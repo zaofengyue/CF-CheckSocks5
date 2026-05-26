@@ -525,7 +525,7 @@ async function allocateTurnRelay(writer, reader, transport, credentials, pipelin
 	) {
 		const realmBytes = message.attributes[TURN_STUN_ATTR.REALM];
 		const nonce = message.attributes[TURN_STUN_ATTR.NONCE];
-		if (!realmBytes?.byteLength || !nonce?.byteLength) throw new Error('TURN authentication challenge is missing realm or nonce');
+		if (!realmBytes || !nonce?.byteLength) throw new Error('TURN authentication challenge is missing realm or nonce');
 
 		const realm = decoder.decode(realmBytes);
 		integrityKey = new Uint8Array(await crypto.subtle.digest('MD5', encoder.encode(`${credentials.username}:${realm}:${credentials.password}`)));

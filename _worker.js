@@ -46,8 +46,31 @@ const DEFAULT_BEIAN_CONTENT = `© 2025 - 2026 Check Socks5 · 基于 <a href="ht
 </script>`;
 
 export default {
-	async fetch(request, env, ctx) {
-		const 备案内容 = env.BEIAN ?? DEFAULT_BEIAN_CONTENT;
+    async fetch(request, env, ctx) {
+        const 备案内容 = env.BEIAN ?? DEFAULT_BEIAN_CONTENT;
+
+        // ── Token 鉴权 ──────────────────────────────────────────
+        const AUTH_TOKEN = env.AUTH_TOKEN;
+        if (AUTH_TOKEN) {
+            const url = new URL(request.url);
+            const pathname = url.pathname.toLowerCase();
+
+            // 首页不拦截，让页面正常加载
+            const isPublicPath = pathname === '/'
+                || pathname === '/locations'
+                || pathname === '/ip.json';
+
+            if (!isPublicPath) {
+                const tokenFromQuery  = url.searchParams.get('token');
+                const tokenFromHeader = request.headers.get('x-auth-token');
+                if (tokenFromQuery !== AUTH_TOKEN && tokenFromHeader !== AUTH_TOKEN) {
+                    return new Response(
+                        JSON.stringify({ ok: false, error: 'Unauthorized' }),
+                        { status: 401, headers: { 'content-type': 'application/json' } }
+                    );
+                }
+            }
+        }
 		let urlText = request.url;
 		const hashIndex = urlText.indexOf('#');
 		const mainUrl = hashIndex === -1 ? urlText : urlText.slice(0, hashIndex);

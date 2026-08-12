@@ -46,37 +46,8 @@ const DEFAULT_BEIAN_CONTENT = `© 2025 - 2026 Check Socks5 · 基于 <a href="ht
 </script>`;
 
 export default {
-    async fetch(request, env, ctx) {
-        const 备案内容 = env.BEIAN ?? DEFAULT_BEIAN_CONTENT;
-		
-        // ── Token 鉴权 ──────────────────────────────────────────
-        const AUTH_TOKEN = env.AUTH_TOKEN;
-        if (AUTH_TOKEN) {
-            const url = new URL(request.url);
-            const pathname = url.pathname.toLowerCase();
-
-            // 首页、locations、ip.json 不拦截
-            const isPublicPath = pathname === '/'
-                || pathname === '/locations'
-                || pathname === '/ip.json';
-
-            if (!isPublicPath) {
-                const referer = request.headers.get('Referer') || '';
-                const host = url.host;
-                const isFromOwnPage = referer.includes(host);
-
-                if (!isFromOwnPage) {
-                    const tokenFromQuery  = url.searchParams.get('token');
-                    const tokenFromHeader = request.headers.get('x-auth-token');
-                    if (tokenFromQuery !== AUTH_TOKEN && tokenFromHeader !== AUTH_TOKEN) {
-                        return new Response(
-                            JSON.stringify({ ok: false, error: 'Unauthorized' }),
-                            { status: 401, headers: { 'content-type': 'application/json' } }
-                        );
-                    }
-                }
-            }
-        }
+	async fetch(request, env, ctx) {
+		const 备案内容 = env.BEIAN ?? DEFAULT_BEIAN_CONTENT;
 		let urlText = request.url;
 		const hashIndex = urlText.indexOf('#');
 		const mainUrl = hashIndex === -1 ? urlText : urlText.slice(0, hashIndex);
@@ -88,6 +59,16 @@ export default {
 
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders(origin) });
+		}
+
+		const authResult = checkAuthToken(request, url, env);
+		if (!authResult.ok) {
+			return authResult.isHtmlRequest
+				? new Response(renderUnauthorizedHTML(), {
+					status: 401,
+					headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-cache, no-store, must-revalidate' }
+				})
+				: jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
 		}
 
 		try {
@@ -222,7 +203,7 @@ function corsHeaders(origin = '') {
 	return {
 		'Access-Control-Allow-Origin': origin || '*',
 		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+		'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Token',
 		'Access-Control-Max-Age': '86400'
 	};
 }
@@ -241,6 +222,81 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 		headers: jsonHeaders(origin)
 	});
 }
+
+// ===================== Token 鉴权 =====================
+// 通过环境变量 TOKEN（或 AUTH_TOKEN）配置访问密钥，未配置时不启用鉴权（保持向后兼容）。
+// 支持三种传递方式，优先级从高到低：
+//   1. Authorization: Bearer <token>  请求头
+//   2. X-Token: <token>               请求头
+//   3. ?token=<token>                 URL 查询参数（同时兼容 ?key=<token>）
+function getConfiguredToken(env) {
+	const token = (env?.TOKEN ?? env?.AUTH_TOKEN ?? '').toString().trim();
+	return token || null;
+}
+
+function extractProvidedToken(request, url) {
+	const authHeader = request.headers.get('Authorization') || '';
+	const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+	if (bearerMatch) return bearerMatch[1].trim();
+
+	const xToken = request.headers.get('X-Token');
+	if (xToken) return xToken.trim();
+
+	const queryToken = url.searchParams.get('token') || url.searchParams.get('key');
+	if (queryToken) return queryToken.trim();
+
+	return '';
+}
+
+function timingSafeEqual(a, b) {
+	const aBytes = encoder.encode(a);
+	const bBytes = encoder.encode(b);
+	if (aBytes.byteLength !== bBytes.byteLength) return false;
+	let diff = 0;
+	for (let i = 0; i < aBytes.byteLength; i++) diff |= aBytes[i] ^ bBytes[i];
+	return diff === 0;
+}
+
+function checkAuthToken(request, url, env) {
+	const configuredToken = getConfiguredToken(env);
+	// 未配置 TOKEN 时不启用鉴权
+	if (!configuredToken) return { ok: true };
+
+	const provided = extractProvidedToken(request, url);
+	const isHtmlRequest = !url.pathname.includes('.') &&
+		!['/ip.json', '/resolve', '/resolve-batch', '/locations'].includes(url.pathname.toLowerCase()) &&
+		!url.pathname.toLowerCase().startsWith('/check');
+
+	if (!provided || !timingSafeEqual(provided, configuredToken)) {
+		return { ok: false, isHtmlRequest };
+	}
+	return { ok: true, isHtmlRequest };
+}
+
+function renderUnauthorizedHTML() {
+	return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>401 Unauthorized</title>
+<style>
+	body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0f172a; color:#e2e8f0; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+	.box { text-align:center; padding:2rem 3rem; border:1px solid #334155; border-radius:12px; background:#1e293b; }
+	h1 { margin:0 0 .5rem; font-size:1.5rem; }
+	p { margin:0; color:#94a3b8; font-size:.95rem; }
+	code { background:#0f172a; padding:.1rem .4rem; border-radius:4px; color:#38bdf8; }
+</style>
+</head>
+<body>
+	<div class="box">
+		<h1>401 Unauthorized</h1>
+		<p>本站点已启用 Token 鉴权，请在请求中携带有效 Token。</p>
+		<p style="margin-top:.75rem;">示例：<code>?token=YOUR_TOKEN</code> 或请求头 <code>Authorization: Bearer YOUR_TOKEN</code></p>
+	</div>
+</body>
+</html>`;
+}
+// ===================== Token 鉴权结束 =====================
 
 async function checkProxy({ type, value }, colo) {
 	const startedAt = Date.now();
@@ -261,7 +317,7 @@ async function checkProxy({ type, value }, colo) {
 	}
 
 	let tunnel = null;
-	const targetHost = 'api.ipapi.is';
+	const targetHost = 'www.iplocate.io';
 	const targetPort = 443;
 
 	try {
@@ -290,7 +346,7 @@ async function checkProxy({ type, value }, colo) {
 		try {
 			await withTimeout(tlsSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
 			await tlsSocket.write(encoder.encode([
-				'GET / HTTP/1.1',
+				'GET /api/lookup HTTP/1.1',
 				`Host: ${targetHost}`,
 				'User-Agent: Mozilla/5.0 CF-Workers-CheckProxy/2.0',
 				'Accept: application/json',
@@ -325,7 +381,7 @@ async function checkProxy({ type, value }, colo) {
 			const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d+)/i);
 			const statusCode = statusMatch ? Number(statusMatch[1]) : NaN;
 			if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) {
-				throw new Error(`Target /ip.json request failed: ${statusLine || 'invalid status'}`);
+				throw new Error(`Target /api/lookup request failed: ${statusLine || 'invalid status'}`);
 			}
 
 			let bodyBytes = responseBuffer.slice(headerEndIndex);
@@ -353,8 +409,26 @@ async function checkProxy({ type, value }, colo) {
 			try {
 				exit = JSON.parse(bodyText.trim());
 			} catch (error) {
-				throw new Error('Target /ip.json did not return valid JSON');
+				throw new Error('Target /api/lookup did not return valid JSON');
 			}
+
+			// Transform iplocate.io response to maintain compatibility with existing frontend
+			exit = {
+				...exit,
+				asn: exit.asn ? {
+					...exit.asn,
+					org: exit.asn.name,
+					descr: exit.asn.name,
+				} : exit.asn,
+				rir: exit.asn?.rir || null,
+				is_datacenter: exit.privacy?.is_hosting || false,
+				is_crawler: false,
+				is_bogon: exit.privacy?.is_bogon || false,
+				is_proxy: exit.privacy?.is_proxy || false,
+				is_vpn: exit.privacy?.is_vpn || false,
+				is_tor: exit.privacy?.is_tor || false,
+				is_abuser: exit.privacy?.is_abuser || false,
+			};
 		} finally {
 			try { tlsSocket.close(); } catch (e) { }
 		}
@@ -2910,6 +2984,17 @@ function generateHTML(备案内容) {
 			--risk-shadow: rgba(239, 68, 68, 0.2);
 		}
 
+		.filter-chip-risk.risk-unknown,
+		.meta-chip-risk.risk-unknown {
+			--risk-border: rgba(148, 163, 184, 0.32);
+			--risk-bg: rgba(148, 163, 184, 0.12);
+			--risk-color: #cbd5e1;
+			--risk-active-border: rgba(148, 163, 184, 0.6);
+			--risk-active-bg: linear-gradient(135deg, rgba(148, 163, 184, 0.34), rgba(100, 116, 139, 0.2));
+			--risk-active-color: #ffffff;
+			--risk-shadow: rgba(148, 163, 184, 0.18);
+		}
+
 		.export-chip {
 			border-color: rgba(251, 191, 36, 0.28);
 			background: linear-gradient(135deg, rgba(251, 191, 36, 0.18), rgba(255, 184, 105, 0.12));
@@ -3879,6 +3964,17 @@ function generateHTML(备案内容) {
 			--risk-shadow: rgba(220, 38, 38, 0.1);
 		}
 
+		html[data-theme='light'] .filter-chip-risk.risk-unknown,
+		html[data-theme='light'] .meta-chip-risk.risk-unknown {
+			--risk-border: rgba(100, 116, 139, 0.26);
+			--risk-bg: rgba(100, 116, 139, 0.08);
+			--risk-color: #475569;
+			--risk-active-border: rgba(100, 116, 139, 0.44);
+			--risk-active-bg: linear-gradient(135deg, rgba(100, 116, 139, 0.18), rgba(71, 85, 105, 0.12));
+			--risk-active-color: #334155;
+			--risk-shadow: rgba(100, 116, 139, 0.1);
+		}
+
 		html[data-theme='light'] .filter-chip-risk:hover,
 		html[data-theme='light'] .filter-chip-risk.is-active {
 			border-color: var(--risk-active-border);
@@ -4456,7 +4552,8 @@ function generateHTML(备案内容) {
 			{ key: 'low', label: '纯净' },
 			{ key: 'elevated', label: '轻微风险' },
 			{ key: 'high', label: '高风险' },
-			{ key: 'critical', label: '极度危险' }
+			{ key: 'critical', label: '极度危险' },
+			{ key: 'unknown', label: '未知' }
 		];
 		const PRIMARY_RESULT_FILTERS = [
 			{ key: 'all', label: '全部' },
@@ -4500,7 +4597,7 @@ function generateHTML(备案内容) {
 			{ header: 'EXIT_COMPANY_TYPE', path: 'exit.company.type' },
 			{ header: 'EXIT_COMPANY_NETWORK', path: 'exit.company.network' },
 			{ header: 'EXIT_COMPANY_WHOIS', path: 'exit.company.whois' },
-			{ header: 'EXIT_ASN', path: 'exit.asnInfo.asn' },
+			{ header: 'EXIT_ASN', path: 'exit.asn' },
 			{ header: 'EXIT_ASN_ABUSER_SCORE', path: 'exit.asnInfo.abuser_score' },
 			{ header: 'EXIT_ASN_ROUTE', path: 'exit.asnInfo.route' },
 			{ header: 'EXIT_ASN_DESCR', path: 'exit.asnInfo.descr' },
@@ -4925,12 +5022,12 @@ function generateHTML(备案内容) {
 		}
 
 		function formatExitAsnDetail(exitData) {
-			const asn = firstNonEmpty(exitData?.asn, exitData?.asnInfo?.asn);
+			const asn = normalizeAsn(firstNonEmpty(exitData?.asn, exitData?.asnInfo?.asn));
 			const route = firstNonEmpty(exitData?.asnInfo?.route);
 			const org = firstNonEmpty(exitData?.asnInfo?.org, exitData?.asOrganization);
 			return firstNonEmpty(
 				joinNonEmptyValues([
-					asn ? 'AS' + asn : '',
+					asn ? asn : '',
 					route || org
 				], ' / '),
 				'未知'
@@ -5847,6 +5944,7 @@ function generateHTML(备案内容) {
 		}
 
 		function getRiskFilterSeverity(filterKey) {
+			if (filterKey === 'unknown') return -1;
 			return RISK_RESULT_FILTERS.findIndex(function (filter) {
 				return filter.key === filterKey;
 			});
@@ -6225,10 +6323,10 @@ function generateHTML(备案内容) {
 			const exitData = getPreferredTextExportProbe(data)?.exit || {};
 			const country = normalizeExportValue(exitData.country);
 			const city = normalizeExportValue(exitData.city);
-			const asn = normalizeExportValue(exitData.asn);
+			const asn = normalizeAsn(exitData.asn);
 			const asOrganization = normalizeExportValue(exitData.asOrganization);
 			const locationSegment = [country, city].filter(Boolean).join(' ') + buildTextExportTypeTag(exitData);
-			const networkSegment = [asn ? 'AS' + asn : '', asOrganization].filter(Boolean).join(' ') + buildTextExportRiskTag(exitData);
+			const networkSegment = [asn ? asn : '', asOrganization].filter(Boolean).join(' ') + buildTextExportRiskTag(exitData);
 			const description = [locationSegment, networkSegment].filter(Boolean).join(' ');
 			return exportTarget + (description ? '#' + description : '');
 		}
@@ -6522,15 +6620,15 @@ function generateHTML(备案内容) {
 		}
 
 		function formatExitNetwork(exitData) {
-			const asn = String(exitData?.asn || '').trim();
+			const asn = normalizeAsn(exitData?.asn);
 			const organization = String(exitData?.asOrganization || '').trim();
 
 			if (asn && organization) {
-				return 'AS' + asn + ' · ' + organization;
+				return asn + ' · ' + organization;
 			}
 
 			if (asn) {
-				return 'AS' + asn;
+				return asn;
 			}
 
 			return organization;
@@ -6677,6 +6775,13 @@ function generateHTML(备案内容) {
 			return '';
 		}
 
+		function normalizeAsn(raw) {
+			if (raw == null) return null;
+			const s = String(raw).trim();
+			if (!s) return null;
+			return s.toUpperCase().startsWith('AS') ? s.toUpperCase() : 'AS' + s;
+		}
+
 		function normalizeExitData(exit) {
 			if (!exit || typeof exit !== 'object') return null;
 
@@ -6689,13 +6794,13 @@ function generateHTML(备案内容) {
 				exit.loc,
 				latitude !== '' && longitude !== '' ? String(latitude) + ',' + String(longitude) : ''
 			);
-			const asn = firstNonEmpty(typeof exit.asn === 'object' ? '' : exit.asn, asnInfo.asn);
-			const asOrganization = firstNonEmpty(exit.asOrganization, exit.org, asnInfo.org, asnInfo.descr, company.name);
+			const asn = normalizeAsn(firstNonEmpty(typeof exit.asn === 'object' ? '' : exit.asn, asnInfo.asn));
+			const asOrganization = firstNonEmpty(exit.asOrganization, exit.org, asnInfo.org, asnInfo.descr, asnInfo.name, company.name);
 			let countryCode = firstNonEmpty(exit.countryCode, exit.country_code, location.country_code, asnInfo.country);
 			if (/^[a-z]{2}$/i.test(String(countryCode || '').trim())) {
 				countryCode = String(countryCode).trim().toUpperCase();
 			}
-			const countryName = firstNonEmpty(exit.countryName, location.country);
+			const countryName = firstNonEmpty(exit.countryName, exit.country, location.country);
 			const ip = firstNonEmpty(exit.ip);
 
 			return Object.assign({}, exit, {
@@ -6704,17 +6809,17 @@ function generateHTML(备案内容) {
 				asn: asn,
 				asnInfo: asnInfo,
 				asOrganization: asOrganization,
-				org: firstNonEmpty(exit.org, asn ? 'AS' + asn + (asOrganization ? ' ' + asOrganization : '') : asOrganization),
+				org: firstNonEmpty(exit.org, asn ? asn + (asOrganization ? ' ' + asOrganization : '') : asOrganization),
 				continent: firstNonEmpty(exit.continent, location.continent),
 				country: firstNonEmpty(exit.country, countryCode, countryName),
 				countryCode: countryCode,
 				country_code: countryCode,
 				countryName: countryName,
-				region: firstNonEmpty(exit.region, exit.regionName, location.state),
+				region: firstNonEmpty(exit.region, exit.regionName, exit.subdivision, location.state),
 				regionCode: firstNonEmpty(exit.regionCode, location.state_code),
 				city: firstNonEmpty(exit.city, location.city),
-				postalCode: firstNonEmpty(exit.postalCode, location.zip),
-				timezone: firstNonEmpty(exit.timezone, location.timezone),
+				postalCode: firstNonEmpty(exit.postalCode, exit.postal_code, location.zip),
+				timezone: firstNonEmpty(exit.timezone, exit.time_zone, location.timezone),
 				loc: loc,
 				latitude: latitude,
 				longitude: longitude
@@ -6830,7 +6935,7 @@ function generateHTML(备案内容) {
 					itemObj.info.innerHTML =
 						'<span class="result-label">候选目标</span>' +
 						buildCopyableTarget(target) +
-						'<span class="result-detail">无法通过该代理访问 api.ipapi.is，请更换目标后重试。</span>';
+						'<span class="result-detail">无法通过该代理访问 www.iplocate.io，请更换目标后重试。</span>';
 					itemObj.meta.innerHTML =
 						buildMetaChip('检测未通过', 'error', 'meta-chip-danger') +
 						buildMetaChip(data.error || data.message || '远端返回失败结果', 'info');

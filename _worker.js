@@ -61,14 +61,8 @@ export default {
 			return new Response(null, { status: 204, headers: corsHeaders(origin) });
 		}
 
-		const authResult = checkAuthToken(request, url, env);
-		if (!authResult.ok) {
-			return authResult.isHtmlRequest
-				? new Response(renderUnauthorizedHTML(), {
-					status: 401,
-					headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-cache, no-store, must-revalidate' }
-				})
-				: jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
+		if (!checkAuthToken(request, url, env).ok) {
+			return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
 		}
 
 		try {
@@ -225,10 +219,17 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 
 // ===================== Token 鉴权 =====================
 // 通过环境变量 TOKEN（或 AUTH_TOKEN）配置访问密钥，未配置时不启用鉴权（保持向后兼容）。
+// 仅保护 /check 系列接口（代理检测），首页及 /ip.json、/resolve、/resolve-batch、/locations 保持公开访问。
 // 支持三种传递方式，优先级从高到低：
 //   1. Authorization: Bearer <token>  请求头
 //   2. X-Token: <token>               请求头
 //   3. ?token=<token>                 URL 查询参数（同时兼容 ?key=<token>）
+const AUTH_PROTECTED_PATH_PREFIX = '/check';
+
+function isAuthProtectedPath(pathname) {
+	return pathname.toLowerCase().startsWith(AUTH_PROTECTED_PATH_PREFIX);
+}
+
 function getConfiguredToken(env) {
 	const token = (env?.TOKEN ?? env?.AUTH_TOKEN ?? '').toString().trim();
 	return token || null;
@@ -258,43 +259,18 @@ function timingSafeEqual(a, b) {
 }
 
 function checkAuthToken(request, url, env) {
+	// 只保护 /check 系列接口，其余路径（首页、/ip.json、/resolve 等）始终公开
+	if (!isAuthProtectedPath(url.pathname)) return { ok: true };
+
 	const configuredToken = getConfiguredToken(env);
 	// 未配置 TOKEN 时不启用鉴权
 	if (!configuredToken) return { ok: true };
 
 	const provided = extractProvidedToken(request, url);
-	const isHtmlRequest = !url.pathname.includes('.') &&
-		!['/ip.json', '/resolve', '/resolve-batch', '/locations'].includes(url.pathname.toLowerCase()) &&
-		!url.pathname.toLowerCase().startsWith('/check');
-
 	if (!provided || !timingSafeEqual(provided, configuredToken)) {
-		return { ok: false, isHtmlRequest };
+		return { ok: false };
 	}
-	return { ok: true, isHtmlRequest };
-}
-
-function renderUnauthorizedHTML() {
-	return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<title>401 Unauthorized</title>
-<style>
-	body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0f172a; color:#e2e8f0; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-	.box { text-align:center; padding:2rem 3rem; border:1px solid #334155; border-radius:12px; background:#1e293b; }
-	h1 { margin:0 0 .5rem; font-size:1.5rem; }
-	p { margin:0; color:#94a3b8; font-size:.95rem; }
-	code { background:#0f172a; padding:.1rem .4rem; border-radius:4px; color:#38bdf8; }
-</style>
-</head>
-<body>
-	<div class="box">
-		<h1>401 Unauthorized</h1>
-		<p>本站点已启用 Token 鉴权，请在请求中携带有效 Token。</p>
-		<p style="margin-top:.75rem;">示例：<code>?token=YOUR_TOKEN</code> 或请求头 <code>Authorization: Bearer YOUR_TOKEN</code></p>
-	</div>
-</body>
-</html>`;
+	return { ok: true };
 }
 // ===================== Token 鉴权结束 =====================
 

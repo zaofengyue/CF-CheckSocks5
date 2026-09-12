@@ -106,11 +106,15 @@ sstp://username:password@host:443
 
 ### 接口鉴权 (Token)
 
-若配置了 `TOKEN` 环境变量，访问受保护接口（`/check`、`/resolve`、`/resolve-batch`）必须携带 Token。支持以下三种方式（优先级由高到低）：
+若配置了 `TOKEN` 环境变量，访问受保护接口必须携带 Token。支持以下多种方式（优先级由高到低）：
 
-1. **Authorization 请求头**：`Authorization: Bearer <token>`
-2. **X-Token 请求头**：`X-Token: <token>`
-3. **URL 查询参数**：`?token=<token>` 或 `?key=<token>`
+1. **URL 路径前缀（最简便直观）**：
+   - 网页直接访问：`https://your-worker.example.workers.dev/<token>`（访问即自动完成鉴权，并自动清洗地址栏）
+   - API 接口调用：`https://your-worker.example.workers.dev/<token>/check?proxy=socks5://host:port`
+   - 域名解析调用：`https://your-worker.example.workers.dev/<token>/resolve?target=domain:port`
+2. **Authorization 请求头**：`Authorization: Bearer <token>`
+3. **X-Token 请求头**：`X-Token: <token>`
+4. **URL 查询参数**：`?token=<token>` 或 `?key=<token>`
 
 未提供或 Token 错误时返回 HTTP `401 Unauthorized`：
 ```json
@@ -242,8 +246,9 @@ curl "https://your-worker.example.workers.dev/resolve?proxyip=socks5://proxy.exa
 
 1. 打开部署后的 Worker 域名。
 2. **Token 配置**（若服务端启用了 `TOKEN` 鉴权）：
-   - 点击页面右上角工具栏中的 **钥匙图标**，输入 Token 并点击「保存」（Token 将保存在浏览器本地 `localStorage`，后续检测自动携带）。
-   - 或者直接在浏览器中访问带参数的链接，例如：`https://your-worker.example.workers.dev/?token=my-secret-token`，页面将自动保存 Token 并自动清洗地址栏。
+   - **方式 A（直接路径访问，最推荐）**：在浏览器地址栏直接输入 `https://your-worker.example.workers.dev/你的Token值`，访问后会自动完成鉴权，页面将自动将 Token 存入本地并将地址栏清洗回根路径 `/`。
+   - **方式 B（UI 手动配置）**：点击页面右上角工具栏中的 **钥匙图标**，输入 Token 并点击「保存」（Token 将保存在浏览器本地 `localStorage`，后续检测自动携带）。
+   - **方式 C（URL 参数访问）**：直接在浏览器中访问带参数链接：`https://your-worker.example.workers.dev/?token=你的Token值`。
 3. 在输入框中填写代理链接、`IP:端口`、`域名:端口` 或带认证的代理地址。
 4. 如需批量检测，打开「批量检测」并粘贴多行目标。
 5. 点击「开始检测」。

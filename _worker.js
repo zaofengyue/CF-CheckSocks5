@@ -55,7 +55,27 @@ export default {
 			urlText = mainUrl.replace(/%3f/i, '?') + (hashIndex === -1 ? '' : urlText.slice(hashIndex));
 		}
 		const url = new URL(urlText);
-		const origin = request.headers.get('Origin') || '';
+		const configuredToken = getConfiguredToken(env);
+		let pathTokenAuthenticated = false;
+
+		if (configuredToken) {
+			const rawPath = url.pathname;
+			let decodedPath = rawPath;
+			try {
+				decodedPath = decodeURIComponent(rawPath);
+			} catch (e) {}
+
+			const tokenPrefix = '/' + configuredToken;
+			if (decodedPath === tokenPrefix || decodedPath === tokenPrefix + '/') {
+				if (request.method === 'GET') {
+					return Response.redirect(`${url.origin}/?token=${encodeURIComponent(configuredToken)}`, 302);
+				}
+			} else if (decodedPath.startsWith(tokenPrefix + '/')) {
+				const remainder = decodedPath.slice(tokenPrefix.length);
+				url.pathname = remainder;
+				pathTokenAuthenticated = true;
+			}
+		}
 
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders(origin) });
@@ -69,7 +89,7 @@ export default {
 			} catch (e) {}
 		}
 
-		if (!checkAuthToken(request, url, env).ok) {
+		if (!checkAuthToken(request, url, env, pathTokenAuthenticated).ok) {
 			return jsonResponse({
 				success: false,
 				error: 'Unauthorized: missing or invalid token'
@@ -268,7 +288,8 @@ function timingSafeEqual(a, b) {
 	return diff === 0;
 }
 
-function checkAuthToken(request, url, env) {
+function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
+	if (pathTokenAuthenticated) return { ok: true };
 	if (!isAuthProtectedPath(url.pathname)) return { ok: true };
 
 	const configuredToken = getConfiguredToken(env);

@@ -55,6 +55,7 @@ export default {
 			urlText = mainUrl.replace(/%3f/i, '?') + (hashIndex === -1 ? '' : urlText.slice(hashIndex));
 		}
 		const url = new URL(urlText);
+		const origin = request.headers.get('Origin') || '';
 		const configuredToken = getConfiguredToken(env);
 		let pathTokenAuthenticated = false;
 
@@ -97,6 +98,10 @@ export default {
 		}
 
 		try {
+			if (url.pathname.toLowerCase() === '/auth-check') {
+				return jsonResponse({ success: true, message: 'Authenticated' }, { origin });
+			}
+
 			if (url.pathname === '/ip.json') {
 				const headers = jsonHeaders(origin);
 				const clientIP = url.searchParams.get('ip')
@@ -208,7 +213,7 @@ export default {
 				return jsonResponse(result, { origin });
 			} else if (url.pathname === '/locations') return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 
-			return new Response(generateHTML(备案内容), {
+			return new Response(generateHTML(备案内容, !!configuredToken), {
 				headers: {
 					'Content-Type': 'text/html; charset=UTF-8',
 					'Cache-Control': 'no-cache, no-store, must-revalidate'
@@ -249,19 +254,19 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 }
 
 // ===================== Token 鉴权 =====================
-// 通过环境变量 TOKEN（或 AUTH_TOKEN）配置访问密钥，未配置时不启用鉴权（保持向后兼容）。
-// 保护 /check、/resolve、/resolve-batch 等核心接口；首页页面、/ip.json、/locations 保持公开访问。
-// 支持三种传递方式，优先级从高到低：
+// 通过环境变量 TOKEN（或 AUTH_TOKEN、SECRET_TOKEN 等）配置访问密钥，未配置时不启用鉴权（保持向后兼容）。
+// 保护 /check、/resolve、/resolve-batch、/auth-check 等核心接口；首页页面、/ip.json、/locations 保持公开访问。
+// 支持多种传递方式，优先级从高到低：
 //   1. Authorization: Bearer <token>  请求头
 //   2. X-Token: <token>               请求头
 //   3. ?token=<token>                 URL 查询参数（同时兼容 ?key=<token>）
 function isAuthProtectedPath(pathname) {
 	const lower = pathname.toLowerCase();
-	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch';
+	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check';
 }
 
 function getConfiguredToken(env) {
-	const token = (env?.TOKEN ?? env?.AUTH_TOKEN ?? '').toString().trim();
+	const token = (env?.TOKEN ?? env?.AUTH_TOKEN ?? env?.SECRET_TOKEN ?? env?.KEY ?? env?.PASSWORD ?? '').toString().trim();
 	return token || null;
 }
 
@@ -1855,7 +1860,7 @@ async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-
 	}
 }
 
-function generateHTML(备案内容) {
+function generateHTML(备案内容, hasToken = false) {
 	return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1868,6 +1873,7 @@ function generateHTML(备案内容) {
 	<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
 	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 	<script>
+		window.__TOKEN_REQUIRED__ = ${hasToken ? 'true' : 'false'};
 		(function () {
 			const storageKey = 'cf_proxy_theme';
 			let theme = 'dark';
@@ -2470,6 +2476,144 @@ function generateHTML(备案内容) {
 		.token-modal-btn-save:hover {
 			transform: translateY(-1px);
 			box-shadow: 0 6px 18px rgba(97, 219, 255, 0.35);
+		}
+
+		/* 访问鉴权锁定全屏遮罩 */
+		.auth-lock-overlay {
+			position: fixed;
+			top: 0;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			background: rgba(4, 11, 20, 0.88);
+			backdrop-filter: blur(16px);
+			display: none;
+			align-items: center;
+			justify-content: center;
+			z-index: 2000;
+			padding: 20px;
+			opacity: 0;
+			transition: opacity 0.3s ease;
+		}
+
+		.auth-lock-overlay.is-active {
+			display: flex;
+			opacity: 1;
+		}
+
+		.auth-lock-card {
+			width: 100%;
+			max-width: 420px;
+			background: var(--panel-strong);
+			border: 1px solid var(--line);
+			border-radius: var(--radius-lg);
+			box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+			padding: 32px 28px;
+			text-align: center;
+			transform: scale(0.95);
+			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+		}
+
+		.auth-lock-overlay.is-active .auth-lock-card {
+			transform: scale(1);
+		}
+
+		.auth-lock-icon {
+			width: 52px;
+			height: 52px;
+			border-radius: 50%;
+			margin: 0 auto 16px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			background: linear-gradient(135deg, rgba(97, 219, 255, 0.16), rgba(45, 212, 191, 0.12));
+			border: 1px solid rgba(97, 219, 255, 0.3);
+			color: var(--accent);
+		}
+
+		.auth-lock-title {
+			font-size: 1.35rem;
+			font-weight: 700;
+			color: #ffffff;
+			margin: 0 0 8px;
+		}
+
+		.auth-lock-desc {
+			font-size: 0.88rem;
+			color: var(--muted);
+			line-height: 1.6;
+			margin: 0 0 22px;
+		}
+
+		.auth-lock-input {
+			width: 100%;
+			box-sizing: border-box;
+			padding: 13px 16px;
+			border-radius: 12px;
+			border: 1px solid var(--line);
+			background: rgba(0, 0, 0, 0.3);
+			color: var(--text);
+			font-size: 0.95rem;
+			outline: none;
+			font-family: inherit;
+			margin-bottom: 12px;
+			transition: all 0.2s ease;
+		}
+
+		.auth-lock-input:focus {
+			border-color: var(--accent);
+			box-shadow: 0 0 0 3px rgba(97, 219, 255, 0.2);
+		}
+
+		.auth-lock-btn {
+			width: 100%;
+			padding: 12px;
+			border-radius: 12px;
+			border: none;
+			background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+			color: #04131f;
+			font-size: 0.95rem;
+			font-weight: 700;
+			cursor: pointer;
+			transition: all 0.2s ease;
+			box-shadow: 0 6px 20px rgba(97, 219, 255, 0.25);
+		}
+
+		.auth-lock-btn:hover {
+			transform: translateY(-1px);
+			box-shadow: 0 8px 24px rgba(97, 219, 255, 0.35);
+		}
+
+		.auth-lock-msg {
+			min-height: 20px;
+			margin-top: 10px;
+			font-size: 0.82rem;
+			color: var(--error);
+			display: none;
+		}
+
+		.auth-lock-msg.is-visible {
+			display: block;
+		}
+
+		html[data-theme='light'] .auth-lock-overlay {
+			background: rgba(240, 244, 248, 0.88);
+		}
+
+		html[data-theme='light'] .auth-lock-card {
+			background: rgba(255, 255, 255, 0.98);
+			border-color: rgba(84, 112, 139, 0.2);
+			box-shadow: 0 20px 60px rgba(0, 0, 0, 0.12);
+		}
+
+		html[data-theme='light'] .auth-lock-title {
+			color: #0f172a;
+		}
+
+		html[data-theme='light'] .auth-lock-input {
+			background: #f8fafc;
+			border-color: rgba(84, 112, 139, 0.25);
+			color: #0f172a;
 		}
 
 		.surface-card {
@@ -7576,6 +7720,9 @@ function generateHTML(备案内容) {
 			if (modalInput) modalInput.value = '';
 			updateTokenButtonState();
 			closeTokenModal();
+			if (window.__TOKEN_REQUIRED__) {
+				showAuthLockOverlay();
+			}
 		}
 
 		function updateTokenButtonState() {
@@ -7590,6 +7737,89 @@ function generateHTML(备案内容) {
 				btn.classList.remove('is-active');
 				btn.setAttribute('title', '配置访问 Token');
 				btn.setAttribute('aria-label', '配置访问 Token');
+			}
+		}
+
+		async function checkTokenValidity(token) {
+			if (!token) return false;
+			try {
+				const res = await fetch('/auth-check', {
+					headers: {
+						'Authorization': 'Bearer ' + token,
+						'X-Token': token
+					}
+				});
+				return res.ok;
+			} catch (e) {
+				return false;
+			}
+		}
+
+		function showAuthLockOverlay(msg) {
+			const overlay = document.getElementById('authLockOverlay');
+			const input = document.getElementById('authLockInput');
+			const errorMsg = document.getElementById('authLockMsg');
+			if (!overlay) return;
+			overlay.classList.add('is-active');
+			if (errorMsg) {
+				if (msg) {
+					errorMsg.textContent = msg;
+					errorMsg.classList.add('is-visible');
+				} else {
+					errorMsg.textContent = '';
+					errorMsg.classList.remove('is-visible');
+				}
+			}
+			if (input) {
+				input.value = '';
+				setTimeout(function () { input.focus(); }, 120);
+			}
+		}
+
+		function hideAuthLockOverlay() {
+			const overlay = document.getElementById('authLockOverlay');
+			if (!overlay) return;
+			overlay.classList.remove('is-active');
+		}
+
+		async function verifyAndUnlock(tokenValue) {
+			const token = (tokenValue || '').trim();
+			const errorMsg = document.getElementById('authLockMsg');
+			const lockBtn = document.getElementById('authLockBtn');
+
+			if (!token) {
+				if (errorMsg) {
+					errorMsg.textContent = '请输入 Token';
+					errorMsg.classList.add('is-visible');
+				}
+				return;
+			}
+
+			if (lockBtn) {
+				lockBtn.textContent = '验证中...';
+				lockBtn.disabled = true;
+			}
+
+			const isValid = await checkTokenValidity(token);
+
+			if (lockBtn) {
+				lockBtn.textContent = '验证并解锁';
+				lockBtn.disabled = false;
+			}
+
+			if (isValid) {
+				try {
+					localStorage.setItem('cf_proxy_token', token);
+				} catch (e) {}
+				updateTokenButtonState();
+				hideAuthLockOverlay();
+			} else {
+				if (errorMsg) {
+					errorMsg.textContent = 'Token 错误，请检查后重新输入';
+					errorMsg.classList.add('is-visible');
+				}
+				const input = document.getElementById('authLockInput');
+				if (input) input.focus();
 			}
 		}
 
@@ -7609,6 +7839,22 @@ function generateHTML(备案内容) {
 
 			updateTokenButtonState();
 
+			// 检查服务端是否要求 Token
+			if (window.__TOKEN_REQUIRED__) {
+				const saved = getSavedToken();
+				if (!saved) {
+					showAuthLockOverlay();
+				} else {
+					checkTokenValidity(saved).then(function (valid) {
+						if (!valid) {
+							try { localStorage.removeItem('cf_proxy_token'); } catch (e) {}
+							updateTokenButtonState();
+							showAuthLockOverlay('本地保存的 Token 已失效，请重新输入');
+						}
+					});
+				}
+			}
+
 			const tokenToggleBtn = document.getElementById('tokenToggleBtn');
 			const modalBackdrop = document.getElementById('tokenModalBackdrop');
 			const modalCloseBtn = document.getElementById('tokenModalCloseBtn');
@@ -7616,6 +7862,20 @@ function generateHTML(备案内容) {
 			const modalSaveBtn = document.getElementById('tokenModalSaveBtn');
 			const modalClearBtn = document.getElementById('tokenModalClearBtn');
 			const modalInput = document.getElementById('tokenModalInput');
+			const authLockBtn = document.getElementById('authLockBtn');
+			const authLockInput = document.getElementById('authLockInput');
+
+			if (authLockBtn && authLockInput) {
+				authLockBtn.addEventListener('click', function () {
+					verifyAndUnlock(authLockInput.value);
+				});
+				authLockInput.addEventListener('keydown', function (e) {
+					if (e.key === 'Enter') {
+						e.preventDefault();
+						verifyAndUnlock(authLockInput.value);
+					}
+				});
+			}
 
 			if (tokenToggleBtn) {
 				tokenToggleBtn.addEventListener('click', function () {
@@ -7705,6 +7965,23 @@ function generateHTML(备案内容) {
 				<button class="token-modal-btn token-modal-btn-cancel" type="button" id="tokenModalCancelBtn">取消</button>
 				<button class="token-modal-btn token-modal-btn-save" type="button" id="tokenModalSaveBtn">保存</button>
 			</div>
+		</div>
+	</div>
+
+	<!-- 访问鉴权锁定全屏遮罩 -->
+	<div class="auth-lock-overlay" id="authLockOverlay">
+		<div class="auth-lock-card">
+			<div class="auth-lock-icon">
+				<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+					<path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+				</svg>
+			</div>
+			<h2 class="auth-lock-title">访问鉴权</h2>
+			<p class="auth-lock-desc">当前服务已开启 Token 保护，请输入授权 Token 解锁全部功能。</p>
+			<input class="auth-lock-input" type="password" id="authLockInput" placeholder="输入访问 Token..." autocomplete="off" spellcheck="false">
+			<button class="auth-lock-btn" type="button" id="authLockBtn">验证并解锁</button>
+			<div class="auth-lock-msg" id="authLockMsg"></div>
 		</div>
 	</div>
 </body>

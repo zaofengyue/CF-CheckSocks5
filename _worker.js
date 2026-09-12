@@ -61,6 +61,14 @@ export default {
 			return new Response(null, { status: 204, headers: corsHeaders(origin) });
 		}
 
+		// Cloudflare Pages 静态资源直通（如 demo.png 等静态资产）
+		if (env.ASSETS && request.method === 'GET' && url.pathname !== '/' && url.pathname !== '/index.html' && url.pathname.includes('.')) {
+			try {
+				const assetResponse = await env.ASSETS.fetch(request);
+				if (assetResponse.status !== 404) return assetResponse;
+			} catch (e) {}
+		}
+
 		if (!checkAuthToken(request, url, env).ok) {
 			return jsonResponse({
 				success: false,

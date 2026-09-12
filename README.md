@@ -26,18 +26,23 @@ Demo: <https://check.socks5.cmliussss.net>
 
 ## 部署方式
 
-### Cloudflare Workers
+### 方式一：Cloudflare Workers 控制台粘贴代码部署（最简便）
 
-1. 在 Cloudflare 控制台创建一个 Worker。
-2. 将 [_worker.js](./_worker.js) 的全部内容复制到 Worker 编辑器中。
-3. 保存并部署。
-4. 访问 Worker 域名即可打开检测页面。
+1. 在 Cloudflare 控制台 -> **Workers 和 Pages** -> 点击 **创建 Worker**。
+2. 点击部署生成默认 Worker，进入详情页后点击右上角 **编辑代码**。
+3. 将本项目中的 [_worker.js](./_worker.js) 全部内容复制，粘贴替换编辑器中的所有代码，点击 **部署**。
+4. 如需开启鉴权，在 Worker 的 **设置** -> **变量和机密** 中添加变量 `TOKEN` 即可。
 
-### Cloudflare Pages
+### 方式二：Cloudflare Pages 上传压缩包 / 文件夹部署
 
-如果使用 Pages，可将仓库连接到 Cloudflare Pages，并确保部署产物根目录包含 `_worker.js`。该文件会作为 Pages 的 Worker 入口处理请求。
+本项目已内置 `_routes.json` 与 `index.html`，完美支持 Pages **直接上传（Direct Upload）**：
 
-项目没有额外构建步骤，也不依赖 `package.json`。
+1. 在 Cloudflare 控制台 -> **Workers 和 Pages** -> 点击 **创建** -> 选择 **Pages** -> **直接上传（Direct Upload）**。
+2. 输入项目名称，在上传区域直接上传：
+   - **方式 A（上传文件夹）**：解压下载的项目包，直接将包含 `_worker.js` 的文件夹拖入上传区域。
+   - **方式 B（上传压缩包）**：将 `_worker.js`、`_routes.json`、`index.html` 等文件全选压缩为 zip 上传（请确保 `_worker.js` 位于压缩包最外层根目录，不要嵌套子文件夹）。
+3. 点击 **部署站点**。
+4. 如需开启鉴权，在 Pages 项目的 **设置** -> **环境变量** 中添加 `TOKEN` 即可。
 
 ## 环境变量
 

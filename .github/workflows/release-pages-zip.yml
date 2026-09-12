@@ -1,0 +1,28 @@
+name: Package Pages Zip
+
+on:
+  push:
+    branches:
+      - main
+      - beta
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create Pages Deploy Zip
+        run: |
+          zip -j CF-CheckSocks5-Pages.zip _worker.js index.html _routes.json wrangler.toml README.md LICENSE demo.png
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CF-CheckSocks5-Pages-Deploy
+          path: CF-CheckSocks5-Pages.zip
+          retention-days: 90

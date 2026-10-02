@@ -13,7 +13,7 @@
 - SSTP 检测使用 HTTPS SSTP 握手、PPP / IPCP 建链，并通过 PPP 内 TCP 连接读取出口信息。
 - 支持单条检测和批量检测；批量模式会自动去重、解析域名并并发验证。
 - 支持域名解析为 A / AAAA 记录，优先使用 Cloudflare DoH，失败后回退到 Google DoH。
-- 支持出口 IP 查询多源自由切换，涵盖 `iplocate.io`、`ipwho.is`（高精度全字段规范）、`api.ip.sb`（极速大批量）、`Cloudflare 官方 Trace`（1w+ 超大批量首选，零风控无上限）、`ipinfo.io` 以及 `ipapi.co`（高精度单条）。
+- 支持出口 IP 查询多源自由切换，涵盖 `iplocate.io`、`HackMyIP`（风控首选 · 原生住宅/机房/VPN与纯净度评级）、`IP2Location.io`（全球权威顶牌 · 自带代理识别 / 免密即用）、`ipwho.is`（高精度全字段规范）、`api.ip.sb`（极速大批量）、`Cloudflare 官方 Trace`（1w+ 超大批量首选，零风控无上限）、`ipinfo.io`、`ipapi.co` 以及 `api.ipapi.is`（深度风控识别 · 支持多 Key 轮询）。
 - 支持代理出口信息展示，包括出口 IP、地区、ASN、运营商、风险标签、响应耗时等。
 - 支持 Leaflet / OpenStreetMap 地图展示出口位置。
 - 支持结果筛选，支持将有效及失败结果复制到剪贴板或导出为 TXT / CSV（包含详细报错原因）。
@@ -26,12 +26,17 @@ Demo: <https://check.socks5.cmliussss.net>
 
 ## 部署方式
 
-### 方式一：Cloudflare Workers 控制台粘贴代码部署（最简便）
+### 方式一：Cloudflare Workers 控制台粘贴代码部署（推荐）
 
 1. 在 Cloudflare 控制台 -> **Workers 和 Pages** -> 点击 **创建 Worker**。
 2. 点击部署生成默认 Worker，进入详情页后点击右上角 **编辑代码**。
 3. 将本项目中的 [_worker.js](./_worker.js) 全部内容复制，粘贴替换编辑器中的所有代码，点击 **部署**。
-4. 如需开启鉴权，在 Worker 的 **设置** -> **变量和机密** 中添加变量 `TOKEN` 即可。
+4. **（可选，强烈推荐）开启后台管理与分布式集群功能**：
+   - 在 Cloudflare 控制台 -> **KV** 中创建一个新的 KV 命名空间（例如：`CHECK_SOCKS5_KV`）。
+   - 进入该 Worker 的 **设置** -> **绑定 (Bindings)** -> 添加 **KV 命名空间绑定**：
+     - **变量名称**：`CONFIG_KV`（或 `KV`）
+     - **KV 命名空间**：选择刚才创建的命名空间。
+   - 访问你的域名 `/admin`，首次打开会提示初始化管理员密码，进入后台即可图形化管理 Token、接口 Key 池和集群调度。
 
 ### 方式二：Cloudflare Pages 上传压缩包 / 文件夹部署
 
@@ -42,16 +47,31 @@ Demo: <https://check.socks5.cmliussss.net>
    - **方式 A（上传文件夹）**：解压下载的项目包，直接将包含 `_worker.js` 的文件夹拖入上传区域。
    - **方式 B（上传压缩包）**：将 `_worker.js`、`_routes.json`、`index.html` 等文件全选压缩为 zip 上传（请确保 `_worker.js` 位于压缩包最外层根目录，不要嵌套子文件夹）。
 3. 点击 **部署站点**。
-4. 如需开启鉴权，在 Pages 项目的 **设置** -> **环境变量** 中添加 `TOKEN` 即可。
+4. 同样可以在 Pages 项目的 **设置** -> **函数 (Functions)** -> **KV 命名空间绑定** 中添加 `CONFIG_KV` 激活后台管理系统。
 
-## 环境变量
+## 环境变量与 KV 绑定
 
-当前源码只读取以下环境变量：
+当前源码支持读取以下配置：
 
-| 变量名 | 说明 | 示例 | 必需 |
-| --- | --- | --- | --- |
-| `TOKEN` | 访问鉴权令牌（兼容 `AUTH_TOKEN`）。未设置时公开访问；设置后受保护接口必须携带凭证。 | `my-secret-token` | 否 |
-| `BEIAN` | 自定义页面页脚 HTML。未设置时使用默认页脚，包含项目链接和维护者链接。 | `© 2026 Example.com · ICP 备案号` | 否 |
+| 变量 / 绑定名 | 类型 | 说明 | 示例 | 必需 |
+| --- | --- | --- | --- | --- |
+| `CONFIG_KV` | KV 命名空间 | 绑定 Cloudflare KV 命名空间，激活 `/admin` 图形后台管理系统、多 Key 自动轮询、分布式集群调度与动态 Token 增删。兼容变量名 `KV`。 | 绑定至 KV 命名空间 | 否 |
+| `ADMIN_PASSWORD` | 环境变量 | 管理员初始密码。若未绑定 KV 或初次访问，亦可通过该环境变量预设后台密码。 | `admin123456` | 否 |
+| `TOKEN` | 环境变量 | 全局兜底访问鉴权令牌（兼容 `AUTH_TOKEN`）。若绑定了 KV，亦可在 `/admin` 后台动态新增和管理多个 Token。 | `my-secret-token` | 否 |
+| `BEIAN` | 环境变量 | 自定义页面页脚 HTML。未设置时使用默认页脚，包含项目链接和维护者链接。 | `© 2026 Example.com · ICP 备案号` | 否 |
+
+## 后台管理系统 (`/admin`)
+
+当 Worker / Pages 绑定了 `CONFIG_KV`（或 `KV`）命名空间时，访问 `https://your-domain/admin` 将开启管理控制台：
+
+- **访问 Token 管理 (Tokens)**：可视化创建、禁用、启用与删除用户 Token，支持为每个 Token 备注用途（如“自用客户端”、“群友测试”等）。
+- **接口与多 Key 池管理 (Sources & Key Pool)**：
+  - 支持为商业 IP 查询接口（如 `api.ipapi.is`、`api.ip2location.io`、`ipdata.co` 等）配置多组 API Key。
+  - **自动负载均衡与智能容灾**：多 Key 自动 Round-Robin 轮询调度；当某个 Key 遇到 429 配额耗尽或被限流时，系统自动触发 10 分钟静默冷却并无缝切换至下一个可用 Key，冷却期结束后自动复活。
+- **Worker 分布式集群调度 (Worker Cluster)**：
+  - 支持将多个免费 Cloudflare 账号部署的 Worker 节点地址填入集群列表中。
+  - 前端批量检测时自动从 `/api/cluster/nodes` 拉取可用节点，将成千上万个代理检测请求并发分发到各个 Worker 节点，打破单账号每天 10 万次请求的免费限制，大幅提升并发吞吐量。
+- **配置导入导出与备份 (Settings & Backup)**：支持一键导出全站配置 JSON 备份文件，迁移站点时一键上传还原。
 
 ## 支持的代理格式
 

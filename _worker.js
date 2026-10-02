@@ -56,6 +56,40 @@ export default {
 			return new Response(null, { status: 204, headers: corsHeaders(origin) });
 		}
 
+		if (url.pathname.toLowerCase() === '/admin' || url.pathname.toLowerCase() === '/admin/') {
+			return new Response(generateAdminHTML(env, Boolean(getKV(env))), {
+				headers: {
+					'Content-Type': 'text/html; charset=UTF-8',
+					'Cache-Control': 'no-cache, no-store, must-revalidate'
+				}
+			});
+		}
+
+		if (url.pathname.toLowerCase().startsWith('/api/admin/')) {
+			return handleAdminAPI(request, url, env, origin);
+		}
+
+		if (url.pathname.toLowerCase() === '/api/cluster/nodes') {
+			const authRes = await checkAuthToken(request, url, env, pathTokenAuthenticated);
+			if (!authRes.ok) {
+				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
+			}
+			const workers = (await getKVWorkers(env)) || [];
+			const activeWorkers = workers.filter(w => w.enabled !== false).map(w => ({
+				id: w.id,
+				name: w.name,
+				url: w.url,
+				token: w.token || '',
+				weight: w.weight || 1
+			}));
+			return jsonResponse({
+				success: true,
+				hasKV: Boolean(getKV(env)),
+				clusterEnabled: activeWorkers.length > 0,
+				nodes: activeWorkers
+			}, { origin });
+		}
+
 		// Cloudflare Pages 静态资源直通（如 demo.png 等静态资产）
 		if (env.ASSETS && request.method === 'GET' && url.pathname !== '/' && url.pathname !== '/index.html' && url.pathname.includes('.')) {
 			try {
@@ -64,7 +98,8 @@ export default {
 			} catch (e) {}
 		}
 
-		if (!checkAuthToken(request, url, env, pathTokenAuthenticated).ok) {
+		const authCheck = await checkAuthToken(request, url, env, pathTokenAuthenticated);
+		if (!authCheck.ok) {
 			return jsonResponse({
 				success: false,
 				error: 'Unauthorized: missing or invalid token'
@@ -184,7 +219,7 @@ export default {
 					}, { status: 400, origin });
 				}
 				const source = url.searchParams.get('source') || 'iplocate';
-				const result = await checkProxy(checkParams, request.cf?.colo ?? null, source);
+				const result = await checkProxy(checkParams, request.cf?.colo ?? null, source, env);
 				return jsonResponse(result, { origin });
 			} else if (url.pathname === '/locations') return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 
@@ -228,16 +263,400 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 	});
 }
 
+// ===================== Cloudflare KV 配置中心与分布式集群调度 =====================
+const KV_CONFIG_PREFIX = 'cf_proxy:';
+let memConfigCache = {
+	tokens: null,
+	workers: null,
+	sources: null,
+	adminPass: null,
+	ts: 0
+};
+const CONFIG_CACHE_TTL_MS = 6000;
+
+function getKV(env) {
+	return env?.CONFIG_KV || env?.KV || null;
+}
+
+async function sha256Hex(str) {
+	const data = encoder.encode(str);
+	const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+	return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function getAdminPassword(env) {
+	const kv = getKV(env);
+	if (kv) {
+		try {
+			const pass = await kv.get(`${KV_CONFIG_PREFIX}admin_password`);
+			if (pass) return pass.trim();
+		} catch (e) {}
+	}
+	const envPass = (env?.ADMIN_PASSWORD || env?.ADMIN_TOKEN || env?.ROOT_PASSWORD || '').toString().trim();
+	return envPass || null;
+}
+
+async function setAdminPassword(env, password) {
+	const kv = getKV(env);
+	if (!kv) throw new Error('未检测到绑定的 KV 空间 (CONFIG_KV)，无法持久化存储管理员密码。请在 Cloudflare 仪表盘绑定 KV。');
+	await kv.put(`${KV_CONFIG_PREFIX}admin_password`, String(password).trim());
+	memConfigCache.adminPass = String(password).trim();
+}
+
+async function getKVTokens(env) {
+	const kv = getKV(env);
+	if (!kv) return null;
+	const now = Date.now();
+	if (memConfigCache.tokens && now - memConfigCache.ts < CONFIG_CACHE_TTL_MS) {
+		return memConfigCache.tokens;
+	}
+	try {
+		const raw = await kv.get(`${KV_CONFIG_PREFIX}tokens`, { type: 'json' });
+		if (Array.isArray(raw)) {
+			memConfigCache.tokens = raw;
+			memConfigCache.ts = now;
+			return raw;
+		}
+	} catch (e) {}
+	return [];
+}
+
+async function saveKVTokens(env, tokens) {
+	const kv = getKV(env);
+	if (!kv) throw new Error('未绑定 KV 空间 (CONFIG_KV)');
+	await kv.put(`${KV_CONFIG_PREFIX}tokens`, JSON.stringify(tokens));
+	memConfigCache.tokens = tokens;
+	memConfigCache.ts = Date.now();
+}
+
+async function getKVWorkers(env) {
+	const kv = getKV(env);
+	if (!kv) return [];
+	const now = Date.now();
+	if (memConfigCache.workers && now - memConfigCache.ts < CONFIG_CACHE_TTL_MS) {
+		return memConfigCache.workers;
+	}
+	try {
+		const raw = await kv.get(`${KV_CONFIG_PREFIX}workers`, { type: 'json' });
+		if (Array.isArray(raw)) {
+			memConfigCache.workers = raw;
+			memConfigCache.ts = now;
+			return raw;
+		}
+	} catch (e) {}
+	return [];
+}
+
+async function saveKVWorkers(env, workers) {
+	const kv = getKV(env);
+	if (!kv) throw new Error('未绑定 KV 空间 (CONFIG_KV)');
+	await kv.put(`${KV_CONFIG_PREFIX}workers`, JSON.stringify(workers));
+	memConfigCache.workers = workers;
+	memConfigCache.ts = Date.now();
+}
+
+async function getKVSources(env) {
+	const kv = getKV(env);
+	if (!kv) return {};
+	const now = Date.now();
+	if (memConfigCache.sources && now - memConfigCache.ts < CONFIG_CACHE_TTL_MS) {
+		return memConfigCache.sources;
+	}
+	try {
+		const raw = await kv.get(`${KV_CONFIG_PREFIX}sources`, { type: 'json' });
+		if (raw && typeof raw === 'object') {
+			memConfigCache.sources = raw;
+			memConfigCache.ts = now;
+			return raw;
+		}
+	} catch (e) {}
+	return {};
+}
+
+async function saveKVSources(env, sources) {
+	const kv = getKV(env);
+	if (!kv) throw new Error('未绑定 KV 空间 (CONFIG_KV)');
+	await kv.put(`${KV_CONFIG_PREFIX}sources`, JSON.stringify(sources));
+	memConfigCache.sources = sources;
+	memConfigCache.ts = Date.now();
+}
+
+// 多 Key 轮询与熔断管理
+const sourceKeyRotationIndex = new Map();
+const sourceKeyCooldownUntil = new Map();
+
+function getSourceKeysFromEnvOrConfig(sourceKey, env) {
+	const sources = memConfigCache.sources;
+	if (sources && sources[sourceKey]?.keys && Array.isArray(sources[sourceKey].keys)) {
+		const validKeys = sources[sourceKey].keys.map(k => String(k).trim()).filter(Boolean);
+		if (validKeys.length > 0) return validKeys;
+	}
+	if (sourceKey === 'ipapi_is' && env?.IPAPI_IS_KEY) {
+		return String(env.IPAPI_IS_KEY).split(/[,;\n\r]+/).map(k => k.trim()).filter(Boolean);
+	}
+	if (sourceKey === 'ipinfo' && (env?.IPINFO_TOKEN || env?.IPINFO_KEY)) {
+		return String(env.IPINFO_TOKEN || env.IPINFO_KEY).split(/[,;\n\r]+/).map(k => k.trim()).filter(Boolean);
+	}
+	if (sourceKey === 'ip2location' && env?.IP2LOCATION_KEY) {
+		return String(env.IP2LOCATION_KEY).split(/[,;\n\r]+/).map(k => k.trim()).filter(Boolean);
+	}
+	return [];
+}
+
+function pickKeyForSource(sourceKey, env) {
+	const keys = getSourceKeysFromEnvOrConfig(sourceKey, env);
+	if (!keys.length) return '';
+	if (keys.length === 1) return keys[0];
+
+	const now = Date.now();
+	const availableKeys = keys.filter(k => {
+		const cooldown = sourceKeyCooldownUntil.get(`${sourceKey}:${k}`);
+		return !cooldown || now > cooldown;
+	});
+
+	const activePool = availableKeys.length > 0 ? availableKeys : keys;
+	let idx = sourceKeyRotationIndex.get(sourceKey) || 0;
+	const selected = activePool[idx % activePool.length];
+	sourceKeyRotationIndex.set(sourceKey, (idx + 1) % activePool.length);
+	return selected;
+}
+
+function markKeyCooldown(sourceKey, key, cooldownMs = 60000) {
+	if (!key) return;
+	sourceKeyCooldownUntil.set(`${sourceKey}:${key}`, Date.now() + cooldownMs);
+}
+
+async function verifyAdminAuth(request, env) {
+	const adminPass = await getAdminPassword(env);
+	if (!adminPass) {
+		return { ok: true, needSetup: true };
+	}
+
+	const authHeader = request.headers.get('Authorization') || '';
+	const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+	const providedToken = tokenMatch ? tokenMatch[1].trim() : (request.headers.get('X-Admin-Token') || '').trim();
+
+	if (!providedToken) return { ok: false, needSetup: false };
+
+	if (timingSafeEqual(providedToken, adminPass)) {
+		return { ok: true, needSetup: false };
+	}
+
+	const expectedSession = await sha256Hex(adminPass + ':cf_admin_session');
+	if (timingSafeEqual(providedToken, expectedSession)) {
+		return { ok: true, needSetup: false };
+	}
+
+	return { ok: false, needSetup: false };
+}
+
+async function handleAdminAPI(request, url, env, origin) {
+	const pathname = url.pathname.toLowerCase().replace(/\/+$/, '');
+	const auth = await verifyAdminAuth(request, env);
+
+	if (pathname === '/api/admin/login' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		const pass = (body.password || '').toString().trim();
+		const currentAdminPass = await getAdminPassword(env);
+
+		if (!currentAdminPass) {
+			if (!pass || pass.length < 4) {
+				return jsonResponse({ success: false, error: '管理员初始密码长度不能少于 4 个字符' }, { status: 400, origin });
+			}
+			try {
+				await setAdminPassword(env, pass);
+			} catch (e) {
+				return jsonResponse({ success: false, error: e.message || '保存管理员密码失败' }, { status: 500, origin });
+			}
+			const sessionToken = await sha256Hex(pass + ':cf_admin_session');
+			return jsonResponse({ success: true, token: sessionToken, message: '管理员密码初始化成功！' }, { origin });
+		}
+
+		if (!pass || (!timingSafeEqual(pass, currentAdminPass) && pass !== currentAdminPass)) {
+			return jsonResponse({ success: false, error: '密码错误，请重新输入' }, { status: 401, origin });
+		}
+
+		const sessionToken = await sha256Hex(currentAdminPass + ':cf_admin_session');
+		return jsonResponse({ success: true, token: sessionToken, message: '登录成功' }, { origin });
+	}
+
+	if (!auth.ok) {
+		return jsonResponse({ success: false, error: '管理员未授权或会话已过期，请重新登录', needSetup: auth.needSetup }, { status: 401, origin });
+	}
+
+	if (pathname === '/api/admin/config' && request.method === 'GET') {
+		const adminPass = await getAdminPassword(env);
+		const tokens = (await getKVTokens(env)) || [];
+		const workers = (await getKVWorkers(env)) || [];
+		const sources = (await getKVSources(env)) || {};
+		return jsonResponse({
+			success: true,
+			hasKV: Boolean(getKV(env)),
+			needSetup: !adminPass,
+			tokens,
+			workers,
+			sources,
+			envTokenConfigured: Boolean(getConfiguredToken(env)),
+			hasEnvAdminPassword: Boolean(env?.ADMIN_PASSWORD)
+		}, { origin });
+	}
+
+	if (pathname === '/api/admin/tokens' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		const currentTokens = (await getKVTokens(env)) || [];
+		let nextTokens = [...currentTokens];
+
+		if (body.action === 'save_all' && Array.isArray(body.tokens)) {
+			nextTokens = body.tokens;
+		} else if (body.action === 'add') {
+			const tok = (body.token?.token || '').trim();
+			if (!tok) return jsonResponse({ success: false, error: 'Token 内容不能为空' }, { status: 400, origin });
+			nextTokens.unshift({
+				id: 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+				token: tok,
+				note: (body.token?.note || '').trim(),
+				enabled: body.token?.enabled !== false,
+				createdAt: Date.now()
+			});
+		} else if (body.action === 'toggle' && body.id) {
+			nextTokens = nextTokens.map(t => t.id === body.id ? { ...t, enabled: !t.enabled } : t);
+		} else if (body.action === 'delete' && body.id) {
+			nextTokens = nextTokens.filter(t => t.id !== body.id);
+		} else if (body.action === 'update' && body.token?.id) {
+			nextTokens = nextTokens.map(t => t.id === body.token.id ? { ...t, ...body.token } : t);
+		}
+
+		try {
+			await saveKVTokens(env, nextTokens);
+			return jsonResponse({ success: true, tokens: nextTokens }, { origin });
+		} catch (e) {
+			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
+		}
+	}
+
+	if (pathname === '/api/admin/workers' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		const currentWorkers = (await getKVWorkers(env)) || [];
+		let nextWorkers = [...currentWorkers];
+
+		if (body.action === 'save_all' && Array.isArray(body.workers)) {
+			nextWorkers = body.workers;
+		} else if (body.action === 'add') {
+			let nodeUrl = (body.worker?.url || '').trim().replace(/\/+$/, '');
+			if (!nodeUrl.startsWith('http://') && !nodeUrl.startsWith('https://')) {
+				nodeUrl = 'https://' + nodeUrl;
+			}
+			if (!nodeUrl) return jsonResponse({ success: false, error: '节点 URL 不能为空' }, { status: 400, origin });
+			nextWorkers.push({
+				id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+				name: (body.worker?.name || 'Worker 节点').trim(),
+				url: nodeUrl,
+				token: (body.worker?.token || '').trim(),
+				enabled: body.worker?.enabled !== false,
+				weight: Number(body.worker?.weight) || 1,
+				createdAt: Date.now()
+			});
+		} else if (body.action === 'toggle' && body.id) {
+			nextWorkers = nextWorkers.map(w => w.id === body.id ? { ...w, enabled: !w.enabled } : w);
+		} else if (body.action === 'delete' && body.id) {
+			nextWorkers = nextWorkers.filter(w => w.id !== body.id);
+		} else if (body.action === 'update' && body.worker?.id) {
+			nextWorkers = nextWorkers.map(w => w.id === body.worker.id ? { ...w, ...body.worker } : w);
+		}
+
+		try {
+			await saveKVWorkers(env, nextWorkers);
+			return jsonResponse({ success: true, workers: nextWorkers }, { origin });
+		} catch (e) {
+			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
+		}
+	}
+
+	if (pathname === '/api/admin/sources' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		if (!body.sources || typeof body.sources !== 'object') {
+			return jsonResponse({ success: false, error: '无效的接口配置数据' }, { status: 400, origin });
+		}
+		try {
+			await saveKVSources(env, body.sources);
+			return jsonResponse({ success: true, sources: body.sources }, { origin });
+		} catch (e) {
+			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
+		}
+	}
+
+	if (pathname === '/api/admin/password' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		const oldPass = (body.oldPassword || '').trim();
+		const newPass = (body.newPassword || '').trim();
+		const currentAdminPass = await getAdminPassword(env);
+
+		if (currentAdminPass && oldPass !== currentAdminPass) {
+			return jsonResponse({ success: false, error: '原密码验证不正确' }, { status: 400, origin });
+		}
+		if (!newPass || newPass.length < 4) {
+			return jsonResponse({ success: false, error: '新密码不能少于 4 个字符' }, { status: 400, origin });
+		}
+		try {
+			await setAdminPassword(env, newPass);
+			const sessionToken = await sha256Hex(newPass + ':cf_admin_session');
+			return jsonResponse({ success: true, token: sessionToken, message: '管理员密码修改成功' }, { origin });
+		} catch (e) {
+			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
+		}
+	}
+
+	if (pathname === '/api/admin/ping' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		let targetUrl = (body.url || '').trim().replace(/\/+$/, '');
+		if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+			targetUrl = 'https://' + targetUrl;
+		}
+		const token = (body.token || '').trim();
+		const pingStart = Date.now();
+		try {
+			const reqHeaders = {};
+			if (token) {
+				reqHeaders['X-Token'] = token;
+				reqHeaders['Authorization'] = 'Bearer ' + token;
+			}
+			const pingRes = await fetch(targetUrl + '/ip.json', {
+				headers: reqHeaders,
+				signal: AbortSignal.timeout(8000)
+			});
+			const latency = Date.now() - pingStart;
+			let data = null;
+			try { data = await pingRes.json(); } catch (e) {}
+			return jsonResponse({
+				success: pingRes.ok,
+				status: pingRes.status,
+				latency,
+				colo: data?.colo || null,
+				ip: data?.ip || null
+			}, { origin });
+		} catch (e) {
+			return jsonResponse({
+				success: false,
+				error: e.message || '网络连接超时或无法访问该节点',
+				latency: Date.now() - pingStart
+			}, { origin });
+		}
+	}
+
+	return jsonResponse({ success: false, error: 'Endpoint not found' }, { status: 404, origin });
+}
+
 // ===================== Token 鉴权 =====================
-// 通过环境变量 TOKEN（或 AUTH_TOKEN、SECRET_TOKEN 等）配置访问密钥，未配置时不启用鉴权（保持向后兼容）。
-// 保护 /check、/resolve、/resolve-batch、/auth-check 等核心接口；首页页面、/ip.json、/locations 保持公开访问。
-// 支持多种传递方式，优先级从高到低：
-//   1. Authorization: Bearer <token>  请求头
-//   2. X-Token: <token>               请求头
-//   3. ?token=<token>                 URL 查询参数（同时兼容 ?key=<token>）
+// 通过环境变量 TOKEN 或 KV 空间中的配置动态鉴权，未配置时不启用鉴权（保持向后兼容）。
 function isAuthProtectedPath(pathname) {
 	const lower = pathname.toLowerCase();
-	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check';
+	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check' || lower === '/api/cluster/nodes';
 }
 
 function getConfiguredToken(env) {
@@ -268,12 +687,31 @@ function timingSafeEqual(a, b) {
 	return diff === 0;
 }
 
-function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
+async function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
 	if (pathTokenAuthenticated) return { ok: true };
 	if (!isAuthProtectedPath(url.pathname)) return { ok: true };
 
+	const kvTokens = await getKVTokens(env);
+	if (kvTokens && kvTokens.length > 0) {
+		const activeKvTokens = kvTokens.filter(t => t.enabled !== false);
+		if (activeKvTokens.length > 0) {
+			const provided = extractProvidedToken(request, url);
+			if (provided) {
+				for (const t of activeKvTokens) {
+					if (timingSafeEqual(provided, t.token)) {
+						return { ok: true };
+					}
+				}
+			}
+			const configuredToken = getConfiguredToken(env);
+			if (configuredToken && provided && timingSafeEqual(provided, configuredToken)) {
+				return { ok: true };
+			}
+			return { ok: false };
+		}
+	}
+
 	const configuredToken = getConfiguredToken(env);
-	// 未配置 TOKEN 时不启用鉴权
 	if (!configuredToken) return { ok: true };
 
 	const provided = extractProvidedToken(request, url);
@@ -284,7 +722,7 @@ function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
 }
 // ===================== Token 鉴权结束 =====================
 
-async function checkProxy({ type, value }, colo, source = 'iplocate') {
+async function checkProxy({ type, value }, colo, source = 'iplocate', env = null) {
 	const startedAt = Date.now();
 	let proxy;
 
@@ -309,6 +747,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 	let requestPath = '/api/lookup';
 	let acceptHeader = 'application/json';
 	let serverName = 'www.iplocate.io';
+	let currentKeyUsed = '';
 
 	if (selectedSource === 'ipsb') {
 		targetHost = 'api.ip.sb';
@@ -320,20 +759,38 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 		serverName = 'ipwho.is';
 		requestPath = '/';
 		acceptHeader = 'application/json';
+	} else if (selectedSource === 'hackmyip' || selectedSource === 'hack_my_ip') {
+		targetHost = 'hackmyip.com';
+		serverName = 'hackmyip.com';
+		requestPath = '/api/ip';
+		acceptHeader = 'application/json';
+	} else if (selectedSource === 'ip2location' || selectedSource === 'ip2location_io') {
+		targetHost = 'api.ip2location.io';
+		serverName = 'api.ip2location.io';
+		currentKeyUsed = pickKeyForSource('ip2location', env);
+		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}&format=json` : '/?format=json';
+		acceptHeader = 'application/json';
 	} else if (selectedSource === 'ipinfo') {
 		targetHost = 'ipinfo.io';
 		serverName = 'ipinfo.io';
-		requestPath = '/json';
+		currentKeyUsed = pickKeyForSource('ipinfo', env);
+		requestPath = currentKeyUsed ? `/json?token=${encodeURIComponent(currentKeyUsed)}` : '/json';
 		acceptHeader = 'application/json';
 	} else if (selectedSource === 'cloudflare') {
 		targetHost = '1.1.1.1';
 		serverName = 'cloudflare.com';
 		requestPath = '/cdn-cgi/trace';
 		acceptHeader = 'text/plain';
-	} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
+	} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co') {
 		targetHost = 'ipapi.co';
 		serverName = 'ipapi.co';
 		requestPath = '/json/';
+		acceptHeader = 'application/json';
+	} else if (selectedSource === 'ipapi_is' || selectedSource === 'ipapiis' || selectedSource === 'ipapi') {
+		targetHost = 'api.ipapi.is';
+		serverName = 'api.ipapi.is';
+		currentKeyUsed = pickKeyForSource('ipapi_is', env);
+		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}` : '/';
 		acceptHeader = 'application/json';
 	}
 
@@ -574,7 +1031,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 					is_tor: false,
 					is_abuser: false
 				};
-			} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
+			} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co') {
 				let raw;
 				try {
 					raw = JSON.parse(bodyText.trim());
@@ -612,6 +1069,141 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 					is_vpn: false,
 					is_tor: false,
 					is_abuser: false
+				};
+			} else if (selectedSource === 'hackmyip' || selectedSource === 'hack_my_ip') {
+				let raw;
+				try {
+					raw = JSON.parse(bodyText.trim());
+				} catch (err) {
+					throw new Error('Target hackmyip.com did not return valid JSON');
+				}
+				const d = raw.data || raw;
+				const loc = d.location || {};
+				const net = d.network || {};
+				const priv = d.privacy || {};
+				const lat = loc.latitude ? parseFloat(loc.latitude) : null;
+				const lon = loc.longitude ? parseFloat(loc.longitude) : null;
+				const isDatacenter = priv.is_datacenter === true || priv.type === 'datacenter';
+				const isVpn = priv.is_vpn === true;
+				const isProxy = priv.proxy === true;
+				const isResidential = priv.is_residential === true;
+				const abuserScore = priv.score !== undefined ? priv.score : null;
+				const riskGrade = priv.grade || '';
+
+				exit = {
+					ip: d.ip,
+					country: loc.country || loc.country_name,
+					countryCode: loc.country || loc.country_name,
+					country_code: loc.country || loc.country_name,
+					countryName: loc.country_name || loc.country,
+					region: loc.region,
+					city: loc.city,
+					postal_code: loc.postal_code,
+					latitude: lat,
+					longitude: lon,
+					loc: lat && lon ? `${lat},${lon}` : '',
+					timezone: loc.timezone,
+					asn: {
+						asn: net.asn ? parseInt(net.asn, 10) : null,
+						org: net.isp,
+						name: net.isp,
+						descr: net.isp
+					},
+					asOrganization: net.isp,
+					company: {
+						name: net.isp,
+						type: isResidential ? 'isp' : (isDatacenter ? 'hosting' : 'business')
+					},
+					is_datacenter: isDatacenter,
+					is_bogon: false,
+					is_proxy: isProxy,
+					is_vpn: isVpn,
+					is_tor: false,
+					is_abuser: abuserScore && abuserScore > 50,
+					risk_score: abuserScore,
+					risk_grade: riskGrade
+				};
+			} else if (selectedSource === 'ip2location' || selectedSource === 'ip2location_io') {
+				let raw;
+				try {
+					raw = JSON.parse(bodyText.trim());
+				} catch (err) {
+					throw new Error('Target api.ip2location.io did not return valid JSON');
+				}
+				if (raw.error) {
+					throw new Error(raw.error.error_message || 'Target api.ip2location.io request failed');
+				}
+				const asnNum = raw.asn ? parseInt(String(raw.asn).replace(/^AS/i, ''), 10) : null;
+				const isProxy = raw.is_proxy === true;
+				exit = {
+					ip: raw.ip,
+					country: raw.country_code || raw.country_name,
+					countryCode: raw.country_code || raw.country_name,
+					country_code: raw.country_code || raw.country_name,
+					countryName: raw.country_name || raw.country_code,
+					region: raw.region_name,
+					city: raw.city_name,
+					postal_code: raw.zip_code,
+					latitude: raw.latitude,
+					longitude: raw.longitude,
+					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
+					timezone: raw.time_zone,
+					asn: {
+						asn: asnNum,
+						org: raw.as,
+						name: raw.as,
+						descr: raw.as
+					},
+					asOrganization: raw.as,
+					company: { name: raw.as },
+					is_datacenter: isProxy,
+					is_bogon: false,
+					is_proxy: isProxy,
+					is_vpn: false,
+					is_tor: false,
+					is_abuser: false
+				};
+			} else if (selectedSource === 'ipapi_is' || selectedSource === 'ipapiis' || selectedSource === 'ipapi') {
+				let raw;
+				try {
+					raw = JSON.parse(bodyText.trim());
+				} catch (err) {
+					throw new Error('Target api.ipapi.is did not return valid JSON');
+				}
+				if (raw.error) {
+					markKeyCooldown('ipapi_is', currentKeyUsed);
+					throw new Error(raw.message || raw.reason || 'Target api.ipapi.is rate limit reached');
+				}
+				const asnData = raw.asn || {};
+				const companyData = raw.company || {};
+				const locationData = raw.location || {};
+				exit = {
+					ip: raw.ip,
+					country: locationData.country || raw.country,
+					countryCode: locationData.country_code || raw.country_code,
+					country_code: locationData.country_code || raw.country_code,
+					countryName: locationData.country || raw.country,
+					region: locationData.state || locationData.region,
+					city: locationData.city,
+					postal_code: locationData.zip || locationData.postal,
+					latitude: locationData.latitude,
+					longitude: locationData.longitude,
+					loc: locationData.latitude && locationData.longitude ? `${locationData.latitude},${locationData.longitude}` : '',
+					timezone: locationData.timezone,
+					asn: {
+						asn: asnData.asn || null,
+						org: asnData.org || asnData.descr,
+						name: asnData.org || asnData.descr,
+						descr: asnData.descr || asnData.org
+					},
+					asOrganization: asnData.org || companyData.name || '',
+					company: companyData,
+					is_datacenter: Boolean(raw.is_datacenter),
+					is_bogon: Boolean(raw.is_bogon),
+					is_proxy: Boolean(raw.is_proxy),
+					is_vpn: Boolean(raw.is_vpn),
+					is_tor: Boolean(raw.is_tor),
+					is_abuser: Boolean(raw.is_abuser)
 				};
 			} else {
 				try {
@@ -5022,6 +5614,12 @@ function generateHTML(备案内容, hasToken = false) {
 							<path d="m18.5 4.5 3 3"></path>
 						</svg>
 					</button>
+					<a class="token-toggle admin-toggle" href="/admin" target="_blank" rel="noopener noreferrer" aria-label="后台管理与集群配置" title="后台管理与集群配置 (/admin)">
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+							<circle cx="12" cy="12" r="3"></circle>
+						</svg>
+					</a>
 					<button class="theme-toggle" type="button" id="themeToggle" aria-label="切换日间和夜间模式" title="切换日间和夜间模式">
 						<span class="theme-toggle-switch" aria-hidden="true">
 							<svg class="theme-toggle-icon theme-toggle-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -5100,11 +5698,14 @@ function generateHTML(备案内容, hasToken = false) {
 							<div class="source-select-wrapper">
 								<select id="ipSourceSelect" class="source-select" aria-label="选择出口 IP 检测源">
 									<option value="iplocate">iplocate.io (默认 · 综合地理定位与机房风控)</option>
+									<option value="hackmyip">HackMyIP (风控首选 · 原生住宅/机房/VPN与纯净度评级)</option>
+									<option value="ip2location">IP2Location.io (权威顶牌 · 自带代理识别 / 免密即用)</option>
 									<option value="ipwhois">ipwho.is (高精度 · 规范全字段 / 海外稳定)</option>
 									<option value="ipsb">api.ip.sb (极速响应 · 大批量测活首选)</option>
 									<option value="cloudflare">Cloudflare 官方 (cdn-cgi/trace · 1w+大批量推荐)</option>
 									<option value="ipinfo">ipinfo.io (知名老牌 · 国际权威数据库)</option>
 									<option value="ipapico">ipapi.co (高精度单条 · 有严格限速)</option>
+									<option value="ipapi_is">api.ipapi.is (深度风控 · 建议配置多Key轮询)</option>
 								</select>
 							</div>
 						</div>
@@ -5285,6 +5886,16 @@ function generateHTML(备案内容, hasToken = false) {
 				label: 'iplocate.io',
 				desc: '当前：<b>iplocate.io</b>，提供详细的国家、城市、经纬度与 ASN 组织信息。'
 			},
+			hackmyip: {
+				badge: 'HackMyIP',
+				label: 'HackMyIP',
+				desc: '当前：<b>HackMyIP</b>，原生识别住宅/机房/VPN/Proxy及纯净度评级 (A-D / 0-100)，风控首选。'
+			},
+			ip2location: {
+				badge: 'IP2Location',
+				label: 'IP2Location.io',
+				desc: '当前：<b>IP2Location.io</b>，全球顶牌数据库，自带代理检测，免密可用且支持配置多 Key 扩容。'
+			},
 			ipwhois: {
 				badge: 'ipwho.is',
 				label: 'ipwho.is',
@@ -5309,13 +5920,17 @@ function generateHTML(备案内容, hasToken = false) {
 				badge: 'ipapi.co',
 				label: 'ipapi.co',
 				desc: '当前：<b>ipapi.co</b>，地理与网络信息详尽，但每分钟限制 30 次且对并发敏感，适合单条或少量节点测试。'
+			},
+			ipapi_is: {
+				badge: 'api.ipapi.is',
+				label: 'api.ipapi.is',
+				desc: '当前：<b>api.ipapi.is</b>，深度机房与风控指纹识别，支持在后台管理配置多 Key 自动轮询。'
 			}
 		};
 
 		function getStoredIpSource() {
 			try {
-				let stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
-				if (stored === 'ipapi_is') stored = 'ipwhois';
+				const stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
 				return stored && IP_SOURCE_DEFINITIONS[stored] ? stored : 'iplocate';
 			} catch {
 				return 'iplocate';
@@ -5365,6 +5980,9 @@ function generateHTML(备案内容, hasToken = false) {
 		let inputCount = 0;
 		let appState = 'idle';
 		let activeRun = null;
+		let clusterNodes = [];
+		let clusterRoundRobinIndex = 0;
+		let clusterNodesPromise = null;
 		const CHECK_CONCURRENCY = 32;
 		const RESOLVE_BATCH_SIZE = 50;
 		const RESOLVE_BATCH_TIMEOUT_MS = 20000;
@@ -5699,6 +6317,25 @@ function generateHTML(备案内容, hasToken = false) {
 			return backendServicePromise;
 		}
 
+		async function loadClusterNodes() {
+			if (clusterNodesPromise) return clusterNodesPromise;
+			clusterNodesPromise = (async function () {
+				try {
+					const res = await fetchJsonWithTimeout('/api/cluster/nodes', {}, 5000);
+					if (res.response && res.response.ok && Array.isArray(res.payload?.nodes)) {
+						clusterNodes = res.payload.nodes.map(n => String(n.url || n).trim()).filter(Boolean);
+						if (clusterNodes.length > 0) {
+							console.log('[Cluster] 已加载多 Worker 分布式节点集群:', clusterNodes.length, '个节点');
+						}
+					}
+				} catch (e) {
+					// Standalone worker mode
+				}
+				return clusterNodes;
+			})();
+			return clusterNodesPromise;
+		}
+
 		function clearMapLayers() {
 			mapLayers.forEach(function (layer) {
 				map.removeLayer(layer);
@@ -5759,6 +6396,12 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		function calculateExitRiskScore(exitData) {
+			if (exitData?.risk_score !== undefined && exitData?.risk_score !== null) {
+				const directScore = parseAbuseScore(exitData.risk_score);
+				if (directScore !== null) {
+					return directScore / 100;
+				}
+			}
 			const companyScore = parseAbuseScore(exitData?.company?.abuser_score) || 0;
 			const asnScore = parseAbuseScore(exitData?.asnInfo?.abuser_score) || 0;
 			const baseScore = ((companyScore + asnScore) / 2) * 5;
@@ -7763,8 +8406,28 @@ function generateHTML(备案内容, hasToken = false) {
 			const currentSource = getSelectedIpSource();
 
 			try {
-				const checkUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
-				const result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
+				let baseUrl = '';
+				if (clusterNodes && clusterNodes.length > 0) {
+					const nodeUrl = clusterNodes[clusterRoundRobinIndex % clusterNodes.length];
+					clusterRoundRobinIndex++;
+					if (nodeUrl && /^https?:\/\//i.test(nodeUrl)) {
+						baseUrl = nodeUrl.replace(/\/+$/, '');
+					}
+				}
+
+				const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+				let result;
+				try {
+					result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
+				} catch (networkErr) {
+					if (baseUrl && !isRunStopped(run)) {
+						// 如果集群节点通信失败，回退至本地 Worker 重试
+						const fallbackUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+						result = await fetchJsonWithTimeout(fallbackUrl, {}, 30000, run?.controller.signal);
+					} else {
+						throw networkErr;
+					}
+				}
 				const data = normalizeCheckDataForUi(result.payload || {
 					success: false,
 					error: '检测接口没有返回有效 JSON'
@@ -8387,6 +9050,7 @@ function generateHTML(备案内容, hasToken = false) {
 			updateResultFilters();
 			loadCfLocations();
 			loadBackendServiceInfo();
+			loadClusterNodes();
 
 			const path = window.location.pathname.slice(1);
 			if (path && path.length > 3) {
@@ -9135,3 +9799,882 @@ class TlsClient {
 	}
 	close() { this.socket.close() }
 }
+
+function generateAdminHTML(env, hasKV = false) {
+	return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>CheckSocks5 - 集群中枢与管理控制台</title>
+	<script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+	<style>
+		:root {
+			--bg: #060e18;
+			--card-bg: rgba(9, 23, 38, 0.88);
+			--border: rgba(97, 219, 255, 0.16);
+			--border-hover: rgba(97, 219, 255, 0.4);
+			--cyan: #61dbff;
+			--emerald: #34d399;
+			--rose: #fb7185;
+			--amber: #fbbf24;
+		}
+		body {
+			background-color: #050d17;
+			background-image: 
+				radial-gradient(ellipse 80% 50% at 50% -20%, rgba(97, 219, 255, 0.15), transparent),
+				radial-gradient(circle at 100% 100%, rgba(16, 185, 129, 0.08), transparent 40%);
+			color: #f0f8ff;
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+		}
+		.glass-card {
+			background: var(--card-bg);
+			border: 1px solid var(--border);
+			backdrop-filter: blur(16px);
+			border-radius: 1rem;
+		}
+		.tab-btn.active {
+			background: rgba(97, 219, 255, 0.15);
+			color: #61dbff;
+			border-color: rgba(97, 219, 255, 0.4);
+		}
+		.toast {
+			position: fixed;
+			bottom: 24px;
+			right: 24px;
+			z-index: 999;
+			transform: translateY(100px);
+			opacity: 0;
+			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+		}
+		.toast.show {
+			transform: translateY(0);
+			opacity: 1;
+		}
+	</style>
+</head>
+<body class="min-h-screen p-4 md:p-8">
+	<div class="max-w-6xl mx-auto space-y-6">
+
+		<!-- 顶栏导航 -->
+		<header class="flex flex-col md:flex-row md:items-center justify-between pb-6 border-b border-cyan-900/40 gap-4">
+			<div class="flex items-center gap-3">
+				<div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-500 to-emerald-400 flex items-center justify-center shadow-lg shadow-cyan-500/20 font-black text-slate-950 text-xl">
+					S5
+				</div>
+				<div>
+					<h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
+						CheckSocks5 控制台
+						<span class="text-[11px] px-2 py-0.5 rounded-full font-mono bg-cyan-950/80 border border-cyan-500/30 text-cyan-300">
+							Admin v1.3.0
+						</span>
+					</h1>
+					<p class="text-xs text-slate-400 mt-0.5">Cloudflare KV 驱动的接口多 Key 轮询、Worker 集群调度与动态凭据中枢</p>
+				</div>
+			</div>
+
+			<div class="flex items-center gap-3">
+				<span id="kvStatusBadge" class="px-2.5 py-1 rounded-full text-xs font-mono border ${hasKV ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-300' : 'bg-amber-950/80 border-amber-500/30 text-amber-300'}">
+					${hasKV ? '● KV 存储空间已绑定' : '⚠️ 未绑定 KV (需在 CF 绑定 CONFIG_KV)'}
+				</span>
+				<a href="/" class="px-3 py-1.5 rounded-xl border border-slate-700 bg-slate-800/60 hover:bg-slate-700/60 text-xs font-medium text-cyan-300 flex items-center gap-1.5 transition">
+					← 返回测活主页
+				</a>
+				<button onclick="logoutAdmin()" class="px-3 py-1.5 rounded-xl border border-rose-900/60 bg-rose-950/40 hover:bg-rose-900/60 text-xs font-medium text-rose-300 transition">
+					退出
+				</button>
+			</div>
+		</header>
+
+		<!-- 选项卡切换 -->
+		<div class="flex flex-wrap gap-2 border-b border-white/5 pb-3">
+			<button onclick="switchTab('tokens')" id="tabBtn-tokens" class="tab-btn active px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
+				🔑 访问凭据 (Tokens)
+			</button>
+			<button onclick="switchTab('sources')" id="tabBtn-sources" class="tab-btn px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
+				🌐 接口与多 Key 池
+			</button>
+			<button onclick="switchTab('workers')" id="tabBtn-workers" class="tab-btn px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
+				🚀 多账号节点集群
+			</button>
+			<button onclick="switchTab('settings')" id="tabBtn-settings" class="tab-btn px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
+				⚙️ 系统安全与备份
+			</button>
+		</div>
+
+		<!-- 选项卡 1：Token 动态管理 -->
+		<section id="tabContent-tokens" class="space-y-4">
+			<div class="glass-card p-6 space-y-5">
+				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
+					<div>
+						<h2 class="text-lg font-bold text-white flex items-center gap-2">
+							动态访问凭据管理
+						</h2>
+						<p class="text-xs text-slate-400 mt-0.5">在 KV 中动态签发和撤销访问 Token，免去每次在环境变量中重新部署的繁琐。</p>
+					</div>
+					<button onclick="openTokenModal('add')" class="px-3.5 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition flex items-center gap-1 shadow-lg shadow-cyan-500/20">
+						+ 新建 Token
+					</button>
+				</div>
+
+				<div class="overflow-x-auto">
+					<table class="w-full text-left text-xs">
+						<thead>
+							<tr class="border-b border-white/10 text-slate-400">
+								<th class="py-2.5 px-3">备注说明</th>
+								<th class="py-2.5 px-3">Token 凭据</th>
+								<th class="py-2.5 px-3">状态</th>
+								<th class="py-2.5 px-3">创建时间</th>
+								<th class="py-2.5 px-3 text-right">操作</th>
+							</tr>
+						</thead>
+						<tbody id="tokenTableBody">
+							<tr><td colspan="5" class="py-8 text-center text-slate-500">正在加载数据...</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+		</section>
+
+		<!-- 选项卡 2：接口多 Key 池管理 -->
+		<section id="tabContent-sources" class="space-y-4 hidden">
+			<div class="glass-card p-6 space-y-5">
+				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
+					<div>
+						<h2 class="text-lg font-bold text-white flex items-center gap-2">
+							出口接口与多 Key 轮询池
+						</h2>
+						<p class="text-xs text-slate-400 mt-0.5">针对有免费额度限制的接口（如 api.ipapi.is 每天 1000 次），可录入多个免费 Key。请求时系统自动轮询负载均衡，额度直接翻倍！</p>
+					</div>
+					<button onclick="saveAllSourcesConfig()" class="px-4 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition shadow-lg shadow-cyan-500/20">
+						保存接口配置
+					</button>
+				</div>
+
+				<div id="sourcesContainer" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+					<!-- 动态渲染各源卡片 -->
+				</div>
+			</div>
+		</section>
+
+		<!-- 选项卡 3：Worker 节点集群管理 -->
+		<section id="tabContent-workers" class="space-y-4 hidden">
+			<div class="glass-card p-6 space-y-5">
+				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
+					<div>
+						<h2 class="text-lg font-bold text-white flex items-center gap-2">
+							多账号 Worker 节点集群 (分布式调度)
+						</h2>
+						<p class="text-xs text-slate-400 mt-0.5">将部署在不同 Cloudflare 免费账号下的 Worker 地址加入集群池。大批量测活时，前端直接把任务均匀并发给这些 Worker，测活速度提升数倍且突破单账号限制！</p>
+					</div>
+					<div class="flex items-center gap-2">
+						<button onclick="pingAllWorkers()" class="px-3 py-1.5 rounded-xl font-medium text-xs border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition">
+							⚡ 一键测速全部
+						</button>
+						<button onclick="openWorkerModal('add')" class="px-3.5 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition shadow-lg shadow-cyan-500/20">
+							+ 添加 Worker
+						</button>
+					</div>
+				</div>
+
+				<div id="workerGrid" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+					<!-- 动态渲染 Worker 节点卡片 -->
+				</div>
+			</div>
+		</section>
+
+		<!-- 选项卡 4：系统设置与数据备份 -->
+		<section id="tabContent-settings" class="space-y-4 hidden">
+			<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+				<!-- 修改管理员密码 -->
+				<div class="glass-card p-6 space-y-4">
+					<h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+						🔐 修改后台管理员密码
+					</h3>
+					<form onsubmit="handlePasswordChange(event)" class="space-y-3">
+						<div>
+							<label class="text-xs text-slate-400 block mb-1">当前旧密码</label>
+							<input type="password" id="inputOldPassword" required class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="text-xs text-slate-400 block mb-1">新密码 (不少于 4 位)</label>
+							<input type="password" id="inputNewPassword" required minlength="4" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="text-xs text-slate-400 block mb-1">确认新密码</label>
+							<input type="password" id="inputConfirmPassword" required minlength="4" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-400">
+						</div>
+						<button type="submit" class="px-4 py-2 rounded-xl text-xs font-bold bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition">
+							更新密码
+						</button>
+					</form>
+				</div>
+
+				<!-- 配置备份与还原 -->
+				<div class="glass-card p-6 space-y-4">
+					<h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+						💾 配置导出与一键还原
+					</h3>
+					<p class="text-xs text-slate-400">将当前的动态 Token、接口多 Key 配置与节点集群导出为 JSON 文件备份，或从备份文件一键恢复。</p>
+					
+					<div class="pt-2 flex flex-col sm:flex-row gap-3">
+						<button onclick="exportFullConfig()" class="px-4 py-2 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition">
+							📥 导出配置 JSON 备份
+						</button>
+						<label class="px-4 py-2 rounded-xl text-xs font-semibold border border-emerald-500/30 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/40 cursor-pointer text-center transition">
+							📤 导入恢复配置文件
+							<input type="file" accept=".json" onchange="importConfig(event)" class="hidden">
+						</label>
+					</div>
+
+					<div class="p-3 rounded-lg border border-white/5 bg-white/[0.02] text-[11px] text-slate-400 leading-relaxed mt-4">
+						<b>💡 如何在 Cloudflare 绑定 KV？</b><br>
+						进入 Cloudflare 控制台 -> Workers & Pages -> 点击进入本项目 ->「设置」->「变量与机密」-> 在「KV 命名空间绑定」中添加变量名称为 <code>CONFIG_KV</code> 即可。
+					</div>
+				</div>
+			</div>
+		</section>
+
+	</div>
+
+	<!-- 登录 / 初始化弹窗 -->
+	<div id="authModal" class="fixed inset-0 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4 z-50">
+		<div class="glass-card max-w-md w-full p-6 space-y-4 border-cyan-500/30 shadow-2xl">
+			<div class="text-center space-y-1">
+				<div class="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 flex items-center justify-center mx-auto text-xl font-bold mb-2">
+					🔐
+				</div>
+				<h3 id="authModalTitle" class="text-lg font-bold text-white">管理员认证</h3>
+				<p id="authModalSubtitle" class="text-xs text-slate-400">请输入管理后台密码以访问控制台</p>
+			</div>
+
+			<form onsubmit="handleLoginSubmit(event)" class="space-y-3 pt-2">
+				<div>
+					<input type="password" id="authPasswordInput" required placeholder="请输入管理员密码..." class="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/30 text-sm text-white focus:outline-none focus:border-cyan-400 transition">
+				</div>
+				<button type="submit" class="w-full py-2.5 rounded-xl font-bold text-sm bg-gradient-to-r from-cyan-500 to-emerald-400 text-slate-950 hover:brightness-110 transition shadow-lg shadow-cyan-500/20">
+					确认进入
+				</button>
+			</form>
+		</div>
+	</div>
+
+	<!-- Token 添加/编辑弹窗 -->
+	<div id="tokenModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+		<div class="glass-card max-w-md w-full p-6 space-y-4">
+			<h3 id="tokenModalTitle" class="text-base font-bold text-white">新建访问 Token</h3>
+			<div class="space-y-3 text-xs">
+				<div>
+					<label class="block text-slate-400 mb-1">Token 凭据密钥</label>
+					<div class="flex gap-2">
+						<input type="text" id="modalTokenValue" class="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400 font-mono">
+						<button type="button" onclick="generateRandomToken()" class="px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-800 text-slate-300 hover:text-white">随机生成</button>
+					</div>
+				</div>
+				<div>
+					<label class="block text-slate-400 mb-1">备注说明 (可选)</label>
+					<input type="text" id="modalTokenNote" placeholder="例如：自用、朋友测试、爬虫调用" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400">
+				</div>
+			</div>
+			<div class="flex justify-end gap-2 pt-2">
+				<button onclick="closeTokenModal()" class="px-3.5 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
+				<button onclick="submitTokenModal()" class="px-4 py-1.5 rounded-lg font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950">保存</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Worker 节点添加/编辑弹窗 -->
+	<div id="workerModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+		<div class="glass-card max-w-md w-full p-6 space-y-4">
+			<h3 id="workerModalTitle" class="text-base font-bold text-white">添加 Worker 集群从节点</h3>
+			<div class="space-y-3 text-xs">
+				<div>
+					<label class="block text-slate-400 mb-1">节点名称</label>
+					<input type="text" id="modalWorkerName" placeholder="例如：CF账号B - 备用节点" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400">
+				</div>
+				<div>
+					<label class="block text-slate-400 mb-1">Worker 完整地址 (URL)</label>
+					<input type="text" id="modalWorkerUrl" placeholder="https://xxx.workers.dev" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400 font-mono">
+				</div>
+				<div>
+					<label class="block text-slate-400 mb-1">该节点的访问 Token (若无鉴权可留空)</label>
+					<input type="text" id="modalWorkerToken" placeholder="若该从节点开启了 TOKEN 鉴权则填入" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400 font-mono">
+				</div>
+			</div>
+			<div class="flex justify-end gap-2 pt-2">
+				<button onclick="closeWorkerModal()" class="px-3.5 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
+				<button onclick="submitWorkerModal()" class="px-4 py-1.5 rounded-lg font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950">保存</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Toast 提示 -->
+	<div id="adminToast" class="toast flex items-center gap-2 px-4 py-3 rounded-xl border border-cyan-400/40 bg-slate-900/95 text-white shadow-2xl text-xs font-medium">
+		<span id="toastContent">已保存！</span>
+	</div>
+
+	<script>
+		let adminSessionToken = sessionStorage.getItem('cf_admin_token') || '';
+		let globalConfig = { tokens: [], workers: [], sources: {}, hasKV: ${hasKV}, needSetup: false };
+		let editingTokenId = null;
+		let editingWorkerId = null;
+
+		const DEFAULT_SOURCES_SPEC = [
+			{ key: 'hackmyip', label: 'HackMyIP (风控首选 · 原生住宅/机房/VPN与纯净度评级)', needKey: false, desc: '免密免注册，原生检测家庭住宅/机房、VPN及 A-D 纯净度等级。' },
+			{ key: 'ip2location', label: 'IP2Location.io (权威顶牌 · 自带代理识别 / 免密即用)', needKey: true, desc: '全球顶级权威库。免密每天1000次，可填多个免费Key扩容至月5万次。' },
+			{ key: 'ipapi_is', label: 'api.ipapi.is (深度风控 · 建议配置多个免费Key轮询)', needKey: true, desc: '免费注册得Key。建议录入多个免费账号的Key轮询分流，额度翻倍。' },
+			{ key: 'ipdata', label: 'ipdata.co (国际权威数据库 · 支持配置Key)', needKey: true, desc: '需配置 Key，提供每日1500次高精机房与威胁情报。' },
+			{ key: 'iplocate', label: 'iplocate.io (默认 · 综合地理定位与机房风控)', needKey: false, desc: '默认综合定位与ASN组织信息。' },
+			{ key: 'ipwhois', label: 'ipwho.is (高精度 · 规范全字段 / 海外稳定)', needKey: false, desc: '全字段规整，海外测活稳定。' },
+			{ key: 'ipsb', label: 'api.ip.sb (极速响应 · 大批量测活首选)', needKey: false, desc: '极速解析，轻量无阻塞。' },
+			{ key: 'cloudflare', label: 'Cloudflare 官方 (cdn-cgi/trace · 1w+大批量推荐)', needKey: false, desc: 'Workers内核直连，零拦截无上限。' },
+			{ key: 'ipinfo', label: 'ipinfo.io (知名老牌 · 国际权威数据库)', needKey: true, desc: '权威老牌库，支持填入 Token 扩容。' },
+			{ key: 'ipapico', label: 'ipapi.co (高精度单条 · 有严格限速)', needKey: false, desc: '单条精细排查，注意限速30次/分。' }
+		];
+
+		async function adminFetch(endpoint, options = {}) {
+			options.headers = options.headers || {};
+			if (adminSessionToken) {
+				options.headers['Authorization'] = 'Bearer ' + adminSessionToken;
+			}
+			const res = await fetch(endpoint, options);
+			if (res.status === 401) {
+				sessionStorage.removeItem('cf_admin_token');
+				adminSessionToken = '';
+				showAuthModal(false);
+				throw new Error('认证已失效，请重新登录');
+			}
+			return res.json();
+		}
+
+		async function initDashboard() {
+			try {
+				const res = await fetch('/api/admin/config', {
+					headers: adminSessionToken ? { 'Authorization': 'Bearer ' + adminSessionToken } : {}
+				});
+				const data = await res.json();
+				if (res.status === 401 || !data.success) {
+					showAuthModal(data.needSetup);
+					return;
+				}
+				hideAuthModal();
+				globalConfig = data;
+				renderAll();
+			} catch (e) {
+				showAuthModal(false);
+			}
+		}
+
+		function showAuthModal(isSetup) {
+			const modal = document.getElementById('authModal');
+			modal.classList.remove('hidden');
+			if (isSetup) {
+				document.getElementById('authModalTitle').textContent = '🎉 首次配置管理员密码';
+				document.getElementById('authModalSubtitle').textContent = '未检测到密码，请为管理后台设置一个专属管理员主密码：';
+			} else {
+				document.getElementById('authModalTitle').textContent = '🔐 管理员认证';
+				document.getElementById('authModalSubtitle').textContent = '请输入管理后台密码以访问控制台';
+			}
+		}
+
+		function hideAuthModal() {
+			document.getElementById('authModal').classList.add('hidden');
+		}
+
+		async function handleLoginSubmit(e) {
+			e.preventDefault();
+			const pass = document.getElementById('authPasswordInput').value.trim();
+			if (!pass) return;
+			try {
+				const res = await fetch('/api/admin/login', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ password: pass })
+				});
+				const data = await res.json();
+				if (!data.success) {
+					alert(data.error || '登录失败');
+					return;
+				}
+				adminSessionToken = data.token;
+				sessionStorage.setItem('cf_admin_token', adminSessionToken);
+				showToast(data.message || '登录成功');
+				hideAuthModal();
+				initDashboard();
+			} catch (err) {
+				alert(err.message || '网络连接异常');
+			}
+		}
+
+		function logoutAdmin() {
+			sessionStorage.removeItem('cf_admin_token');
+			adminSessionToken = '';
+			window.location.reload();
+		}
+
+		function switchTab(name) {
+			['tokens', 'sources', 'workers', 'settings'].forEach(t => {
+				document.getElementById('tabContent-' + t).classList.toggle('hidden', t !== name);
+				document.getElementById('tabBtn-' + t).classList.toggle('active', t === name);
+			});
+		}
+
+		function renderAll() {
+			renderTokens();
+			renderSources();
+			renderWorkers();
+		}
+
+		// Token 管理
+		function renderTokens() {
+			const tbody = document.getElementById('tokenTableBody');
+			const tokens = globalConfig.tokens || [];
+			if (!tokens.length) {
+				tbody.innerHTML = '<tr><td colspan="5" class="py-8 text-center text-slate-500">暂无动态 Token（未配置时系统遵循环境变量 TOKEN）</td></tr>';
+				return;
+			}
+			tbody.innerHTML = tokens.map(t => {
+				const dateStr = t.createdAt ? new Date(t.createdAt).toLocaleString('zh-CN', { hour12: false }) : '-';
+				return \`
+					<tr class="border-b border-white/5 hover:bg-white/[0.02]">
+						<td class="py-3 px-3 font-semibold text-white">\${escapeHtml(t.note || '未命名')}</td>
+						<td class="py-3 px-3 font-mono text-cyan-300">
+							<span id="tok-\${t.id}">••••••••••••</span>
+							<button onclick="toggleTokenMask('\${t.id}', '\${escapeHtml(t.token)}')" class="ml-1 text-slate-400 hover:text-white">👁️</button>
+							<button onclick="copyToClipboard('\${escapeHtml(t.token)}')" class="ml-1 text-slate-400 hover:text-white">📋</button>
+						</td>
+						<td class="py-3 px-3">
+							<button onclick="toggleTokenStatus('\${t.id}')" class="px-2 py-0.5 rounded text-[11px] font-medium border \${t.enabled !== false ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300' : 'bg-slate-800 border-slate-600 text-slate-400'}">
+								\${t.enabled !== false ? '已启用' : '已停用'}
+							</button>
+						</td>
+						<td class="py-3 px-3 text-slate-400">\${dateStr}</td>
+						<td class="py-3 px-3 text-right space-x-2">
+							<button onclick="editToken('\${t.id}')" class="text-cyan-400 hover:underline">编辑</button>
+							<button onclick="deleteToken('\${t.id}')" class="text-rose-400 hover:underline">删除</button>
+						</td>
+					</tr>
+				\`;
+			}).join('');
+		}
+
+		function toggleTokenMask(id, realVal) {
+			const span = document.getElementById('tok-' + id);
+			if (span.textContent === '••••••••••••') {
+				span.textContent = realVal;
+			} else {
+				span.textContent = '••••••••••••';
+			}
+		}
+
+		function openTokenModal(mode, id = null) {
+			editingTokenId = id;
+			const modal = document.getElementById('tokenModal');
+			if (mode === 'add') {
+				document.getElementById('tokenModalTitle').textContent = '新建访问 Token';
+				document.getElementById('modalTokenValue').value = '';
+				document.getElementById('modalTokenNote').value = '';
+			} else {
+				const tok = globalConfig.tokens.find(t => t.id === id);
+				if (!tok) return;
+				document.getElementById('tokenModalTitle').textContent = '编辑 Token';
+				document.getElementById('modalTokenValue').value = tok.token;
+				document.getElementById('modalTokenNote').value = tok.note || '';
+			}
+			modal.classList.remove('hidden');
+		}
+
+		function closeTokenModal() {
+			document.getElementById('tokenModal').classList.add('hidden');
+			editingTokenId = null;
+		}
+
+		function generateRandomToken() {
+			const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+			let s = 'cf_';
+			for (let i = 0; i < 24; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+			document.getElementById('modalTokenValue').value = s;
+		}
+
+		async function submitTokenModal() {
+			const tokenVal = document.getElementById('modalTokenValue').value.trim();
+			const noteVal = document.getElementById('modalTokenNote').value.trim();
+			if (!tokenVal) { alert('Token 不能为空'); return; }
+
+			try {
+				const action = editingTokenId ? 'update' : 'add';
+				const res = await adminFetch('/api/admin/tokens', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						action,
+						token: { id: editingTokenId, token: tokenVal, note: noteVal }
+					})
+				});
+				if (res.success) {
+					globalConfig.tokens = res.tokens;
+					renderTokens();
+					closeTokenModal();
+					showToast('Token 保存成功！');
+				} else {
+					alert(res.error || '保存失败');
+				}
+			} catch (e) {
+				alert(e.message);
+			}
+		}
+
+		async function toggleTokenStatus(id) {
+			try {
+				const res = await adminFetch('/api/admin/tokens', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'toggle', id })
+				});
+				if (res.success) {
+					globalConfig.tokens = res.tokens;
+					renderTokens();
+					showToast('状态已更新');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		async function deleteToken(id) {
+			if (!confirm('确定要删除该 Token 吗？')) return;
+			try {
+				const res = await adminFetch('/api/admin/tokens', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'delete', id })
+				});
+				if (res.success) {
+					globalConfig.tokens = res.tokens;
+					renderTokens();
+					showToast('Token 已删除');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		function editToken(id) {
+			openTokenModal('edit', id);
+		}
+
+		// 接口与多 Key 池
+		function renderSources() {
+			const container = document.getElementById('sourcesContainer');
+			const confSources = globalConfig.sources || {};
+			container.innerHTML = DEFAULT_SOURCES_SPEC.map(spec => {
+				const current = confSources[spec.key] || { enabled: true, keys: [] };
+				const isEnabled = current.enabled !== false;
+				const keysText = (current.keys || []).join('\\n');
+				const keysCount = (current.keys || []).filter(Boolean).length;
+				return \`
+					<div class="p-4 rounded-xl border border-white/10 bg-slate-900/60 space-y-3">
+						<div class="flex items-center justify-between">
+							<strong class="text-sm font-semibold text-white">\${escapeHtml(spec.label)}</strong>
+							<label class="flex items-center gap-1.5 cursor-pointer">
+								<span class="text-[11px] text-slate-400">\${isEnabled ? '启用' : '禁用'}</span>
+								<input type="checkbox" id="sourceEnable-\${spec.key}" \${isEnabled ? 'checked' : ''} class="w-4 h-4 rounded text-cyan-500 bg-slate-800">
+							</label>
+						</div>
+						<p class="text-xs text-slate-400 leading-relaxed">\${escapeHtml(spec.desc)}</p>
+						\${spec.needKey ? \`
+							<div>
+								<div class="flex justify-between text-[11px] text-slate-400 mb-1">
+									<span>API Key 池 (每行一个，自动轮询均衡负载)</span>
+									<span class="text-cyan-300 font-mono">\${keysCount} 个可用 Key</span>
+								</div>
+								<textarea id="sourceKeys-\${spec.key}" rows="2" placeholder="在此粘贴 API Key，支持填入多个免费账号的 Key 轮询..." class="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-white/10 text-xs text-cyan-100 font-mono focus:outline-none focus:border-cyan-400">\${escapeHtml(keysText)}</textarea>
+							</div>
+						\` : ''}
+					</div>
+				\`;
+			}).join('');
+		}
+
+		async function saveAllSourcesConfig() {
+			const nextSources = {};
+			DEFAULT_SOURCES_SPEC.forEach(spec => {
+				const isEnabled = document.getElementById('sourceEnable-' + spec.key)?.checked ?? true;
+				let keys = [];
+				if (spec.needKey) {
+					const val = document.getElementById('sourceKeys-' + spec.key)?.value || '';
+					keys = val.split(/[\\r\\n,;]+/).map(k => k.trim()).filter(Boolean);
+				}
+				nextSources[spec.key] = { enabled: isEnabled, keys };
+			});
+
+			try {
+				const res = await adminFetch('/api/admin/sources', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ sources: nextSources })
+				});
+				if (res.success) {
+					globalConfig.sources = res.sources;
+					renderSources();
+					showToast('所有接口与多 Key 配置保存成功！');
+				} else {
+					alert(res.error || '保存失败');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		// Worker 集群管理
+		function renderWorkers() {
+			const grid = document.getElementById('workerGrid');
+			const workers = globalConfig.workers || [];
+			if (!workers.length) {
+				grid.innerHTML = '<div class="col-span-full py-8 text-center text-slate-500">暂无从节点。点击右上角“添加 Worker”，即可把其他 CF 账号部署的测活地址加入分布式集群！</div>';
+				return;
+			}
+			grid.innerHTML = workers.map(w => {
+				return \`
+					<div class="p-4 rounded-xl border border-white/10 bg-slate-900/60 space-y-3">
+						<div class="flex items-center justify-between">
+							<strong class="text-sm font-semibold text-white flex items-center gap-1.5">
+								\${escapeHtml(w.name)}
+								<span id="pingBadge-\${w.id}" class="text-[10px] px-1.5 py-0.5 rounded font-mono bg-slate-800 text-slate-400">待检测</span>
+							</strong>
+							<button onclick="toggleWorkerStatus('\${w.id}')" class="px-2 py-0.5 rounded text-[11px] font-medium border \${w.enabled !== false ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300' : 'bg-slate-800 border-slate-600 text-slate-400'}">
+								\${w.enabled !== false ? '运行中' : '已挂起'}
+							</button>
+						</div>
+						<div class="text-xs font-mono text-cyan-300 break-all bg-slate-950/60 p-2 rounded-lg border border-white/5">
+							\${escapeHtml(w.url)}
+						</div>
+						<div class="flex items-center justify-between text-xs pt-1">
+							<button onclick="pingSingleWorker('\${w.id}', '\${escapeHtml(w.url)}', '\${escapeHtml(w.token || '')}')" class="text-cyan-400 hover:underline">
+								⚡ 测速
+							</button>
+							<div class="space-x-2">
+								<button onclick="editWorker('\${w.id}')" class="text-slate-400 hover:text-white">编辑</button>
+								<button onclick="deleteWorker('\${w.id}')" class="text-rose-400 hover:underline">删除</button>
+							</div>
+						</div>
+					</div>
+				\`;
+			}).join('');
+		}
+
+		function openWorkerModal(mode, id = null) {
+			editingWorkerId = id;
+			const modal = document.getElementById('workerModal');
+			if (mode === 'add') {
+				document.getElementById('workerModalTitle').textContent = '添加 Worker 集群从节点';
+				document.getElementById('modalWorkerName').value = '';
+				document.getElementById('modalWorkerUrl').value = '';
+				document.getElementById('modalWorkerToken').value = '';
+			} else {
+				const w = globalConfig.workers.find(item => item.id === id);
+				if (!w) return;
+				document.getElementById('workerModalTitle').textContent = '编辑 Worker 节点';
+				document.getElementById('modalWorkerName').value = w.name;
+				document.getElementById('modalWorkerUrl').value = w.url;
+				document.getElementById('modalWorkerToken').value = w.token || '';
+			}
+			modal.classList.remove('hidden');
+		}
+
+		function closeWorkerModal() {
+			document.getElementById('workerModal').classList.add('hidden');
+			editingWorkerId = null;
+		}
+
+		async function submitWorkerModal() {
+			const name = document.getElementById('modalWorkerName').value.trim();
+			const url = document.getElementById('modalWorkerUrl').value.trim();
+			const token = document.getElementById('modalWorkerToken').value.trim();
+			if (!url) { alert('URL 不能为空'); return; }
+
+			try {
+				const action = editingWorkerId ? 'update' : 'add';
+				const res = await adminFetch('/api/admin/workers', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						action,
+						worker: { id: editingWorkerId, name, url, token }
+					})
+				});
+				if (res.success) {
+					globalConfig.workers = res.workers;
+					renderWorkers();
+					closeWorkerModal();
+					showToast('节点已保存');
+				} else {
+					alert(res.error || '保存失败');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		async function toggleWorkerStatus(id) {
+			try {
+				const res = await adminFetch('/api/admin/workers', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'toggle', id })
+				});
+				if (res.success) {
+					globalConfig.workers = res.workers;
+					renderWorkers();
+					showToast('节点状态已更新');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		async function deleteWorker(id) {
+			if (!confirm('确定要删除该 Worker 节点吗？')) return;
+			try {
+				const res = await adminFetch('/api/admin/workers', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'delete', id })
+				});
+				if (res.success) {
+					globalConfig.workers = res.workers;
+					renderWorkers();
+					showToast('节点已删除');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		function editWorker(id) {
+			openWorkerModal('edit', id);
+		}
+
+		async function pingSingleWorker(id, url, token) {
+			const badge = document.getElementById('pingBadge-' + id);
+			if (badge) { badge.textContent = '测试中...'; badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-cyan-950 text-cyan-300'; }
+			try {
+				const res = await adminFetch('/api/admin/ping', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ url, token })
+				});
+				if (res.success) {
+					if (badge) {
+						badge.textContent = res.latency + 'ms' + (res.colo ? ' (' + res.colo + ')' : '');
+						badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-emerald-950 text-emerald-300 border border-emerald-500/30';
+					}
+				} else {
+					if (badge) {
+						badge.textContent = '异常 (' + (res.status || '超时') + ')';
+						badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-rose-950 text-rose-300 border border-rose-500/30';
+					}
+				}
+			} catch (e) {
+				if (badge) {
+					badge.textContent = '不可达';
+					badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-rose-950 text-rose-300 border border-rose-500/30';
+				}
+			}
+		}
+
+		function pingAllWorkers() {
+			(globalConfig.workers || []).forEach(w => {
+				pingSingleWorker(w.id, w.url, w.token || '');
+			});
+		}
+
+		// 系统设置
+		async function handlePasswordChange(e) {
+			e.preventDefault();
+			const oldPass = document.getElementById('inputOldPassword').value.trim();
+			const newPass = document.getElementById('inputNewPassword').value.trim();
+			const confirmPass = document.getElementById('inputConfirmPassword').value.trim();
+			if (newPass !== confirmPass) { alert('两次输入的新密码不一致'); return; }
+
+			try {
+				const res = await adminFetch('/api/admin/password', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ oldPassword: oldPass, newPassword: newPass })
+				});
+				if (res.success) {
+					adminSessionToken = res.token;
+					sessionStorage.setItem('cf_admin_token', adminSessionToken);
+					showToast('密码修改成功！已自动更新当前会话');
+					document.getElementById('inputOldPassword').value = '';
+					document.getElementById('inputNewPassword').value = '';
+					document.getElementById('inputConfirmPassword').value = '';
+				} else {
+					alert(res.error || '修改失败');
+				}
+			} catch (err) { alert(err.message); }
+		}
+
+		function exportFullConfig() {
+			const backup = {
+				version: '1.3.0',
+				timestamp: Date.now(),
+				tokens: globalConfig.tokens || [],
+				workers: globalConfig.workers || [],
+				sources: globalConfig.sources || {}
+			};
+			const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+			const a = document.createElement('a');
+			a.href = URL.createObjectURL(blob);
+			a.download = 'cf-socks5-config-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+			a.click();
+			showToast('备份文件已下载！');
+		}
+
+		async function importConfig(e) {
+			const file = e.target.files?.[0];
+			if (!file) return;
+			const reader = new FileReader();
+			reader.onload = async function (evt) {
+				try {
+					const data = JSON.parse(evt.target.result);
+					if (data.tokens && Array.isArray(data.tokens)) {
+						await adminFetch('/api/admin/tokens', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ action: 'save_all', tokens: data.tokens })
+						});
+					}
+					if (data.workers && Array.isArray(data.workers)) {
+						await adminFetch('/api/admin/workers', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ action: 'save_all', workers: data.workers })
+						});
+					}
+					if (data.sources && typeof data.sources === 'object') {
+						await adminFetch('/api/admin/sources', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ sources: data.sources })
+						});
+					}
+					showToast('配置还原成功！正在刷新...');
+					setTimeout(() => window.location.reload(), 1000);
+				} catch (err) {
+					alert('解析配置文件失败: ' + err.message);
+				}
+			};
+			reader.readAsText(file);
+		}
+
+		function showToast(msg) {
+			const t = document.getElementById('adminToast');
+			document.getElementById('toastContent').textContent = msg;
+			t.classList.add('show');
+			setTimeout(() => t.classList.remove('show'), 2800);
+		}
+
+		function copyToClipboard(text) {
+			navigator.clipboard.writeText(text).then(() => showToast('已复制到剪贴板！')).catch(() => alert('复制失败'));
+		}
+
+		function escapeHtml(str) {
+			return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+		}
+
+		window.addEventListener('DOMContentLoaded', initDashboard);
+	</script>
+</body>
+</html>\`;
+}
+

@@ -9,12 +9,13 @@
 ### 🚀 新增功能
 1. **出口 IP 接口多源容灾与前端面板选项切换**：
    - 在 Workspace 控制面板新增**出口 IP 接口选择卡片**，与“批量检测开关”和“开始检测按钮”并排整合，完美契合深蓝磨砂玻璃质感。
-   - 支持 5 大特色服务源自由切换：
+   - 支持 6 大特色服务源自由切换：
      - **`iplocate.io`**：默认综合地理定位与 ASN 组织。
+     - **`ipwho.is`**：高精度规范全字段、海外稳定测活。
      - **`api.ip.sb`**：极速 GeoIP 解析，毫秒级响应，大批量测试推荐。
-     - **`api.ipapi.is`**：原生识别机房/数据中心 IP、VPN 标记与纯净度风控。
-     - **`ipinfo.io`**：全球知名老牌权威 IP 数据库。
      - **`Cloudflare 官方 Trace (1.1.1.1/cdn-cgi/trace)`**：基于 Workers 骨干网络直连，零风控、无额度上限，**1w+ 超大批量测活首选**。
+     - **`ipinfo.io`**：全球知名老牌权威 IP 数据库。
+     - **`ipapi.co`**：高精度单条节点详尽信息查询（严格限速 30 次/分，适合单条排查）。
    - **本地自动持久化**：用户所选的查询源自动保存在浏览器 `localStorage` 中，刷新页面不丢失。
    - **后端协议适配**：`checkProxy` 统一根据前端传入的 `source` 参数建立对应 Host 的 TLS 隧道，针对 JSON 及 Cloudflare key=value 纯文本格式进行统一标准化清洗。
 
@@ -30,12 +31,14 @@
 
 3. **GitHub Releases 自动打包与发布 Cloudflare Pages 部署包**：
    - 优化 GitHub Actions 工作流，推送至 `beta` 分支时自动生成 `beta` 预发布版本，推送至 `main` 分支或版本标签时自动发布正式版。
-   - 自动生成符合 Cloudflare Pages Direct Upload 规范的最外层直装包 `CF-CheckSocks5-Pages.zip`，并上传为 Release 附件供随时下载部署。
+   - 自动生成符合 Cloudflare Pages Direct Upload 规范的最外层直装包 `CF-CheckSocks5-Pages.zip`，仅打包部署运行必需的核心文件（`_worker.js`、`_routes.json`、`index.html`），保持体积纯净精简，上传为 Release 附件供随时下载部署。
 
-### 🔒 隐私与安全性优化
+### 🔒 隐私与资产优化
 1. **彻底移除第三方访客统计脚本**：
    - 移除页脚原有的 `https://tongji.090227.xyz` 统计脚本及 `#visit-count` 元素。
    - 确保节点测试过程完全私密，不向任何未授权第三方服务器上报访客域名与节点信息。
+2. **清理冗余图片资产**：
+   - 移除已废弃的 `demo.png` 示意图文件并更新 README 说明。
 
 ---
 

@@ -315,9 +315,9 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 		serverName = 'api.ip.sb';
 		requestPath = '/geoip';
 		acceptHeader = 'application/json';
-	} else if (selectedSource === 'ipapi_is') {
-		targetHost = 'api.ipapi.is';
-		serverName = 'api.ipapi.is';
+	} else if (selectedSource === 'ipwhois' || selectedSource === 'ipwho_is') {
+		targetHost = 'ipwho.is';
+		serverName = 'ipwho.is';
 		requestPath = '/';
 		acceptHeader = 'application/json';
 	} else if (selectedSource === 'ipinfo') {
@@ -330,6 +330,11 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 		serverName = 'cloudflare.com';
 		requestPath = '/cdn-cgi/trace';
 		acceptHeader = 'text/plain';
+	} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
+		targetHost = 'ipapi.co';
+		serverName = 'ipapi.co';
+		requestPath = '/json/';
+		acceptHeader = 'application/json';
 	}
 
 	try {
@@ -488,40 +493,45 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 					is_tor: false,
 					is_abuser: false
 				};
-			} else if (selectedSource === 'ipapi_is') {
+			} else if (selectedSource === 'ipwhois' || selectedSource === 'ipwho_is') {
 				let raw;
 				try {
 					raw = JSON.parse(bodyText.trim());
 				} catch (err) {
-					throw new Error('Target api.ipapi.is did not return valid JSON');
+					throw new Error('Target ipwho.is did not return valid JSON');
 				}
+				if (raw.success === false) {
+					throw new Error(raw.message || 'Target ipwho.is lookup failed');
+				}
+				const asnNum = raw.connection?.asn ? parseInt(raw.connection.asn, 10) : null;
+				const orgName = raw.connection?.org || raw.connection?.isp || '';
 				exit = {
 					ip: raw.ip,
-					country: raw.location?.country,
-					countryCode: raw.location?.country_code,
-					country_code: raw.location?.country_code,
-					countryName: raw.location?.country,
-					region: raw.location?.state,
-					city: raw.location?.city,
-					postal_code: raw.location?.postal_code || raw.location?.zip,
-					latitude: raw.location?.latitude,
-					longitude: raw.location?.longitude,
-					loc: raw.location?.latitude && raw.location?.longitude ? `${raw.location.latitude},${raw.location.longitude}` : '',
-					timezone: raw.location?.timezone,
-					asn: raw.asn ? {
-						asn: raw.asn.asn,
-						org: raw.asn.org || raw.asn.descr,
-						name: raw.asn.org || raw.asn.descr,
-						descr: raw.asn.descr || raw.asn.org
-					} : null,
-					asOrganization: raw.asn?.org || raw.company?.name,
-					company: raw.company || { name: raw.asn?.org },
-					is_datacenter: Boolean(raw.is_datacenter),
-					is_bogon: Boolean(raw.is_bogon),
-					is_proxy: Boolean(raw.is_proxy),
-					is_vpn: Boolean(raw.is_vpn),
-					is_tor: Boolean(raw.is_tor),
-					is_abuser: Boolean(raw.is_abuser)
+					country: raw.country,
+					countryCode: raw.country_code,
+					country_code: raw.country_code,
+					countryName: raw.country,
+					region: raw.region,
+					city: raw.city,
+					postal_code: raw.postal,
+					latitude: raw.latitude,
+					longitude: raw.longitude,
+					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
+					timezone: raw.timezone?.id || raw.timezone,
+					asn: {
+						asn: asnNum,
+						org: orgName,
+						name: orgName,
+						descr: orgName
+					},
+					asOrganization: orgName,
+					company: { name: orgName },
+					is_datacenter: false,
+					is_bogon: false,
+					is_proxy: false,
+					is_vpn: false,
+					is_tor: false,
+					is_abuser: false
 				};
 			} else if (selectedSource === 'ipinfo') {
 				let raw;
@@ -557,6 +567,45 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 					},
 					asOrganization: asnOrg,
 					company: { name: asnOrg },
+					is_datacenter: false,
+					is_bogon: false,
+					is_proxy: false,
+					is_vpn: false,
+					is_tor: false,
+					is_abuser: false
+				};
+			} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
+				let raw;
+				try {
+					raw = JSON.parse(bodyText.trim());
+				} catch (err) {
+					throw new Error('Target ipapi.co did not return valid JSON');
+				}
+				if (raw.error) {
+					throw new Error(raw.reason || raw.message || 'Target ipapi.co rate limit reached');
+				}
+				const asnNum = raw.asn ? parseInt(String(raw.asn).replace(/^AS/i, ''), 10) : null;
+				exit = {
+					ip: raw.ip,
+					country: raw.country_name || raw.country,
+					countryCode: raw.country_code || raw.country,
+					country_code: raw.country_code || raw.country,
+					countryName: raw.country_name || raw.country,
+					region: raw.region,
+					city: raw.city,
+					postal_code: raw.postal,
+					latitude: raw.latitude,
+					longitude: raw.longitude,
+					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
+					timezone: raw.timezone,
+					asn: {
+						asn: asnNum,
+						org: raw.org,
+						name: raw.org,
+						descr: raw.org
+					},
+					asOrganization: raw.org,
+					company: { name: raw.org },
 					is_datacenter: false,
 					is_bogon: false,
 					is_proxy: false,
@@ -5050,11 +5099,12 @@ function generateHTML(备案内容, hasToken = false) {
 							</div>
 							<div class="source-select-wrapper">
 								<select id="ipSourceSelect" class="source-select" aria-label="选择出口 IP 检测源">
-									<option value="iplocate">iplocate.io (默认 · 综合地理定位与 ASN)</option>
-									<option value="ipsb">api.ip.sb (极速 · GeoIP解析 / 大批量推荐)</option>
-									<option value="ipapi_is">api.ipapi.is (安全风控 · 原生机房/纯净度检测)</option>
-									<option value="ipinfo">ipinfo.io (知名老牌 · 稳定性高)</option>
+									<option value="iplocate">iplocate.io (默认 · 综合地理定位与机房风控)</option>
+									<option value="ipwhois">ipwho.is (高精度 · 规范全字段 / 海外稳定)</option>
+									<option value="ipsb">api.ip.sb (极速响应 · 大批量测活首选)</option>
 									<option value="cloudflare">Cloudflare 官方 (cdn-cgi/trace · 1w+大批量推荐)</option>
+									<option value="ipinfo">ipinfo.io (知名老牌 · 国际权威数据库)</option>
+									<option value="ipapico">ipapi.co (高精度单条 · 有严格限速)</option>
 								</select>
 							</div>
 						</div>
@@ -5235,31 +5285,37 @@ function generateHTML(备案内容, hasToken = false) {
 				label: 'iplocate.io',
 				desc: '当前：<b>iplocate.io</b>，提供详细的国家、城市、经纬度与 ASN 组织信息。'
 			},
+			ipwhois: {
+				badge: 'ipwho.is',
+				label: 'ipwho.is',
+				desc: '当前：<b>ipwho.is</b>，高精度地理定位与网络运营商信息，全字段规范，海外测活稳定。'
+			},
 			ipsb: {
 				badge: 'api.ip.sb',
 				label: 'api.ip.sb',
 				desc: '当前：<b>api.ip.sb</b>，海外全球节点解析速度极快，延迟低，查询高效，大批量推荐。'
 			},
-			ipapi_is: {
-				badge: 'api.ipapi.is',
-				label: 'api.ipapi.is',
-				desc: '当前：<b>api.ipapi.is</b>，原生识别机房 IP、VPN 标记与纯净度安全风控。'
+			cloudflare: {
+				badge: 'Cloudflare',
+				label: 'Cloudflare Trace (1.1.1.1)',
+				desc: '当前：<b>Cloudflare 官方 Trace</b>，基于 Workers 内核直连，零风控防封，1w+ 大批量推荐。'
 			},
 			ipinfo: {
 				badge: 'ipinfo.io',
 				label: 'ipinfo.io',
 				desc: '当前：<b>ipinfo.io</b>，全球老牌权威 IP 数据库，稳定性极佳。'
 			},
-			cloudflare: {
-				badge: 'Cloudflare',
-				label: 'Cloudflare Trace (1.1.1.1)',
-				desc: '当前：<b>Cloudflare 官方 Trace</b>，基于 Workers 内核直连，零风控防封，1w+ 大批量推荐。'
+			ipapico: {
+				badge: 'ipapi.co',
+				label: 'ipapi.co',
+				desc: '当前：<b>ipapi.co</b>，地理与网络信息详尽，但每分钟限制 30 次且对并发敏感，适合单条或少量节点测试。'
 			}
 		};
 
 		function getStoredIpSource() {
 			try {
-				const stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
+				let stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
+				if (stored === 'ipapi_is') stored = 'ipwhois';
 				return stored && IP_SOURCE_DEFINITIONS[stored] ? stored : 'iplocate';
 			} catch {
 				return 'iplocate';
@@ -7166,11 +7222,20 @@ function generateHTML(备案内容, hasToken = false) {
 			}).join(',');
 			const rows = records.map(function (record) {
 				const isSuccess = record.status === 'success';
+				let parsedTarget = null;
+				try {
+					parsedTarget = parseProxyUrl(record?.target || record?.data?.link || '');
+				} catch (e) {}
+
 				const fallbackData = Object.assign({}, record?.data || {}, {
 					status: isSuccess ? '成功' : '失败',
 					error: isSuccess ? '' : normalizeExportValue(record?.data?.error || '检测失败'),
-					type: record?.proxyType || record?.data?.type || '',
-					link: record?.target || record?.data?.link || ''
+					type: record?.proxyType || record?.data?.type || parsedTarget?.scheme || '',
+					link: record?.target || record?.data?.link || '',
+					hostname: record?.data?.hostname || parsedTarget?.hostPlain || parsedTarget?.hostname || '',
+					port: record?.data?.port || parsedTarget?.port || '',
+					username: record?.data?.username || parsedTarget?.username || '',
+					password: record?.data?.password || parsedTarget?.password || ''
 				});
 				if (!fallbackData.status) fallbackData.status = isSuccess ? '成功' : '失败';
 

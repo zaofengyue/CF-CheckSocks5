@@ -28,8 +28,8 @@ jobs:
 
       - name: Create Pages Deploy Zip
         run: |
-          # 确保 _worker.js 等文件位于 zip 根目录（符合 Cloudflare Pages Direct Upload 规范）
-          zip -j CF-CheckSocks5-Pages.zip _worker.js _routes.json index.html README.md CHANGELOG.md
+          # 仅打包 Cloudflare Pages 部署与运行必需文件（确保位于 zip 根目录）
+          zip -j CF-CheckSocks5-Pages.zip _worker.js _routes.json index.html
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

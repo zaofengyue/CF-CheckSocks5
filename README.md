@@ -1,7 +1,5 @@
 # CF-Workers-CheckSocks5
 
-![demo](./demo.png)
-
 一个基于 Cloudflare Workers 的代理可用性检测工具。项目以单个 `_worker.js` 运行为核心，支持 SOCKS5、HTTP、HTTPS、TURN、SSTP 代理检测，提供网页端单条/批量检测、域名解析、出口 IP 信息展示、地图定位、结果筛选与导出。
 
 > 支持可选的 `TOKEN` 鉴权。未设置 `TOKEN` 环境变量时默认公开访问；设置后将自动保护 `/check`、`/resolve`、`/resolve-batch` 等核心接口，防止被未授权盗刷。
@@ -15,7 +13,7 @@
 - SSTP 检测使用 HTTPS SSTP 握手、PPP / IPCP 建链，并通过 PPP 内 TCP 连接读取出口信息。
 - 支持单条检测和批量检测；批量模式会自动去重、解析域名并并发验证。
 - 支持域名解析为 A / AAAA 记录，优先使用 Cloudflare DoH，失败后回退到 Google DoH。
-- 支持出口 IP 查询多源自由切换，涵盖 `iplocate.io`、`api.ip.sb`（极速大批量）、`api.ipapi.is`（原生机房与纯净度风控）、`ipinfo.io` 以及 `Cloudflare 官方 Trace`（1w+ 超大批量首选，零风控无上限）。
+- 支持出口 IP 查询多源自由切换，涵盖 `iplocate.io`、`ipwho.is`（高精度全字段规范）、`api.ip.sb`（极速大批量）、`Cloudflare 官方 Trace`（1w+ 超大批量首选，零风控无上限）、`ipinfo.io` 以及 `ipapi.co`（高精度单条）。
 - 支持代理出口信息展示，包括出口 IP、地区、ASN、运营商、风险标签、响应耗时等。
 - 支持 Leaflet / OpenStreetMap 地图展示出口位置。
 - 支持结果筛选，支持将有效及失败结果复制到剪贴板或导出为 TXT / CSV（包含详细报错原因）。
@@ -53,7 +51,7 @@ Demo: <https://check.socks5.cmliussss.net>
 | 变量名 | 说明 | 示例 | 必需 |
 | --- | --- | --- | --- |
 | `TOKEN` | 访问鉴权令牌（兼容 `AUTH_TOKEN`）。未设置时公开访问；设置后受保护接口必须携带凭证。 | `my-secret-token` | 否 |
-| `BEIAN` | 自定义页面页脚 HTML。未设置时使用默认页脚，包含项目链接、访问人数和维护者链接。 | `© 2026 Example.com · ICP 备案号` | 否 |
+| `BEIAN` | 自定义页面页脚 HTML。未设置时使用默认页脚，包含项目链接和维护者链接。 | `© 2026 Example.com · ICP 备案号` | 否 |
 
 ## 支持的代理格式
 

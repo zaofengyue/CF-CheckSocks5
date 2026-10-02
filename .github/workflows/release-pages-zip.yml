@@ -1,24 +1,35 @@
-name: Package Pages Zip
+name: Release Pages Zip
 
 on:
   push:
+    tags:
+      - 'v*'
     branches:
       - main
       - beta
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '发布版本号标签 (例如 v1.2.0 或 beta)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
 
 jobs:
-  package:
+  build-and-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Create Pages Deploy Zip
         run: |
-          zip -j CF-CheckSocks5-Pages.zip _worker.js index.html _routes.json wrangler.toml README.md LICENSE demo.png
+          # 确保 _worker.js 等文件位于 zip 根目录（符合 Cloudflare Pages Direct Upload 规范）
+          zip -j CF-CheckSocks5-Pages.zip _worker.js _routes.json index.html README.md CHANGELOG.md
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -26,3 +37,37 @@ jobs:
           name: CF-CheckSocks5-Pages-Deploy
           path: CF-CheckSocks5-Pages.zip
           retention-days: 90
+
+      - name: Determine Release Metadata
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag_name }}" ]]; then
+            echo "tag=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+            echo "title=Release ${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            echo "tag=${TAG_NAME}" >> $GITHUB_OUTPUT
+            echo "title=Release ${TAG_NAME}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/beta" ]]; then
+            echo "tag=beta" >> $GITHUB_OUTPUT
+            echo "title=Beta Preview Release" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "title=Latest Release" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.title }}
+          files: CF-CheckSocks5-Pages.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

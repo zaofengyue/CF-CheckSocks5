@@ -275,7 +275,7 @@ let memConfigCache = {
 const CONFIG_CACHE_TTL_MS = 6000;
 
 function getKV(env) {
-	return env?.CONFIG_KV || env?.KV || null;
+	return env?.KV || env?.CONFIG_KV || null;
 }
 
 async function sha256Hex(str) {
@@ -292,13 +292,13 @@ async function getAdminPassword(env) {
 			if (pass) return pass.trim();
 		} catch (e) {}
 	}
-	const envPass = (env?.ADMIN_PASSWORD || env?.ADMIN_TOKEN || env?.ROOT_PASSWORD || '').toString().trim();
+	const envPass = (env?.ADMIN || env?.ADMIN_PASSWORD || env?.ADMIN_TOKEN || env?.ROOT_PASSWORD || '').toString().trim();
 	return envPass || null;
 }
 
 async function setAdminPassword(env, password) {
 	const kv = getKV(env);
-	if (!kv) throw new Error('未检测到绑定的 KV 空间 (CONFIG_KV)，无法持久化存储管理员密码。请在 Cloudflare 仪表盘绑定 KV。');
+	if (!kv) throw new Error('未检测到绑定的 KV 空间 (KV)，无法持久化存储管理员密码。请在 Cloudflare 仪表盘绑定变量名为 KV 的命名空间。');
 	await kv.put(`${KV_CONFIG_PREFIX}admin_password`, String(password).trim());
 	memConfigCache.adminPass = String(password).trim();
 }
@@ -323,7 +323,7 @@ async function getKVTokens(env) {
 
 async function saveKVTokens(env, tokens) {
 	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (CONFIG_KV)');
+	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}tokens`, JSON.stringify(tokens));
 	memConfigCache.tokens = tokens;
 	memConfigCache.ts = Date.now();
@@ -349,7 +349,7 @@ async function getKVWorkers(env) {
 
 async function saveKVWorkers(env, workers) {
 	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (CONFIG_KV)');
+	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}workers`, JSON.stringify(workers));
 	memConfigCache.workers = workers;
 	memConfigCache.ts = Date.now();
@@ -375,7 +375,7 @@ async function getKVSources(env) {
 
 async function saveKVSources(env, sources) {
 	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (CONFIG_KV)');
+	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}sources`, JSON.stringify(sources));
 	memConfigCache.sources = sources;
 	memConfigCache.ts = Date.now();
@@ -10028,8 +10028,9 @@ function generateAdminHTML(env, hasKV = false) {
 					</div>
 
 					<div class="p-3 rounded-lg border border-white/5 bg-white/[0.02] text-[11px] text-slate-400 leading-relaxed mt-4">
-						<b>💡 如何在 Cloudflare 绑定 KV？</b><br>
-						进入 Cloudflare 控制台 -> Workers & Pages -> 点击进入本项目 ->「设置」->「变量与机密」-> 在「KV 命名空间绑定」中添加变量名称为 <code>CONFIG_KV</code> 即可。
+						<b>💡 如何在 Cloudflare 绑定 KV 与管理员密码？</b><br>
+						1. <b>KV 命名空间绑定</b>：进入 Cloudflare 控制台 -> Workers & Pages -> 本项目 ->「设置」->「绑定 / 变量」-> 在「KV 命名空间绑定」中添加变量名称为 <code>KV</code> 即可。<br>
+						2. <b>环境变量预设密码</b>：可在「环境变量」中添加 <code>ADMIN</code> 直接作为管理员密码。
 					</div>
 				</div>
 			</div>

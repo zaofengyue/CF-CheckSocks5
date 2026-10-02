@@ -34,9 +34,9 @@ Demo: <https://check.socks5.cmliussss.net>
 4. **（可选，强烈推荐）开启后台管理与分布式集群功能**：
    - 在 Cloudflare 控制台 -> **KV** 中创建一个新的 KV 命名空间（例如：`CHECK_SOCKS5_KV`）。
    - 进入该 Worker 的 **设置** -> **绑定 (Bindings)** -> 添加 **KV 命名空间绑定**：
-     - **变量名称**：`CONFIG_KV`（或 `KV`）
+     - **变量名称**：`KV`（兼容 `CONFIG_KV`）
      - **KV 命名空间**：选择刚才创建的命名空间。
-   - 访问你的域名 `/admin`，首次打开会提示初始化管理员密码，进入后台即可图形化管理 Token、接口 Key 池和集群调度。
+   - 访问你的域名 `/admin`，首次打开会提示初始化管理员密码（亦可在环境变量设置 `ADMIN`），进入后台即可图形化管理 Token、接口 Key 池和集群调度。
 
 ### 方式二：Cloudflare Pages 上传压缩包 / 文件夹部署
 
@@ -47,16 +47,16 @@ Demo: <https://check.socks5.cmliussss.net>
    - **方式 A（上传文件夹）**：解压下载的项目包，直接将包含 `_worker.js` 的文件夹拖入上传区域。
    - **方式 B（上传压缩包）**：将 `_worker.js`、`_routes.json`、`index.html` 等文件全选压缩为 zip 上传（请确保 `_worker.js` 位于压缩包最外层根目录，不要嵌套子文件夹）。
 3. 点击 **部署站点**。
-4. 同样可以在 Pages 项目的 **设置** -> **函数 (Functions)** -> **KV 命名空间绑定** 中添加 `CONFIG_KV` 激活后台管理系统。
+4. 同样可以在 Pages 项目的 **设置** -> **函数 (Functions)** -> **KV 命名空间绑定** 中添加变量名 `KV` 激活后台管理系统。
 
 ## 环境变量与 KV 绑定
 
-当前源码支持读取以下配置：
+当前源码支持读取以下配置（最简仅需 `KV` 与 `ADMIN`）：
 
 | 变量 / 绑定名 | 类型 | 说明 | 示例 | 必需 |
 | --- | --- | --- | --- | --- |
-| `CONFIG_KV` | KV 命名空间 | 绑定 Cloudflare KV 命名空间，激活 `/admin` 图形后台管理系统、多 Key 自动轮询、分布式集群调度与动态 Token 增删。兼容变量名 `KV`。 | 绑定至 KV 命名空间 | 否 |
-| `ADMIN_PASSWORD` | 环境变量 | 管理员初始密码。若未绑定 KV 或初次访问，亦可通过该环境变量预设后台密码。 | `admin123456` | 否 |
+| `KV` | KV 命名空间 | 绑定 Cloudflare KV 命名空间，激活 `/admin` 图形后台管理系统、多 Key 自动轮询、分布式集群调度与动态 Token 增删。亦兼容旧名 `CONFIG_KV`。 | 绑定至 KV 命名空间 | 否 |
+| `ADMIN` | 环境变量 | 管理员后台密码。亦可在初次访问 `/admin` 时直接网页输入初始化。兼容 `ADMIN_PASSWORD`、`ADMIN_TOKEN`。 | `admin123456` | 否 |
 | `TOKEN` | 环境变量 | 全局兜底访问鉴权令牌（兼容 `AUTH_TOKEN`）。若绑定了 KV，亦可在 `/admin` 后台动态新增和管理多个 Token。 | `my-secret-token` | 否 |
 | `BEIAN` | 环境变量 | 自定义页面页脚 HTML。未设置时使用默认页脚，包含项目链接和维护者链接。 | `© 2026 Example.com · ICP 备案号` | 否 |
 

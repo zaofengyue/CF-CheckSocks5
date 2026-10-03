@@ -10694,14 +10694,14 @@ function generateAdminHTML(env, hasKV = false) {
 			</div>
 
 			<div class="glass-card p-6 space-y-5">
-				<div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-5 border-b border-white/10">
+				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-white/10">
 					<div class="space-y-1">
 						<div class="flex items-center gap-2.5">
-							<div class="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500/20 to-teal-500/10 border border-emerald-500/30 flex items-center justify-center text-sm shadow-inner">
+							<div class="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500/20 to-teal-500/10 border border-emerald-500/30 flex items-center justify-center text-sm shadow-inner shrink-0">
 								🌐
 							</div>
 							<div>
-								<h2 class="text-base font-bold text-white flex items-center gap-2">
+								<h2 class="text-base font-bold text-white flex items-center gap-2 flex-wrap">
 									多账号 Worker 节点集群
 									<span id="clusterNodeCountBadge" class="text-[10px] px-2 py-0.5 rounded-full font-mono bg-emerald-500/10 border border-emerald-500/20 text-emerald-300">0 个节点</span>
 								</h2>
@@ -10709,18 +10709,12 @@ function generateAdminHTML(env, hasKV = false) {
 							</div>
 						</div>
 					</div>
-					<div class="flex items-center gap-2 flex-wrap sm:flex-nowrap">
-						<button onclick="pingAllWorkers()" class="h-9 px-3 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center gap-1.5 shadow-sm">
+					<div class="flex items-center gap-2 shrink-0 self-end sm:self-center ml-auto sm:ml-0">
+						<button onclick="pingAllWorkers()" class="h-9 px-3.5 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center gap-1.5 shadow-sm cursor-pointer">
 							<span class="text-amber-400">⚡</span> 一键测速
 						</button>
-						<button onclick="openSubWorkerScriptModal()" class="h-9 px-3 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center gap-1.5 shadow-sm">
-							<span class="text-cyan-400">📋</span> 复制内核
-						</button>
-						<button onclick="openWorkerModal('add')" class="h-9 px-3.5 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/50 hover:border-cyan-400/50 transition flex items-center gap-1.5 shadow-sm">
+						<button onclick="openWorkerModal('add')" class="h-9 px-3.5 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/50 hover:border-cyan-400/50 transition flex items-center gap-1.5 shadow-sm cursor-pointer">
 							<span>➕</span> 手动接入
-						</button>
-						<button onclick="openBatchDeployModal()" class="h-9 px-4 rounded-xl text-xs font-bold bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 hover:brightness-110 transition flex items-center gap-1.5 shadow-lg shadow-emerald-500/20">
-							<span>🚀</span> 批量全自动部署
 						</button>
 					</div>
 				</div>
@@ -10971,6 +10965,8 @@ function generateAdminHTML(env, hasKV = false) {
 				</div>
 			</div>
 		</div>
+	</div>
+
 	<!-- 批量全自动部署从节点弹窗 -->
 	<div id="batchDeployModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
 		<div class="glass-card max-w-2xl w-full p-6 space-y-4 max-h-[92vh] flex flex-col border border-emerald-500/30 shadow-2xl">

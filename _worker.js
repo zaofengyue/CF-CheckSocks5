@@ -742,12 +742,8 @@ async function handleAdminAPI(request, url, env, origin) {
 		return jsonResponse({ success: true, token: sessionToken, message: '登录成功' }, { origin });
 	}
 
-	if (!auth.ok || auth.needSetup) {
-		return jsonResponse({
-			success: false,
-			error: auth.needSetup ? '管理员尚未初始化密码，请先完成密码设置' : '管理员未授权或会话已过期，请重新登录',
-			needSetup: Boolean(auth.needSetup)
-		}, { status: 401, origin });
+	if (!auth.ok) {
+		return jsonResponse({ success: false, error: '管理员未授权或会话已过期，请重新登录', needSetup: auth.needSetup }, { status: 401, origin });
 	}
 
 	if (pathname === '/api/admin/config' && request.method === 'GET') {
@@ -6932,7 +6928,8 @@ function generateHTML(备案内容, hasToken = false) {
 							const u = String(n.url || n).trim();
 							if (u) {
 								clusterNodes.push(u);
-								if (n.token) clusterNodeTokens[u.replace(/\/+$/, '')] = n.token;
+								const cleanUrl = u.endsWith('/') ? u.slice(0, -1) : u;
+								if (n.token) clusterNodeTokens[cleanUrl] = n.token;
 							}
 						});
 						pureClusterMode = Boolean(res.payload?.pureClusterMode);
@@ -9086,15 +9083,16 @@ function generateHTML(备案内容, hasToken = false) {
 					let chosenNode = null;
 					if (clusterNodes && clusterNodes.length > 0) {
 						chosenNode = getHealthyClusterNode();
-						if (chosenNode && /^https?:\/\//i.test(chosenNode)) {
-							baseUrl = chosenNode.replace(/\/+$/, '');
+						if (chosenNode && (chosenNode.startsWith('http://') || chosenNode.startsWith('https://'))) {
+							baseUrl = chosenNode.endsWith('/') ? chosenNode.slice(0, -1) : chosenNode;
 						}
 					}
 
 					// 如果开启了纯集群模式但无可用节点，报错提示；否则如无节点或非纯集群则回退本地
 					if (pureClusterMode && !baseUrl && clusterNodes.length > 0) {
 						// 节点全部在冷却，稍候或使用第一个
-						baseUrl = clusterNodes[0].replace(/\/+$/, '');
+						const firstNode = clusterNodes[0];
+						baseUrl = firstNode.endsWith('/') ? firstNode.slice(0, -1) : firstNode;
 					}
 
 					const nodeToken = chosenNode ? clusterNodeTokens[baseUrl] : '';
@@ -11553,7 +11551,7 @@ function generateAdminHTML(env, hasKV = false) {
 
 		function updateBatchAccountsCount() {
 			const text = document.getElementById('batchDeployAccounts')?.value || '';
-			const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+			const lines = text.split(/[\\r\\n]+/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
 			const countSpan = document.getElementById('batchDeployCount');
 			if (countSpan) countSpan.textContent = lines.length + ' 个账号待部署';
 		}
@@ -11561,7 +11559,7 @@ function generateAdminHTML(env, hasKV = false) {
 		async function runBatchAutoDeploy() {
 			const text = document.getElementById('batchDeployAccounts').value;
 			const scriptName = (document.getElementById('batchDeployScriptName').value || 'check-socks5-node').trim();
-			const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+			const lines = text.split(/[\\r\\n]+/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
 
 			if (!lines.length) {
 				alert('请先输入至少一个 Cloudflare 账号凭据');
@@ -11600,8 +11598,8 @@ function generateAdminHTML(env, hasKV = false) {
 					const parts = line.split(',');
 					email = parts[0].trim();
 					apiKey = parts.slice(1).join(',').trim();
-				} else if (line.includes(' ')) {
-					const parts = line.split(/\s+/);
+				} else if (/[ \\t]/.test(line)) {
+					const parts = line.split(/[ \\t]+/);
 					email = parts[0].trim();
 					apiKey = parts.slice(1).join(' ').trim();
 				} else {

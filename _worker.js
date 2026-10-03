@@ -82,11 +82,21 @@ export default {
 				token: w.token || '',
 				weight: w.weight || 1
 			}));
+			const clusterSettings = await getKVClusterSettings(env);
 			return jsonResponse({
 				success: true,
 				hasKV: Boolean(getKV(env)),
 				clusterEnabled: activeWorkers.length > 0,
+				pureClusterMode: Boolean(clusterSettings.pureClusterMode),
 				nodes: activeWorkers
+			}, { origin });
+		}
+
+		if (url.pathname.toLowerCase() === '/api/sources/list') {
+			const kvSources = (await getKVSources(env)) || {};
+			return jsonResponse({
+				success: true,
+				sources: kvSources
 			}, { origin });
 		}
 
@@ -223,7 +233,8 @@ export default {
 				return jsonResponse(result, { origin });
 			} else if (url.pathname === '/locations') return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 
-			return new Response(generateHTML(备案内容, !!configuredToken), {
+			const tokenRequired = await isTokenRequired(env);
+			return new Response(generateHTML(备案内容, tokenRequired), {
 				headers: {
 					'Content-Type': 'text/html; charset=UTF-8',
 					'Cache-Control': 'no-cache, no-store, must-revalidate'
@@ -381,6 +392,33 @@ async function saveKVSources(env, sources) {
 	memConfigCache.ts = Date.now();
 }
 
+async function getKVClusterSettings(env) {
+	const kv = getKV(env);
+	if (!kv) return { pureClusterMode: false };
+	try {
+		const raw = await kv.get(`${KV_CONFIG_PREFIX}cluster_settings`, { type: 'json' });
+		if (raw && typeof raw === 'object') return raw;
+	} catch (e) {}
+	return { pureClusterMode: false };
+}
+
+async function saveKVClusterSettings(env, settings) {
+	const kv = getKV(env);
+	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
+	await kv.put(`${KV_CONFIG_PREFIX}cluster_settings`, JSON.stringify(settings));
+}
+
+function getObjectByPath(obj, path) {
+	if (!obj || !path) return null;
+	const parts = String(path).split('.');
+	let current = obj;
+	for (const p of parts) {
+		if (current === null || current === undefined || typeof current !== 'object') return null;
+		current = current[p];
+	}
+	return current;
+}
+
 // 多 Key 轮询与熔断管理
 const sourceKeyRotationIndex = new Map();
 const sourceKeyCooldownUntil = new Map();
@@ -490,6 +528,7 @@ async function handleAdminAPI(request, url, env, origin) {
 		const tokens = (await getKVTokens(env)) || [];
 		const workers = (await getKVWorkers(env)) || [];
 		const sources = (await getKVSources(env)) || {};
+		const clusterSettings = (await getKVClusterSettings(env)) || {};
 		return jsonResponse({
 			success: true,
 			hasKV: Boolean(getKV(env)),
@@ -497,9 +536,23 @@ async function handleAdminAPI(request, url, env, origin) {
 			tokens,
 			workers,
 			sources,
+			clusterSettings,
 			envTokenConfigured: Boolean(getConfiguredToken(env)),
-			hasEnvAdminPassword: Boolean(env?.ADMIN_PASSWORD)
+			hasEnvAdminPassword: Boolean(env?.ADMIN || env?.ADMIN_PASSWORD)
 		}, { origin });
+	}
+
+	if (pathname === '/api/admin/cluster-settings' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		const currentSettings = (await getKVClusterSettings(env)) || {};
+		const nextSettings = { ...currentSettings, ...body };
+		try {
+			await saveKVClusterSettings(env, nextSettings);
+			return jsonResponse({ success: true, clusterSettings: nextSettings }, { origin });
+		} catch (e) {
+			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
+		}
 	}
 
 	if (pathname === '/api/admin/tokens' && request.method === 'POST') {
@@ -720,6 +773,15 @@ async function checkAuthToken(request, url, env, pathTokenAuthenticated = false)
 	}
 	return { ok: true };
 }
+
+async function isTokenRequired(env) {
+	const kvTokens = await getKVTokens(env);
+	if (kvTokens && kvTokens.length > 0) {
+		const activeKvTokens = kvTokens.filter(t => t.enabled !== false);
+		if (activeKvTokens.length > 0) return true;
+	}
+	return Boolean(getConfiguredToken(env));
+}
 // ===================== Token 鉴权结束 =====================
 
 async function checkProxy({ type, value }, colo, source = 'iplocate', env = null) {
@@ -792,6 +854,27 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 		currentKeyUsed = pickKeyForSource('ipapi_is', env);
 		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}` : '/';
 		acceptHeader = 'application/json';
+	} else {
+		// 检查是否为后台配置的自定义源 (custom:xxx)
+		const allKVSources = (await getKVSources(env)) || {};
+		const customDef = allKVSources[selectedSource];
+		if (customDef && customDef.url) {
+			try {
+				let rawUrl = customDef.url.trim();
+				currentKeyUsed = pickKeyForSource(selectedSource, env);
+				if (currentKeyUsed) {
+					rawUrl = rawUrl.replace(/\{\{KEY\}\}/gi, encodeURIComponent(currentKeyUsed));
+				}
+				const parsedCustomUrl = new URL(rawUrl);
+				targetHost = parsedCustomUrl.hostname;
+				serverName = parsedCustomUrl.hostname;
+				targetPort = parsedCustomUrl.port ? Number(parsedCustomUrl.port) : (parsedCustomUrl.protocol === 'http:' ? 80 : 443);
+				requestPath = parsedCustomUrl.pathname + parsedCustomUrl.search;
+				acceptHeader = 'application/json, text/plain, */*';
+			} catch (e) {
+				// URL 解析失败时回退到默认 iplocate
+			}
+		}
 	}
 
 	try {
@@ -1206,29 +1289,74 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_abuser: Boolean(raw.is_abuser)
 				};
 			} else {
+				let raw;
 				try {
-					exit = JSON.parse(bodyText.trim());
+					raw = JSON.parse(bodyText.trim());
 				} catch (error) {
-					throw new Error('Target /api/lookup did not return valid JSON');
+					throw new Error('Target lookup did not return valid JSON');
 				}
 
-				// Transform iplocate.io response to maintain compatibility with existing frontend
-				exit = {
-					...exit,
-					asn: exit.asn ? {
-						...exit.asn,
-						org: exit.asn.name || exit.asn.org,
-						descr: exit.asn.name || exit.asn.descr,
-					} : exit.asn,
-					rir: exit.asn?.rir || null,
-					is_datacenter: exit.privacy?.is_hosting || false,
-					is_crawler: false,
-					is_bogon: exit.privacy?.is_bogon || false,
-					is_proxy: exit.privacy?.is_proxy || false,
-					is_vpn: exit.privacy?.is_vpn || false,
-					is_tor: exit.privacy?.is_tor || false,
-					is_abuser: exit.privacy?.is_abuser || false,
-				};
+				// 检查是否为自定义源提取映射
+				const allKVSources = (await getKVSources(env)) || {};
+				const customDef = allKVSources[selectedSource];
+				if (customDef && customDef.mapping) {
+					const m = customDef.mapping;
+					const ipVal = getObjectByPath(raw, m.ip || 'ip') || raw.ip || '';
+					const countryVal = getObjectByPath(raw, m.country || 'country') || '';
+					const countryCodeVal = getObjectByPath(raw, m.country_code || 'country_code') || countryVal;
+					const cityVal = getObjectByPath(raw, m.city || 'city') || '';
+					const asnNum = parseInt(getObjectByPath(raw, m.asn || 'asn') || '0', 10) || null;
+					const orgVal = getObjectByPath(raw, m.org || 'org') || getObjectByPath(raw, m.isp || 'isp') || '';
+					const isProxyVal = Boolean(getObjectByPath(raw, m.is_proxy || 'is_proxy') || getObjectByPath(raw, m.proxy || 'proxy'));
+					const isVpnVal = Boolean(getObjectByPath(raw, m.is_vpn || 'is_vpn') || getObjectByPath(raw, m.vpn || 'vpn'));
+					const isDcVal = Boolean(getObjectByPath(raw, m.is_datacenter || 'is_datacenter') || getObjectByPath(raw, m.hosting || 'hosting'));
+					exit = {
+						ip: ipVal,
+						country: countryVal,
+						countryCode: countryCodeVal,
+						country_code: countryCodeVal,
+						countryName: countryVal,
+						region: getObjectByPath(raw, m.region || 'region') || '',
+						city: cityVal,
+						postal_code: getObjectByPath(raw, m.postal || 'postal') || '',
+						latitude: parseFloat(getObjectByPath(raw, m.latitude || 'latitude')) || null,
+						longitude: parseFloat(getObjectByPath(raw, m.longitude || 'longitude')) || null,
+						loc: (getObjectByPath(raw, m.latitude || 'latitude') && getObjectByPath(raw, m.longitude || 'longitude')) ? `${getObjectByPath(raw, m.latitude || 'latitude')},${getObjectByPath(raw, m.longitude || 'longitude')}` : '',
+						timezone: getObjectByPath(raw, m.timezone || 'timezone') || '',
+						asn: {
+							asn: asnNum,
+							org: orgVal,
+							name: orgVal,
+							descr: orgVal
+						},
+						asOrganization: orgVal,
+						company: { name: orgVal },
+						is_datacenter: isDcVal,
+						is_bogon: false,
+						is_proxy: isProxyVal,
+						is_vpn: isVpnVal,
+						is_tor: false,
+						is_abuser: false
+					};
+				} else {
+					// 默认按照 iplocate.io 响应结构解析
+					exit = {
+						...raw,
+						asn: raw.asn ? {
+							...raw.asn,
+							org: raw.asn.name || raw.asn.org,
+							descr: raw.asn.name || raw.asn.descr,
+						} : raw.asn,
+						rir: raw.asn?.rir || null,
+						is_datacenter: raw.privacy?.is_hosting || false,
+						is_crawler: false,
+						is_bogon: raw.privacy?.is_bogon || false,
+						is_proxy: raw.privacy?.is_proxy || false,
+						is_vpn: raw.privacy?.is_vpn || false,
+						is_tor: raw.privacy?.is_tor || false,
+						is_abuser: raw.privacy?.is_abuser || false,
+					};
+				}
 			}
 		} finally {
 			try { tlsSocket.close(); } catch (e) { }
@@ -6317,6 +6445,38 @@ function generateHTML(备案内容, hasToken = false) {
 			return backendServicePromise;
 		}
 
+		let pureClusterMode = false;
+		const nodeFailures = new Map(); // nodeUrl -> failure count
+		const nodeCooldownUntil = new Map(); // nodeUrl -> timestamp
+
+		function getHealthyClusterNode() {
+			if (!clusterNodes || !clusterNodes.length) return null;
+			const now = Date.now();
+			const activeNodes = clusterNodes.filter(url => {
+				const cd = nodeCooldownUntil.get(url);
+				return !cd || now > cd;
+			});
+			if (!activeNodes.length) return clusterNodes[clusterRoundRobinIndex++ % clusterNodes.length];
+			const selected = activeNodes[clusterRoundRobinIndex++ % activeNodes.length];
+			return selected;
+		}
+
+		function reportNodeFailure(nodeUrl, isRateLimit = false) {
+			if (!nodeUrl) return;
+			const count = (nodeFailures.get(nodeUrl) || 0) + 1;
+			nodeFailures.set(nodeUrl, count);
+			// 如果是 429/1015 或连续失败 2 次，冷却休眠 5 分钟
+			if (isRateLimit || count >= 2) {
+				nodeCooldownUntil.set(nodeUrl, Date.now() + 300000);
+				console.warn('[Cluster Node Cooldown]', nodeUrl, '已熔断休眠 5 分钟');
+			}
+		}
+
+		function reportNodeSuccess(nodeUrl) {
+			if (!nodeUrl) return;
+			nodeFailures.delete(nodeUrl);
+		}
+
 		async function loadClusterNodes() {
 			if (clusterNodesPromise) return clusterNodesPromise;
 			clusterNodesPromise = (async function () {
@@ -6324,16 +6484,56 @@ function generateHTML(备案内容, hasToken = false) {
 					const res = await fetchJsonWithTimeout('/api/cluster/nodes', {}, 5000);
 					if (res.response && res.response.ok && Array.isArray(res.payload?.nodes)) {
 						clusterNodes = res.payload.nodes.map(n => String(n.url || n).trim()).filter(Boolean);
+						pureClusterMode = Boolean(res.payload?.pureClusterMode);
 						if (clusterNodes.length > 0) {
-							console.log('[Cluster] 已加载多 Worker 分布式节点集群:', clusterNodes.length, '个节点');
+							console.log('[Cluster] 已加载多 Worker 节点集群:', clusterNodes.length, '个节点', pureClusterMode ? '(纯集群执行模式)' : '');
 						}
 					}
 				} catch (e) {
 					// Standalone worker mode
 				}
+				// 动态加载自定义源
+				try {
+					const sRes = await fetchJsonWithTimeout('/api/sources/list', {}, 5000);
+					if (sRes.response && sRes.response.ok && sRes.payload?.sources) {
+						updateCustomSourcesInUI(sRes.payload.sources);
+					}
+				} catch (e) {}
 				return clusterNodes;
 			})();
 			return clusterNodesPromise;
+		}
+
+		function updateCustomSourcesInUI(sourcesConfig) {
+			if (!ipSourceSelect || !sourcesConfig) return;
+			const currentSelected = getSelectedIpSource();
+			// 移除所有旧的自定义选项
+			const customOptions = ipSourceSelect.querySelectorAll('option[data-custom="true"]');
+			customOptions.forEach(opt => opt.remove());
+
+			Object.keys(sourcesConfig).forEach(key => {
+				const src = sourcesConfig[key];
+				if (!src || src.enabled === false) return;
+				// 如果是内置源，跳过
+				if (['iplocate', 'hackmyip', 'ip2location', 'ipwhois', 'ipsb', 'cloudflare', 'ipinfo', 'ipapico', 'ipapi_is'].includes(key)) {
+					return;
+				}
+				// 注册到 IP_SOURCE_DEFINITIONS
+				IP_SOURCE_DEFINITIONS[key] = {
+					badge: src.label || key,
+					label: src.label || key,
+					desc: '自定义源：<b>' + escapeHtml(src.label || key) + '</b> (' + escapeHtml(src.url || '') + ')'
+				};
+				const opt = document.createElement('option');
+				opt.value = key;
+				opt.dataset.custom = 'true';
+				opt.textContent = (src.label || key) + ' (自定义 · 映射提取)';
+				ipSourceSelect.appendChild(opt);
+			});
+
+			if (currentSelected && IP_SOURCE_DEFINITIONS[currentSelected]) {
+				applyIpSource(currentSelected, false);
+			}
 		}
 
 		function clearMapLayers() {
@@ -8406,35 +8606,65 @@ function generateHTML(备案内容, hasToken = false) {
 			const currentSource = getSelectedIpSource();
 
 			try {
-				let baseUrl = '';
-				if (clusterNodes && clusterNodes.length > 0) {
-					const nodeUrl = clusterNodes[clusterRoundRobinIndex % clusterNodes.length];
-					clusterRoundRobinIndex++;
-					if (nodeUrl && /^https?:\/\//i.test(nodeUrl)) {
-						baseUrl = nodeUrl.replace(/\/+$/, '');
+				let result = null;
+				let attempts = 0;
+				const maxAttempts = (clusterNodes && clusterNodes.length > 1) ? Math.min(clusterNodes.length + 1, 3) : 2;
+
+				while (attempts < maxAttempts && !isRunStopped(run)) {
+					attempts++;
+					let baseUrl = '';
+					let chosenNode = null;
+					if (clusterNodes && clusterNodes.length > 0) {
+						chosenNode = getHealthyClusterNode();
+						if (chosenNode && /^https?:\/\//i.test(chosenNode)) {
+							baseUrl = chosenNode.replace(/\/+$/, '');
+						}
+					}
+
+					// 如果开启了纯集群模式但无可用节点，报错提示；否则如无节点或非纯集群则回退本地
+					if (pureClusterMode && !baseUrl && clusterNodes.length > 0) {
+						// 节点全部在冷却，稍候或使用第一个
+						baseUrl = clusterNodes[0].replace(/\/+$/, '');
+					}
+
+					const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+					try {
+						result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
+						const status = result?.response?.status;
+						// 如果遇到 429、1015 或 1027，该子节点超限，将其标记熔断并重试下一个节点
+						if (chosenNode && (status === 429 || status === 1015 || status === 1027)) {
+							reportNodeFailure(chosenNode, true);
+							continue;
+						}
+						if (chosenNode && result?.response?.ok) {
+							reportNodeSuccess(chosenNode);
+						}
+						break;
+					} catch (networkErr) {
+						if (chosenNode) {
+							reportNodeFailure(chosenNode, false);
+						}
+						if (isRunStopped(run)) throw networkErr;
+						if (attempts >= maxAttempts) {
+							if (!pureClusterMode && baseUrl) {
+								// 最后一次尝试本地 Worker
+								const fallbackUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+								result = await fetchJsonWithTimeout(fallbackUrl, {}, 30000, run?.controller.signal);
+								break;
+							} else {
+								throw networkErr;
+							}
+						}
 					}
 				}
 
-				const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
-				let result;
-				try {
-					result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
-				} catch (networkErr) {
-					if (baseUrl && !isRunStopped(run)) {
-						// 如果集群节点通信失败，回退至本地 Worker 重试
-						const fallbackUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
-						result = await fetchJsonWithTimeout(fallbackUrl, {}, 30000, run?.controller.signal);
-					} else {
-						throw networkErr;
-					}
-				}
-				const data = normalizeCheckDataForUi(result.payload || {
+				const data = normalizeCheckDataForUi(result?.payload || {
 					success: false,
 					error: '检测接口没有返回有效 JSON'
 				}, target);
-				if (!result.response.ok) {
+				if (!result?.response?.ok) {
 					data.success = false;
-					data.error = data.error || ('HTTP ' + result.response.status);
+					data.error = data.error || ('HTTP ' + (result?.response?.status || 'Error'));
 				}
 				completedCount++;
 
@@ -9866,7 +10096,7 @@ function generateAdminHTML(env, hasKV = false) {
 					<h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
 						CheckSocks5 控制台
 						<span class="text-[11px] px-2 py-0.5 rounded-full font-mono bg-cyan-950/80 border border-cyan-500/30 text-cyan-300">
-							Admin v1.3.0
+							Admin v1.4.0
 						</span>
 					</h1>
 					<p class="text-xs text-slate-400 mt-0.5">Cloudflare KV 驱动的接口多 Key 轮询、Worker 集群调度与动态凭据中枢</p>
@@ -9875,7 +10105,7 @@ function generateAdminHTML(env, hasKV = false) {
 
 			<div class="flex items-center gap-3">
 				<span id="kvStatusBadge" class="px-2.5 py-1 rounded-full text-xs font-mono border ${hasKV ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-300' : 'bg-amber-950/80 border-amber-500/30 text-amber-300'}">
-					${hasKV ? '● KV 存储空间已绑定' : '⚠️ 未绑定 KV (需在 CF 绑定 CONFIG_KV)'}
+					${hasKV ? '● KV 存储空间已绑定' : '⚠️ 未绑定 KV (需在 CF 绑定 KV)'}
 				</span>
 				<a href="/" class="px-3 py-1.5 rounded-xl border border-slate-700 bg-slate-800/60 hover:bg-slate-700/60 text-xs font-medium text-cyan-300 flex items-center gap-1.5 transition">
 					← 返回测活主页
@@ -9936,19 +10166,24 @@ function generateAdminHTML(env, hasKV = false) {
 			</div>
 		</section>
 
-		<!-- 选项卡 2：接口多 Key 池管理 -->
+		<!-- 选项卡 2：接口多 Key 池与自定义接口管理 -->
 		<section id="tabContent-sources" class="space-y-4 hidden">
 			<div class="glass-card p-6 space-y-5">
 				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
 					<div>
 						<h2 class="text-lg font-bold text-white flex items-center gap-2">
-							出口接口与多 Key 轮询池
+							出口接口、多 Key 轮询池与自定义源
 						</h2>
-						<p class="text-xs text-slate-400 mt-0.5">针对有免费额度限制的接口（如 api.ipapi.is 每天 1000 次），可录入多个免费 Key。请求时系统自动轮询负载均衡，额度直接翻倍！</p>
+						<p class="text-xs text-slate-400 mt-0.5">支持为官方接口录入多个免费 Key 自动轮询分流翻倍额度；同时支持添加自定义 IP 数据库，通过 JSON 字段映射提取出口数据。</p>
 					</div>
-					<button onclick="saveAllSourcesConfig()" class="px-4 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition shadow-lg shadow-cyan-500/20">
-						保存接口配置
-					</button>
+					<div class="flex items-center gap-2">
+						<button onclick="openCustomSourceModal('add')" class="px-3.5 py-1.5 rounded-xl font-bold text-xs border border-cyan-500/40 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition flex items-center gap-1">
+							➕ 添加自定义接口
+						</button>
+						<button onclick="saveAllSourcesConfig()" class="px-4 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition shadow-lg shadow-cyan-500/20">
+							保存内置接口配置
+						</button>
+					</div>
 				</div>
 
 				<div id="sourcesContainer" class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -9959,15 +10194,42 @@ function generateAdminHTML(env, hasKV = false) {
 
 		<!-- 选项卡 3：Worker 节点集群管理 -->
 		<section id="tabContent-workers" class="space-y-4 hidden">
+			<!-- 纯集群调度模式开关横幅 -->
+			<div class="glass-card p-5 border-cyan-500/30 bg-gradient-to-r from-cyan-950/40 via-slate-900/60 to-emerald-950/30">
+				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+					<div class="space-y-1">
+						<div class="flex items-center gap-2">
+							<span class="text-base font-bold text-white">⚡ 纯集群调度模式 (主账号 0 消耗)</span>
+							<span class="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-emerald-950 text-emerald-300 border border-emerald-500/30">
+								保护主额度
+							</span>
+						</div>
+						<p class="text-xs text-slate-300 leading-relaxed max-w-3xl">
+							开启后，主 Worker <b>仅作为控制中枢与 UI 托管</b>，所有代理测活任务 <b>100% 分发给下方子节点</b> 轮询执行，主账号 Workers 每日 10 万次配额保持 0 消耗！建议在已配置好子节点后开启。
+						</p>
+					</div>
+					<div class="flex items-center gap-3">
+						<label class="relative inline-flex items-center cursor-pointer">
+							<input type="checkbox" id="pureClusterModeToggle" onchange="handlePureClusterToggle(this.checked)" class="sr-only peer">
+							<div class="w-12 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-500"></div>
+							<span id="pureClusterModeLabel" class="ml-2 text-xs font-semibold text-slate-400">已关闭</span>
+						</label>
+					</div>
+				</div>
+			</div>
+
 			<div class="glass-card p-6 space-y-5">
 				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
 					<div>
 						<h2 class="text-lg font-bold text-white flex items-center gap-2">
-							多账号 Worker 节点集群 (分布式调度)
+							多账号 Worker 节点集群 (分布式调度与自动容灾)
 						</h2>
-						<p class="text-xs text-slate-400 mt-0.5">将部署在不同 Cloudflare 免费账号下的 Worker 地址加入集群池。大批量测活时，前端直接把任务均匀并发给这些 Worker，测活速度提升数倍且突破单账号限制！</p>
+						<p class="text-xs text-slate-400 mt-0.5">将部署在不同 Cloudflare 免费账号下的 Worker 加入集群池。大批量并发时自动轮询分流；单节点触达 429 限制时自动休眠并切换下一节点重试，平稳支撑 10w+ 测活！</p>
 					</div>
-					<div class="flex items-center gap-2">
+					<div class="flex items-center gap-2 flex-wrap">
+						<button onclick="openSubWorkerScriptModal()" class="px-3.5 py-1.5 rounded-xl font-bold text-xs border border-emerald-500/40 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/40 transition flex items-center gap-1.5">
+							📋 复制极简子节点代码
+						</button>
 						<button onclick="pingAllWorkers()" class="px-3 py-1.5 rounded-xl font-medium text-xs border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition">
 							⚡ 一键测速全部
 						</button>
@@ -10015,7 +10277,7 @@ function generateAdminHTML(env, hasKV = false) {
 					<h3 class="text-sm font-bold text-white flex items-center gap-1.5">
 						💾 配置导出与一键还原
 					</h3>
-					<p class="text-xs text-slate-400">将当前的动态 Token、接口多 Key 配置与节点集群导出为 JSON 文件备份，或从备份文件一键恢复。</p>
+					<p class="text-xs text-slate-400">将当前的动态 Token、接口多 Key 配置、自定义接口与节点集群导出为 JSON 文件备份，或从备份文件一键恢复。</p>
 					
 					<div class="pt-2 flex flex-col sm:flex-row gap-3">
 						<button onclick="exportFullConfig()" class="px-4 py-2 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition">
@@ -10109,6 +10371,122 @@ function generateAdminHTML(env, hasKV = false) {
 		</div>
 	</div>
 
+	<!-- 自定义接口添加/编辑弹窗 -->
+	<div id="customSourceModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+		<div class="glass-card max-w-xl w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+			<div class="flex items-center justify-between pb-3 border-b border-white/10">
+				<h3 id="customSourceModalTitle" class="text-base font-bold text-white flex items-center gap-2">
+					➕ 添加自定义 IP 接口
+				</h3>
+				<button onclick="closeCustomSourceModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
+			</div>
+
+			<div class="space-y-4 text-xs">
+				<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+					<div>
+						<label class="block text-slate-300 font-semibold mb-1">接口英文标识 (Key, 纯英文字母数字)</label>
+						<input type="text" id="modalCustomKey" placeholder="例如：my_ip_api" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+					</div>
+					<div>
+						<label class="block text-slate-300 font-semibold mb-1">前台显示名称 (Label)</label>
+						<input type="text" id="modalCustomLabel" placeholder="例如：我的自建 IP 库" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400">
+					</div>
+				</div>
+
+				<div>
+					<label class="block text-slate-300 font-semibold mb-1">目标请求 URL (支持在 URL 中使用 <code>{{KEY}}</code> 自动替换 Key 池)</label>
+					<input type="text" id="modalCustomUrl" placeholder="https://api.example.com/json 或 https://api.myip.com/?key={{KEY}}" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-cyan-300 font-mono focus:outline-none focus:border-cyan-400">
+				</div>
+
+				<div>
+					<label class="block text-slate-300 font-semibold mb-1">API Key 轮询池 (可选，每行一个，用于替换 <code>{{KEY}}</code> 轮询分流)</label>
+					<textarea id="modalCustomKeys" rows="2" placeholder="如需 Key 验证请每行填入一个，系统会自动轮询均衡负载..." class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400"></textarea>
+				</div>
+
+				<div class="p-3.5 rounded-xl border border-cyan-500/20 bg-cyan-950/20 space-y-3">
+					<div class="text-[11px] font-bold text-cyan-300 flex items-center justify-between">
+						<span>🧩 JSON 响应字段路径映射 (点操作符支持多层，如 <code>data.ip</code>)</span>
+						<span class="text-slate-400 font-normal">留空则使用默认字段名</span>
+					</div>
+
+					<div class="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">IP 地址字段</label>
+							<input type="text" id="modalMapIp" placeholder="ip" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">国家/地区字段</label>
+							<input type="text" id="modalMapCountry" placeholder="country" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">国家代码(如 US)</label>
+							<input type="text" id="modalMapCountryCode" placeholder="country_code" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">城市字段</label>
+							<input type="text" id="modalMapCity" placeholder="city" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">ASN 号字段</label>
+							<input type="text" id="modalMapAsn" placeholder="asn" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">运营商/ISP 字段</label>
+							<input type="text" id="modalMapOrg" placeholder="org 或 isp" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">代理/Proxy 字段</label>
+							<input type="text" id="modalMapProxy" placeholder="is_proxy" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">机房/Hosting 字段</label>
+							<input type="text" id="modalMapDatacenter" placeholder="is_datacenter" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+						<div>
+							<label class="block text-[11px] text-slate-400 mb-0.5">时区字段</label>
+							<input type="text" id="modalMapTimezone" placeholder="timezone" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+						</div>
+					</div>
+				</div>
+			</div>
+
+			<div class="flex justify-end gap-2 pt-3 border-t border-white/10">
+				<button onclick="closeCustomSourceModal()" class="px-4 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
+				<button onclick="submitCustomSourceModal()" class="px-5 py-1.5 rounded-lg font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg shadow-cyan-500/20">保存接口</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- 极简子节点专属脚本展示与复制弹窗 -->
+	<div id="subWorkerScriptModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+		<div class="glass-card max-w-2xl w-full p-6 space-y-4 max-h-[90vh] flex flex-col">
+			<div class="flex items-center justify-between pb-3 border-b border-white/10">
+				<div>
+					<h3 class="text-base font-bold text-white flex items-center gap-2">
+						📋 极简子 Worker 专属脚本 (免 KV / 免配置)
+					</h3>
+					<p class="text-xs text-slate-400 mt-0.5">直接复制代码部署到其他免费 Cloudflare 账号中，开箱即用，秒级上线从节点！</p>
+				</div>
+				<button onclick="closeSubWorkerScriptModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
+			</div>
+
+			<div class="flex-1 overflow-hidden flex flex-col space-y-2">
+				<div class="text-[11px] text-slate-400">
+					💡 <b>部署指引</b>：在其他 Cloudflare 账号进入 <b>Workers & Pages</b> -> <b>创建 Worker</b> -> 点击 <b>快速编辑 / 编辑代码</b> -> 全选并粘贴以下代码 -> 点击 <b>部署</b>。将生成的 <code>.workers.dev</code> 域名添加到上方集群池即可！
+				</div>
+				<textarea id="subWorkerScriptArea" readonly class="flex-1 w-full p-3 rounded-xl bg-slate-950 border border-white/10 text-xs text-cyan-200 font-mono leading-relaxed select-all focus:outline-none focus:border-cyan-400 resize-none h-80"></textarea>
+			</div>
+
+			<div class="flex justify-between items-center pt-3 border-t border-white/10">
+				<span class="text-[11px] text-slate-400">原生支持 SOCKS5 / HTTP 探测与跨域 CORS</span>
+				<div class="space-x-2">
+					<button onclick="closeSubWorkerScriptModal()" class="px-4 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">关闭</button>
+					<button onclick="copySubWorkerScript()" class="px-5 py-1.5 rounded-lg font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/20">一键复制代码</button>
+				</div>
+			</div>
+		</div>
+	</div>
+
 	<!-- Toast 提示 -->
 	<div id="adminToast" class="toast flex items-center gap-2 px-4 py-3 rounded-xl border border-cyan-400/40 bg-slate-900/95 text-white shadow-2xl text-xs font-medium">
 		<span id="toastContent">已保存！</span>
@@ -10116,9 +10494,10 @@ function generateAdminHTML(env, hasKV = false) {
 
 	<script>
 		let adminSessionToken = sessionStorage.getItem('cf_admin_token') || '';
-		let globalConfig = { tokens: [], workers: [], sources: {}, hasKV: ${hasKV}, needSetup: false };
+		let globalConfig = { tokens: [], workers: [], sources: {}, clusterSettings: {}, hasKV: ${hasKV}, needSetup: false };
 		let editingTokenId = null;
 		let editingWorkerId = null;
+		let editingCustomSourceKey = null;
 
 		const DEFAULT_SOURCES_SPEC = [
 			{ key: 'hackmyip', label: 'HackMyIP (风控首选 · 原生住宅/机房/VPN与纯净度评级)', needKey: false, desc: '免密免注册，原生检测家庭住宅/机房、VPN及 A-D 纯净度等级。' },
@@ -10132,6 +10511,211 @@ function generateAdminHTML(env, hasKV = false) {
 			{ key: 'ipinfo', label: 'ipinfo.io (知名老牌 · 国际权威数据库)', needKey: true, desc: '权威老牌库，支持填入 Token 扩容。' },
 			{ key: 'ipapico', label: 'ipapi.co (高精度单条 · 有严格限速)', needKey: false, desc: '单条精细排查，注意限速30次/分。' }
 		];
+
+		const SUB_WORKER_SCRIPT_TEMPLATE = \`// ============================================================
+// CheckSocks5 极简从节点执行内核 (Standalone Sub-Worker)
+// 适用于部署到备用 Cloudflare 免费账号，免 KV、免环境变量，开箱即用！
+// ============================================================
+import { connect } from 'cloudflare:sockets';
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': '*'
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+    const url = new URL(request.url);
+    const colo = request.cf?.colo || 'UNKNOWN';
+
+    // 测速与探活接口
+    if (url.pathname === '/ip.json') {
+      const clientIp = request.headers.get('cf-connecting-ip') || '127.0.0.1';
+      return new Response(JSON.stringify({ success: true, ip: clientIp, colo }), {
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 代理测活接口
+    if (url.pathname === '/check') {
+      const proxyParam = url.searchParams.get('proxy') || url.searchParams.get('socks5') || url.searchParams.get('http') || url.searchParams.get('https');
+      if (!proxyParam) {
+        return new Response(JSON.stringify({ success: false, error: 'Missing proxy parameter' }), {
+          status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        });
+      }
+      const source = url.searchParams.get('source') || 'iplocate';
+      try {
+        const result = await checkProxyCore(proxyParam, colo, source);
+        return new Response(JSON.stringify(result), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ success: false, error: err.message || 'Check failed' }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ status: 'running', role: 'cluster-sub-worker', colo }), {
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+    });
+  }
+};
+
+function parseProxyUrl(raw) {
+  let target = raw.trim();
+  let proto = 'socks5';
+  if (/^[a-zA-Z0-9]+:\\/\\//.test(target)) {
+    const idx = target.indexOf('://');
+    proto = target.slice(0, idx).toLowerCase();
+    target = target.slice(idx + 3);
+  }
+  let username = '', password = '';
+  const atIdx = target.lastIndexOf('@');
+  if (atIdx !== -1) {
+    const auth = target.slice(0, atIdx);
+    target = target.slice(atIdx + 1);
+    const colonIdx = auth.indexOf(':');
+    if (colonIdx !== -1) {
+      username = decodeURIComponent(auth.slice(0, colonIdx));
+      password = decodeURIComponent(auth.slice(colonIdx + 1));
+    } else {
+      username = decodeURIComponent(auth);
+    }
+  }
+  const parts = target.split(':');
+  const host = parts[0];
+  const port = parseInt(parts[1] || (proto === 'http' ? '80' : proto === 'https' ? '443' : '1080'), 10);
+  return { proto, host, port, username, password };
+}
+
+async function checkProxyCore(rawProxy, colo, source) {
+  const p = parseProxyUrl(rawProxy);
+  const startTime = Date.now();
+
+  let targetHost = 'iplocate.io';
+  let targetPath = '/api/lookup/';
+  if (source === 'ipsb') { targetHost = 'api.ip.sb'; targetPath = '/geoip'; }
+  else if (source === 'ipwhois') { targetHost = 'ipwho.is'; targetPath = '/'; }
+  else if (source === 'cloudflare') { targetHost = 'cloudflare.com'; targetPath = '/cdn-cgi/trace'; }
+  else if (source === 'hackmyip') { targetHost = 'api.hackmyip.com'; targetPath = '/api/v1/ip'; }
+
+  const socket = connect({ hostname: p.host, port: p.port });
+  const writer = socket.writable.getWriter();
+  const reader = socket.readable.getReader();
+
+  try {
+    if (p.proto.startsWith('socks')) {
+      // SOCKS5 Handshake
+      const authMethod = p.username ? 0x02 : 0x00;
+      await writer.write(new Uint8Array([0x05, 0x01, authMethod]));
+      let resp = await readChunk(reader, 2);
+      if (resp[0] !== 0x05) throw new Error('Invalid SOCKS5 handshake response');
+      if (resp[1] === 0x02) {
+        const uBytes = new TextEncoder().encode(p.username);
+        const pBytes = new TextEncoder().encode(p.password);
+        const authPayload = new Uint8Array(3 + uBytes.length + pBytes.length);
+        authPayload[0] = 0x01;
+        authPayload[1] = uBytes.length;
+        authPayload.set(uBytes, 2);
+        authPayload[2 + uBytes.length] = pBytes.length;
+        authPayload.set(pBytes, 3 + uBytes.length);
+        await writer.write(authPayload);
+        const authRes = await readChunk(reader, 2);
+        if (authRes[1] !== 0x00) throw new Error('SOCKS5 auth failed');
+      } else if (resp[1] !== 0x00) {
+        throw new Error('SOCKS5 auth method not supported');
+      }
+
+      // Connect Command
+      const hostBytes = new TextEncoder().encode(targetHost);
+      const req = new Uint8Array(7 + hostBytes.length);
+      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
+      req[4] = hostBytes.length;
+      req.set(hostBytes, 5);
+      req[5 + hostBytes.length] = (80 >> 8) & 0xff;
+      req[6 + hostBytes.length] = 80 & 0xff;
+      await writer.write(req);
+      const connRes = await readChunk(reader, 10);
+      if (connRes[1] !== 0x00) throw new Error('SOCKS5 connect error: ' + connRes[1]);
+    } else {
+      // HTTP Proxy Handshake
+      const connectCmd = 'CONNECT ' + targetHost + ':80 HTTP/1.1\\r\\nHost: ' + targetHost + ':80\\r\\n\\r\\n';
+      await writer.write(new TextEncoder().encode(connectCmd));
+      const headRes = await readLine(reader);
+      if (!headRes.includes('200')) throw new Error('HTTP connect error: ' + headRes);
+    }
+
+    const latency = Date.now() - startTime;
+    // Send HTTP GET
+    const httpGet = 'GET ' + targetPath + ' HTTP/1.1\\r\\nHost: ' + targetHost + '\\r\\nUser-Agent: curl/7.88.1\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n';
+    await writer.write(new TextEncoder().encode(httpGet));
+
+    // Read Response
+    let body = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      body += new TextDecoder().decode(value, { stream: true });
+      if (body.length > 32768) break;
+    }
+
+    const jsonStart = body.indexOf('{');
+    let exitData = {};
+    if (jsonStart !== -1) {
+      try { exitData = JSON.parse(body.slice(jsonStart)); } catch (e) {}
+    } else if (source === 'cloudflare') {
+      const ipMatch = body.match(/ip=([0-9a-fA-F.:]+)/);
+      if (ipMatch) exitData = { ip: ipMatch[1], country: 'Unknown' };
+    }
+
+    return {
+      success: true,
+      latency,
+      colo,
+      proxy: { host: p.host, port: p.port, proto: p.proto },
+      exit: {
+        ip: exitData.ip || 'Unknown',
+        country: exitData.country || exitData.country_name || exitData.countryCode || '',
+        city: exitData.city || '',
+        asn: exitData.asn || (exitData.asn_number ? { asn: exitData.asn_number } : null),
+        is_datacenter: Boolean(exitData.is_datacenter || exitData.hosting)
+      }
+    };
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+    try { writer.releaseLock(); } catch (e) {}
+    try { socket.close(); } catch (e) {}
+  }
+}
+
+async function readChunk(reader, length) {
+  const buf = new Uint8Array(length);
+  let read = 0;
+  while (read < length) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error('Socket closed prematurely');
+    buf.set(value.subarray(0, length - read), read);
+    read += Math.min(value.length, length - read);
+  }
+  return buf;
+}
+
+async function readLine(reader) {
+  let line = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    line += new TextDecoder().decode(value);
+    if (line.includes('\\r\\n\\r\\n') || line.includes('\\n\\n')) break;
+  }
+  return line;
+}\`;
 
 		async function adminFetch(endpoint, options = {}) {
 			options.headers = options.headers || {};
@@ -10160,6 +10744,15 @@ function generateAdminHTML(env, hasKV = false) {
 				}
 				hideAuthModal();
 				globalConfig = data;
+				// 同步纯集群模式开关
+				const isPure = Boolean(globalConfig.clusterSettings?.pureClusterMode);
+				const pureToggle = document.getElementById('pureClusterModeToggle');
+				const pureLabel = document.getElementById('pureClusterModeLabel');
+				if (pureToggle) pureToggle.checked = isPure;
+				if (pureLabel) {
+					pureLabel.textContent = isPure ? '已启用 (主账号0消耗)' : '已关闭';
+					pureLabel.className = 'ml-2 text-xs font-semibold ' + (isPure ? 'text-emerald-400' : 'text-slate-400');
+				}
 				renderAll();
 			} catch (e) {
 				showAuthModal(false);
@@ -10360,11 +10953,13 @@ function generateAdminHTML(env, hasKV = false) {
 			openTokenModal('edit', id);
 		}
 
-		// 接口与多 Key 池
+		// 接口与多 Key 池管理
 		function renderSources() {
 			const container = document.getElementById('sourcesContainer');
 			const confSources = globalConfig.sources || {};
-			container.innerHTML = DEFAULT_SOURCES_SPEC.map(spec => {
+
+			// 渲染官方内置接口
+			const builtInHtml = DEFAULT_SOURCES_SPEC.map(spec => {
 				const current = confSources[spec.key] || { enabled: true, keys: [] };
 				const isEnabled = current.enabled !== false;
 				const keysText = (current.keys || []).join('\\n');
@@ -10391,10 +10986,46 @@ function generateAdminHTML(env, hasKV = false) {
 					</div>
 				\`;
 			}).join('');
+
+			// 渲染自定义接口
+			const customKeys = Object.keys(confSources).filter(k => {
+				return confSources[k]?.isCustom || !DEFAULT_SOURCES_SPEC.some(s => s.key === k);
+			});
+
+			const customHtml = customKeys.map(k => {
+				const src = confSources[k];
+				const isEnabled = src.enabled !== false;
+				const keysCount = (src.keys || []).filter(Boolean).length;
+				return \`
+					<div class="p-4 rounded-xl border border-cyan-500/30 bg-slate-900/80 space-y-3 relative overflow-hidden">
+						<div class="absolute top-0 right-0 bg-cyan-500 text-slate-950 text-[10px] font-bold px-2 py-0.5 rounded-bl-lg">自定义接口</div>
+						<div class="flex items-center justify-between pr-16">
+							<strong class="text-sm font-semibold text-white">\${escapeHtml(src.label || k)}</strong>
+							<label class="flex items-center gap-1.5 cursor-pointer">
+								<span class="text-[11px] text-slate-400">\${isEnabled ? '启用' : '禁用'}</span>
+								<input type="checkbox" onchange="toggleCustomSourceEnable('\${k}', this.checked)" \${isEnabled ? 'checked' : ''} class="w-4 h-4 rounded text-cyan-500 bg-slate-800">
+							</label>
+						</div>
+						<div class="text-xs font-mono text-cyan-300 break-all bg-slate-950/60 p-2 rounded-lg border border-white/5">
+							\${escapeHtml(src.url || '')}
+						</div>
+						<div class="text-[11px] text-slate-400 space-y-1">
+							<div>Key 池状态: <span class="text-cyan-300 font-mono">\${keysCount} 个 Key 轮询中</span></div>
+							<div class="truncate">字段映射: <code class="text-slate-300 font-mono">IP: \${escapeHtml(src.mapping?.ip || 'ip')} | 地区: \${escapeHtml(src.mapping?.country || 'country')} | ASN: \${escapeHtml(src.mapping?.asn || 'asn')}</code></div>
+						</div>
+						<div class="flex items-center justify-end gap-3 text-xs pt-1 border-t border-white/5">
+							<button onclick="openCustomSourceModal('edit', '\${k}')" class="text-cyan-400 hover:underline">编辑</button>
+							<button onclick="deleteCustomSource('\${k}')" class="text-rose-400 hover:underline">删除</button>
+						</div>
+					</div>
+				\`;
+			}).join('');
+
+			container.innerHTML = builtInHtml + customHtml;
 		}
 
 		async function saveAllSourcesConfig() {
-			const nextSources = {};
+			const nextSources = { ...(globalConfig.sources || {}) };
 			DEFAULT_SOURCES_SPEC.forEach(spec => {
 				const isEnabled = document.getElementById('sourceEnable-' + spec.key)?.checked ?? true;
 				let keys = [];
@@ -10402,7 +11033,7 @@ function generateAdminHTML(env, hasKV = false) {
 					const val = document.getElementById('sourceKeys-' + spec.key)?.value || '';
 					keys = val.split(/[\\r\\n,;]+/).map(k => k.trim()).filter(Boolean);
 				}
-				nextSources[spec.key] = { enabled: isEnabled, keys };
+				nextSources[spec.key] = { ...(nextSources[spec.key] || {}), enabled: isEnabled, keys };
 			});
 
 			try {
@@ -10414,11 +11045,191 @@ function generateAdminHTML(env, hasKV = false) {
 				if (res.success) {
 					globalConfig.sources = res.sources;
 					renderSources();
-					showToast('所有接口与多 Key 配置保存成功！');
+					showToast('所有接口配置已保存！');
 				} else {
 					alert(res.error || '保存失败');
 				}
 			} catch (e) { alert(e.message); }
+		}
+
+		function openCustomSourceModal(mode, key = null) {
+			editingCustomSourceKey = key;
+			const modal = document.getElementById('customSourceModal');
+			if (mode === 'add') {
+				document.getElementById('customSourceModalTitle').innerHTML = '➕ 添加自定义 IP 接口';
+				document.getElementById('modalCustomKey').value = '';
+				document.getElementById('modalCustomKey').disabled = false;
+				document.getElementById('modalCustomLabel').value = '';
+				document.getElementById('modalCustomUrl').value = '';
+				document.getElementById('modalCustomKeys').value = '';
+				document.getElementById('modalMapIp').value = 'ip';
+				document.getElementById('modalMapCountry').value = 'country';
+				document.getElementById('modalMapCountryCode').value = 'country_code';
+				document.getElementById('modalMapCity').value = 'city';
+				document.getElementById('modalMapAsn').value = 'asn';
+				document.getElementById('modalMapOrg').value = 'org';
+				document.getElementById('modalMapProxy').value = 'is_proxy';
+				document.getElementById('modalMapDatacenter').value = 'is_datacenter';
+				document.getElementById('modalMapTimezone').value = 'timezone';
+			} else {
+				const src = globalConfig.sources?.[key];
+				if (!src) return;
+				document.getElementById('customSourceModalTitle').innerHTML = '✏️ 编辑自定义 IP 接口 (' + escapeHtml(key) + ')';
+				document.getElementById('modalCustomKey').value = key;
+				document.getElementById('modalCustomKey').disabled = true;
+				document.getElementById('modalCustomLabel').value = src.label || '';
+				document.getElementById('modalCustomUrl').value = src.url || '';
+				document.getElementById('modalCustomKeys').value = (src.keys || []).join('\\n');
+				const m = src.mapping || {};
+				document.getElementById('modalMapIp').value = m.ip || 'ip';
+				document.getElementById('modalMapCountry').value = m.country || 'country';
+				document.getElementById('modalMapCountryCode').value = m.country_code || 'country_code';
+				document.getElementById('modalMapCity').value = m.city || 'city';
+				document.getElementById('modalMapAsn').value = m.asn || 'asn';
+				document.getElementById('modalMapOrg').value = m.org || m.isp || 'org';
+				document.getElementById('modalMapProxy').value = m.is_proxy || 'is_proxy';
+				document.getElementById('modalMapDatacenter').value = m.is_datacenter || 'is_datacenter';
+				document.getElementById('modalMapTimezone').value = m.timezone || 'timezone';
+			}
+			modal.classList.remove('hidden');
+		}
+
+		function closeCustomSourceModal() {
+			document.getElementById('customSourceModal').classList.add('hidden');
+			editingCustomSourceKey = null;
+		}
+
+		async function submitCustomSourceModal() {
+			const key = document.getElementById('modalCustomKey').value.trim().toLowerCase();
+			const label = document.getElementById('modalCustomLabel').value.trim();
+			const url = document.getElementById('modalCustomUrl').value.trim();
+			const keysRaw = document.getElementById('modalCustomKeys').value.trim();
+			const keys = keysRaw ? keysRaw.split(/[\\r\\n,;]+/).map(k => k.trim()).filter(Boolean) : [];
+
+			if (!key || !/^[a-z0-9_-]+$/.test(key)) {
+				alert('接口标识只能包含英文小写字母、数字、下划线或连字符');
+				return;
+			}
+			if (!url || !/^https?:\\/\\//i.test(url)) {
+				alert('请输入有效的 HTTP / HTTPS 请求 URL');
+				return;
+			}
+
+			const mapping = {
+				ip: document.getElementById('modalMapIp').value.trim() || 'ip',
+				country: document.getElementById('modalMapCountry').value.trim() || 'country',
+				country_code: document.getElementById('modalMapCountryCode').value.trim() || 'country_code',
+				city: document.getElementById('modalMapCity').value.trim() || 'city',
+				asn: document.getElementById('modalMapAsn').value.trim() || 'asn',
+				org: document.getElementById('modalMapOrg').value.trim() || 'org',
+				is_proxy: document.getElementById('modalMapProxy').value.trim() || 'is_proxy',
+				is_datacenter: document.getElementById('modalMapDatacenter').value.trim() || 'is_datacenter',
+				timezone: document.getElementById('modalMapTimezone').value.trim() || 'timezone'
+			};
+
+			const nextSources = { ...(globalConfig.sources || {}) };
+			nextSources[key] = {
+				label: label || key,
+				url,
+				keys,
+				mapping,
+				isCustom: true,
+				enabled: nextSources[key]?.enabled !== false
+			};
+
+			try {
+				const res = await adminFetch('/api/admin/sources', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ sources: nextSources })
+				});
+				if (res.success) {
+					globalConfig.sources = res.sources;
+					renderSources();
+					closeCustomSourceModal();
+					showToast('自定义接口已保存并立即生效！');
+				} else {
+					alert(res.error || '保存失败');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		async function toggleCustomSourceEnable(key, enabled) {
+			const nextSources = { ...(globalConfig.sources || {}) };
+			if (!nextSources[key]) return;
+			nextSources[key].enabled = enabled;
+			try {
+				const res = await adminFetch('/api/admin/sources', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ sources: nextSources })
+				});
+				if (res.success) {
+					globalConfig.sources = res.sources;
+					showToast('接口状态已更新');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		async function deleteCustomSource(key) {
+			if (!confirm('确定要删除自定义接口 [' + key + '] 吗？')) return;
+			const nextSources = { ...(globalConfig.sources || {}) };
+			delete nextSources[key];
+			try {
+				const res = await adminFetch('/api/admin/sources', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ sources: nextSources })
+				});
+				if (res.success) {
+					globalConfig.sources = res.sources;
+					renderSources();
+					showToast('自定义接口已删除');
+				}
+			} catch (e) { alert(e.message); }
+		}
+
+		// 极简子节点专属脚本弹窗
+		function openSubWorkerScriptModal() {
+			document.getElementById('subWorkerScriptArea').value = SUB_WORKER_SCRIPT_TEMPLATE;
+			document.getElementById('subWorkerScriptModal').classList.remove('hidden');
+		}
+
+		function closeSubWorkerScriptModal() {
+			document.getElementById('subWorkerScriptModal').classList.add('hidden');
+		}
+
+		function copySubWorkerScript() {
+			const code = document.getElementById('subWorkerScriptArea').value;
+			navigator.clipboard.writeText(code).then(() => {
+				showToast('已复制完整脚本代码！去备用 CF 账号粘贴部署即可');
+			}).catch(() => {
+				alert('复制失败，请手动在文本框中全选复制');
+			});
+		}
+
+		// 纯集群调度模式开关
+		async function handlePureClusterToggle(enabled) {
+			const label = document.getElementById('pureClusterModeLabel');
+			if (label) {
+				label.textContent = enabled ? '已启用 (主账号0消耗)' : '已关闭';
+				label.className = 'ml-2 text-xs font-semibold ' + (enabled ? 'text-emerald-400' : 'text-slate-400');
+			}
+			try {
+				const res = await adminFetch('/api/admin/cluster-settings', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ pureClusterMode: enabled })
+				});
+				if (res.success) {
+					globalConfig.clusterSettings = res.clusterSettings;
+					showToast(enabled ? '纯集群模式已启用！主账号零消耗' : '纯集群模式已关闭，主节点参与测活');
+				} else {
+					alert(res.error || '保存集群设置失败');
+				}
+			} catch (e) {
+				alert(e.message);
+			}
 		}
 
 		// Worker 集群管理
@@ -10426,7 +11237,7 @@ function generateAdminHTML(env, hasKV = false) {
 			const grid = document.getElementById('workerGrid');
 			const workers = globalConfig.workers || [];
 			if (!workers.length) {
-				grid.innerHTML = '<div class="col-span-full py-8 text-center text-slate-500">暂无从节点。点击右上角“添加 Worker”，即可把其他 CF 账号部署的测活地址加入分布式集群！</div>';
+				grid.innerHTML = '<div class="col-span-full py-8 text-center text-slate-500">暂无从节点。点击右上角“添加 Worker”或“复制极简子节点代码”，把其他 CF 账号部署的测活地址加入分布式集群！</div>';
 				return;
 			}
 			grid.innerHTML = workers.map(w => {
@@ -10607,11 +11418,12 @@ function generateAdminHTML(env, hasKV = false) {
 
 		function exportFullConfig() {
 			const backup = {
-				version: '1.3.0',
+				version: '1.4.0',
 				timestamp: Date.now(),
 				tokens: globalConfig.tokens || [],
 				workers: globalConfig.workers || [],
-				sources: globalConfig.sources || {}
+				sources: globalConfig.sources || {},
+				clusterSettings: globalConfig.clusterSettings || {}
 			};
 			const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
 			const a = document.createElement('a');
@@ -10649,6 +11461,13 @@ function generateAdminHTML(env, hasKV = false) {
 							body: JSON.stringify({ sources: data.sources })
 						});
 					}
+					if (data.clusterSettings && typeof data.clusterSettings === 'object') {
+						await adminFetch('/api/admin/cluster-settings', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify(data.clusterSettings)
+						});
+					}
 					showToast('配置还原成功！正在刷新...');
 					setTimeout(() => window.location.reload(), 1000);
 				} catch (err) {
@@ -10676,6 +11495,6 @@ function generateAdminHTML(env, hasKV = false) {
 		window.addEventListener('DOMContentLoaded', initDashboard);
 	</script>
 </body>
-</html>\`;
+</html>`;
 }
 

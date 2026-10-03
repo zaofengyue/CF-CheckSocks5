@@ -62,15 +62,17 @@ Demo: <https://check.socks5.cmliussss.net>
 
 ## 后台管理系统 (`/admin`)
 
-当 Worker / Pages 绑定了 `CONFIG_KV`（或 `KV`）命名空间时，访问 `https://your-domain/admin` 将开启管理控制台：
+当 Worker / Pages 绑定了 `KV`（亦兼容 `CONFIG_KV`）命名空间时，访问 `https://your-domain/admin` 将开启管理控制台：
 
 - **访问 Token 管理 (Tokens)**：可视化创建、禁用、启用与删除用户 Token，支持为每个 Token 备注用途（如“自用客户端”、“群友测试”等）。
 - **接口与多 Key 池管理 (Sources & Key Pool)**：
-  - 支持为商业 IP 查询接口（如 `api.ipapi.is`、`api.ip2location.io`、`ipdata.co` 等）配置多组 API Key。
-  - **自动负载均衡与智能容灾**：多 Key 自动 Round-Robin 轮询调度；当某个 Key 遇到 429 配额耗尽或被限流时，系统自动触发 10 分钟静默冷却并无缝切换至下一个可用 Key，冷却期结束后自动复活。
-- **Worker 分布式集群调度 (Worker Cluster)**：
-  - 支持将多个免费 Cloudflare 账号部署的 Worker 节点地址填入集群列表中。
-  - 前端批量检测时自动从 `/api/cluster/nodes` 拉取可用节点，将成千上万个代理检测请求并发分发到各个 Worker 节点，打破单账号每天 10 万次请求的免费限制，大幅提升并发吞吐量。
+  - 支持为商业 IP 查询接口（如 `api.ipapi.is`、`api.ip2location.io`、`ipdata.co` 等）配置多组 API Key，自动 Round-Robin 轮询调度与 429 智能熔断。
+  - **自定义接口 (Custom IP Sources)**：支持任意添加第三方自建或商业 IP 数据库，支持在 URL 中设置 `{{KEY}}` 搭配 Key 池轮询，并通过 JSON 点操作符路径（如 `data.ip`、`location.country`）自由映射提取出口属性。
+- **Worker 分布式集群调度与纯集群模式 (Worker Cluster)**：
+  - **⚡ 纯集群调度模式 (主账号 0 消耗)**：一键开启纯集群模式，主 Worker 仅作为控制面板与管理中枢，所有测活流量 100% 分发给子 Worker 节点，彻底保持主账号每日 10 万次配额零消耗！
+  - **📋 极简子节点专属脚本**：后台支持一键复制约 200 行免 KV 空间、免环境变量的纯执行独立脚本，在小号 Cloudflare 直接粘贴部署，秒级上线从节点。
+  - **10w+ 智能容灾与熔断重试**：大批量测活时，当某个子节点因高频请求遇到 429/1015/1027 或网络离线时，前端调度器自动将其标记 5 分钟冷却，并自动切换至下一健康子节点重试，大批量检测持续不中断。
+  - **一键全节点测速巡检**：实时探测所有子 Worker 的 HTTP 往返延迟与 Cloudflare 边缘机房代码（如 HKG、SJC 等）。
 - **配置导入导出与备份 (Settings & Backup)**：支持一键导出全站配置 JSON 备份文件，迁移站点时一键上传还原。
 
 ## 支持的代理格式

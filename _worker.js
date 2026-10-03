@@ -9493,6 +9493,10 @@ function generateHTML(备案内容, hasToken = false) {
 		let hasPromptedTokenAuth = false;
 		function onTokenUnauthorized() {
 			if (hasPromptedTokenAuth) return;
+			const lockOverlay = document.getElementById('authLockOverlay');
+			if (lockOverlay && lockOverlay.classList.contains('is-active')) return;
+			if (window.__TOKEN_REQUIRED__ && !getSavedToken()) return;
+
 			hasPromptedTokenAuth = true;
 			openTokenModal('服务端已开启 Token 鉴权（401 Unauthorized）。请输入正确的访问令牌后继续。');
 		}
@@ -9638,6 +9642,8 @@ function generateHTML(备案内容, hasToken = false) {
 				} catch (e) {}
 				updateTokenButtonState();
 				hideAuthLockOverlay();
+				closeTokenModal();
+				loadClusterNodes();
 			} else {
 				if (errorMsg) {
 					errorMsg.textContent = 'Token 错误，请检查后重新输入';
@@ -10688,25 +10694,33 @@ function generateAdminHTML(env, hasKV = false) {
 			</div>
 
 			<div class="glass-card p-6 space-y-5">
-				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
-					<div>
-						<h2 class="text-lg font-bold text-white flex items-center gap-2">
-							多账号 Worker 节点集群 (分布式调度与自动容灾)
-						</h2>
-						<p class="text-xs text-slate-400 mt-0.5">将部署在不同 Cloudflare 免费账号下的 Worker 加入集群池。大批量并发时自动轮询分流；单节点触达 429 限制时自动休眠并切换下一节点重试，平稳支撑 10w+ 测活！</p>
+				<div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-5 border-b border-white/10">
+					<div class="space-y-1">
+						<div class="flex items-center gap-2.5">
+							<div class="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500/20 to-teal-500/10 border border-emerald-500/30 flex items-center justify-center text-sm shadow-inner">
+								🌐
+							</div>
+							<div>
+								<h2 class="text-base font-bold text-white flex items-center gap-2">
+									多账号 Worker 节点集群
+									<span id="clusterNodeCountBadge" class="text-[10px] px-2 py-0.5 rounded-full font-mono bg-emerald-500/10 border border-emerald-500/20 text-emerald-300">0 个节点</span>
+								</h2>
+								<p class="text-xs text-slate-400 mt-0.5">跨 Cloudflare 免费账号分布式轮询调度与智能容灾，单节点 429 自动熔断切流，平稳支撑 10w+ 测活</p>
+							</div>
+						</div>
 					</div>
-					<div class="flex items-center gap-2 flex-wrap">
-						<button onclick="openBatchDeployModal()" class="px-3.5 py-1.5 rounded-xl font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 hover:brightness-110 transition shadow-lg shadow-emerald-500/20 flex items-center gap-1.5">
-							🤖 批量自动部署从节点
+					<div class="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+						<button onclick="pingAllWorkers()" class="h-9 px-3 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center gap-1.5 shadow-sm">
+							<span class="text-amber-400">⚡</span> 一键测速
 						</button>
-						<button onclick="openSubWorkerScriptModal()" class="px-3.5 py-1.5 rounded-xl font-bold text-xs border border-emerald-500/40 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/40 transition flex items-center gap-1.5">
-							📋 复制极简子节点代码
+						<button onclick="openSubWorkerScriptModal()" class="h-9 px-3 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center gap-1.5 shadow-sm">
+							<span class="text-cyan-400">📋</span> 复制内核
 						</button>
-						<button onclick="pingAllWorkers()" class="px-3 py-1.5 rounded-xl font-medium text-xs border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition">
-							⚡ 一键测速全部
+						<button onclick="openWorkerModal('add')" class="h-9 px-3.5 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/50 hover:border-cyan-400/50 transition flex items-center gap-1.5 shadow-sm">
+							<span>➕</span> 手动接入
 						</button>
-						<button onclick="openWorkerModal('add')" class="px-3.5 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition shadow-lg shadow-cyan-500/20">
-							+ 添加 Worker
+						<button onclick="openBatchDeployModal()" class="h-9 px-4 rounded-xl text-xs font-bold bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 hover:brightness-110 transition flex items-center gap-1.5 shadow-lg shadow-emerald-500/20">
+							<span>🚀</span> 批量全自动部署
 						</button>
 					</div>
 				</div>
@@ -11671,8 +11685,21 @@ function generateAdminHTML(env, hasKV = false) {
 		function renderWorkers() {
 			const grid = document.getElementById('workerGrid');
 			const workers = globalConfig.workers || [];
+			const countBadge = document.getElementById('clusterNodeCountBadge');
+			if (countBadge) countBadge.textContent = workers.length + ' 个节点';
+
 			if (!workers.length) {
-				grid.innerHTML = '<div class="col-span-full py-8 text-center text-slate-500">暂无从节点。点击右上角“添加 Worker”或“复制极简子节点代码”，把其他 CF 账号部署的测活地址加入分布式集群！</div>';
+				grid.innerHTML = '<div class="col-span-full py-12 px-6 rounded-2xl border border-dashed border-white/10 bg-slate-950/40 text-center space-y-4">'
+					+ '<div class="w-12 h-12 mx-auto rounded-2xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-xl text-cyan-400">🤖</div>'
+					+ '<div class="space-y-1 max-w-md mx-auto">'
+					+ '<h4 class="text-sm font-bold text-white">当前集群暂无从节点</h4>'
+					+ '<p class="text-xs text-slate-400 leading-relaxed">接入多个备用 Cloudflare 免费账号的子节点，可组成弹性负载均衡集群，大批量并发任务自动分流并突破单号限额。</p>'
+					+ '</div>'
+					+ '<div class="flex items-center justify-center gap-3 pt-2">'
+					+ '<button onclick="openBatchDeployModal()" class="px-4 py-2 rounded-xl text-xs font-bold bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 hover:brightness-110 shadow-lg shadow-emerald-500/20">🚀 批量全自动部署</button>'
+					+ '<button onclick="openSubWorkerScriptModal()" class="px-3.5 py-2 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900 text-slate-300 hover:text-white">📋 查看极简代码</button>'
+					+ '</div>'
+					+ '</div>';
 				return;
 			}
 			grid.innerHTML = workers.map(w => {

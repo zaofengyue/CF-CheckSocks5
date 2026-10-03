@@ -281,6 +281,8 @@ const SUB_WORKER_SCRIPT_TEMPLATE = `// =========================================
 // ============================================================
 import { connect } from 'cloudflare:sockets';
 
+const AUTH_TOKEN = '__AUTH_TOKEN__';
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -305,6 +307,14 @@ export default {
 
     // 代理测活接口
     if (url.pathname === '/check') {
+      if (AUTH_TOKEN && AUTH_TOKEN !== '__AUTH_TOKEN__') {
+        const clientToken = url.searchParams.get('token') || request.headers.get('x-token') || (request.headers.get('authorization') || '').replace(/^Bearer\\s+/i, '');
+        if (clientToken !== AUTH_TOKEN) {
+          return new Response(JSON.stringify({ success: false, error: 'Unauthorized: Invalid node token' }), {
+            status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+          });
+        }
+      }
       const proxyParam = url.searchParams.get('proxy') || url.searchParams.get('socks5') || url.searchParams.get('http') || url.searchParams.get('https');
       if (!proxyParam) {
         return new Response(JSON.stringify({ success: false, error: 'Missing proxy parameter' }), {
@@ -333,7 +343,7 @@ export default {
 function parseProxyUrl(raw) {
   let target = raw.trim();
   let proto = 'socks5';
-  if (/^[a-zA-Z0-9]+:\\/\\//.test(target)) {
+  if (target.includes('://')) {
     const idx = target.indexOf('://');
     proto = target.slice(0, idx).toLowerCase();
     target = target.slice(idx + 3);
@@ -344,16 +354,27 @@ function parseProxyUrl(raw) {
     const auth = target.slice(0, atIdx);
     target = target.slice(atIdx + 1);
     const colonIdx = auth.indexOf(':');
+    function safeDecode(s) {
+      try { return decodeURIComponent(s); } catch (e) { return s; }
+    }
     if (colonIdx !== -1) {
-      username = decodeURIComponent(auth.slice(0, colonIdx));
-      password = decodeURIComponent(auth.slice(colonIdx + 1));
+      username = safeDecode(auth.slice(0, colonIdx));
+      password = safeDecode(auth.slice(colonIdx + 1));
     } else {
-      username = decodeURIComponent(auth);
+      username = safeDecode(auth);
     }
   }
-  const parts = target.split(':');
-  const host = parts[0];
-  const port = parseInt(parts[1] || (proto === 'http' ? '80' : proto === 'https' ? '443' : '1080'), 10);
+  let host = '', port = (proto === 'http' ? 80 : proto === 'https' ? 443 : 1080);
+  if (target.startsWith('[')) {
+    const bracketEnd = target.indexOf(']');
+    host = bracketEnd !== -1 ? target.slice(1, bracketEnd) : target;
+    const portPart = bracketEnd !== -1 ? target.slice(bracketEnd + 1).replace(/^:/, '') : '';
+    if (portPart) port = parseInt(portPart, 10);
+  } else {
+    const parts = target.split(':');
+    host = parts[0];
+    if (parts[1]) port = parseInt(parts[1], 10);
+  }
   return { proto, host, port, username, password };
 }
 
@@ -721,8 +742,12 @@ async function handleAdminAPI(request, url, env, origin) {
 		return jsonResponse({ success: true, token: sessionToken, message: '登录成功' }, { origin });
 	}
 
-	if (!auth.ok) {
-		return jsonResponse({ success: false, error: '管理员未授权或会话已过期，请重新登录', needSetup: auth.needSetup }, { status: 401, origin });
+	if (!auth.ok || auth.needSetup) {
+		return jsonResponse({
+			success: false,
+			error: auth.needSetup ? '管理员尚未初始化密码，请先完成密码设置' : '管理员未授权或会话已过期，请重新登录',
+			needSetup: Boolean(auth.needSetup)
+		}, { status: 401, origin });
 	}
 
 	if (pathname === '/api/admin/config' && request.method === 'GET') {
@@ -916,9 +941,10 @@ async function handleAdminAPI(request, url, env, origin) {
 			return jsonResponse({ success: false, error: '请提供 Global API Key 或 API Token' }, { status: 400, origin });
 		}
 
-		// 构建 Cloudflare 官方 API 认证请求头
+		// 构建 Cloudflare 官方 API 认证请求头 (精确区分 Global API Key 与 API Token)
+		const isGlobalKey = /^[0-9a-f]{37}$/i.test(apiKey);
 		const cfHeaders = {};
-		if (email && apiKey.length > 30) {
+		if (email && isGlobalKey) {
 			cfHeaders['X-Auth-Email'] = email;
 			cfHeaders['X-Auth-Key'] = apiKey;
 		} else {
@@ -968,7 +994,10 @@ async function handleAdminAPI(request, url, env, origin) {
 				}
 			}
 
-			// 3. 上传部署极简从节点内核脚本 (ES Module via Multipart Form)
+			// 3. 上传部署极简从节点内核脚本 (注入专属随机鉴权 Token 防白嫖)
+			const nodeToken = 's5_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+			const customizedScript = SUB_WORKER_SCRIPT_TEMPLATE.replace('__AUTH_TOKEN__', nodeToken);
+
 			const formData = new FormData();
 			const metadata = {
 				main_module: 'index.js',
@@ -976,7 +1005,7 @@ async function handleAdminAPI(request, url, env, origin) {
 				compatibility_flags: ['nodejs_compat']
 			};
 			formData.set('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }), 'metadata.json');
-			formData.set('index.js', new Blob([SUB_WORKER_SCRIPT_TEMPLATE], { type: 'application/javascript+module' }), 'index.js');
+			formData.set('index.js', new Blob([customizedScript], { type: 'application/javascript+module' }), 'index.js');
 
 			const uploadRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}`, {
 				method: 'PUT',
@@ -990,26 +1019,32 @@ async function handleAdminAPI(request, url, env, origin) {
 				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
 			}
 
-			// 4. 开启 workers.dev 访问路由
-			await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, {
+			// 4. 开启 workers.dev 访问路由并检查结果
+			const subRouteRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, {
 				method: 'POST',
 				headers: { ...cfHeaders, 'Content-Type': 'application/json' },
 				body: JSON.stringify({ enabled: true }),
 				signal: AbortSignal.timeout(10000)
 			});
+			const subRouteData = await subRouteRes.json();
+			if (!subRouteData.success) {
+				const errMsg = subRouteData.errors?.[0]?.message || '开启 workers.dev 路由失败';
+				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
+			}
 
 			// 5. 组装从节点地址并保存到 KV 集群列表
 			const targetUrl = `https://${scriptName}.${subdomain}.workers.dev`;
 			const currentWorkers = (await getKVWorkers(env)) || [];
 			const nodeDisplayName = customNodeName || `${accountName} (自动部署)`;
 
-			const existingIndex = currentWorkers.findIndex(w => w.url.toLowerCase().replace(/\/+$/, '') === targetUrl.toLowerCase());
+			const existingIndex = currentWorkers.findIndex(w => (w?.url || '').toLowerCase().replace(/\/+$/, '') === targetUrl.toLowerCase());
 			let savedNode;
 			if (existingIndex !== -1) {
 				savedNode = {
 					...currentWorkers[existingIndex],
 					name: nodeDisplayName,
 					url: targetUrl,
+					token: currentWorkers[existingIndex].token || nodeToken,
 					enabled: true
 				};
 				currentWorkers[existingIndex] = savedNode;
@@ -1018,7 +1053,7 @@ async function handleAdminAPI(request, url, env, origin) {
 					id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
 					name: nodeDisplayName,
 					url: targetUrl,
-					token: '',
+					token: nodeToken,
 					enabled: true
 				};
 				currentWorkers.push(savedNode);
@@ -1030,7 +1065,10 @@ async function handleAdminAPI(request, url, env, origin) {
 			let colo = 'CF';
 			try {
 				const pingStart = Date.now();
-				const pRes = await fetch(targetUrl + '/ip.json', { signal: AbortSignal.timeout(6000) });
+				const pRes = await fetch(targetUrl + '/ip.json', {
+					headers: { 'X-Token': nodeToken },
+					signal: AbortSignal.timeout(6000)
+				});
 				if (pRes.ok) {
 					latency = Date.now() - pingStart;
 					const pJson = await pRes.json();
@@ -6881,13 +6919,22 @@ function generateHTML(备案内容, hasToken = false) {
 			nodeFailures.delete(nodeUrl);
 		}
 
+		let clusterNodeTokens = {};
 		async function loadClusterNodes() {
 			if (clusterNodesPromise) return clusterNodesPromise;
 			clusterNodesPromise = (async function () {
 				try {
 					const res = await fetchJsonWithTimeout('/api/cluster/nodes', {}, 5000);
 					if (res.response && res.response.ok && Array.isArray(res.payload?.nodes)) {
-						clusterNodes = res.payload.nodes.map(n => String(n.url || n).trim()).filter(Boolean);
+						clusterNodes = [];
+						clusterNodeTokens = {};
+						res.payload.nodes.forEach(n => {
+							const u = String(n.url || n).trim();
+							if (u) {
+								clusterNodes.push(u);
+								if (n.token) clusterNodeTokens[u.replace(/\/+$/, '')] = n.token;
+							}
+						});
 						pureClusterMode = Boolean(res.payload?.pureClusterMode);
 						if (clusterNodes.length > 0) {
 							console.log('[Cluster] 已加载多 Worker 节点集群:', clusterNodes.length, '个节点', pureClusterMode ? '(纯集群执行模式)' : '');
@@ -9050,7 +9097,8 @@ function generateHTML(备案内容, hasToken = false) {
 						baseUrl = clusterNodes[0].replace(/\/+$/, '');
 					}
 
-					const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+					const nodeToken = chosenNode ? clusterNodeTokens[baseUrl] : '';
+					const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken ? '&token=' + encodeURIComponent(nodeToken) : '');
 					try {
 						result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
 						const status = result?.response?.status;
@@ -10950,7 +10998,8 @@ function generateAdminHTML(env, hasKV = false) {
 					<b>💡 如何获取 Global API Key（永久免密，零验证码）：</b><br>
 					1. 登录该 Cloudflare 免费小号；<br>
 					2. 点击网页右上角头像 -> <b>「我的个人资料」</b> -> <b>「API 令牌」</b>；<br>
-					3. 找到 <b>「Global API Key」</b> 一行，点击 <b>「查看」</b>，复制那串 37 位的十六进制 Key 即可。
+					3. 找到 <b>「Global API Key」</b> 一行，点击 <b>「查看」</b>，复制那串 37 位的十六进制 Key 即可。<br>
+					<div class="pt-1 text-emerald-400 font-medium">🛡️ 安全保障：凭据仅在部署时直连 Cloudflare 官方 API，系统不留存任何密钥；各从节点部署时已自动注入专属鉴权令牌防外界盗用。</div>
 				</div>
 
 				<!-- 部署日志控制台 -->

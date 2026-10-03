@@ -274,6 +274,208 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 	});
 }
 
+// ===================== CheckSocks5 极简从节点执行内核模板 =====================
+const SUB_WORKER_SCRIPT_TEMPLATE = `// ============================================================
+// CheckSocks5 极简从节点执行内核 (Standalone Sub-Worker)
+// 适用于部署到备用 Cloudflare 免费账号，免 KV、免环境变量，开箱即用！
+// ============================================================
+import { connect } from 'cloudflare:sockets';
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': '*'
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+    const url = new URL(request.url);
+    const colo = request.cf?.colo || 'UNKNOWN';
+
+    // 测速与探活接口
+    if (url.pathname === '/ip.json') {
+      const clientIp = request.headers.get('cf-connecting-ip') || '127.0.0.1';
+      return new Response(JSON.stringify({ success: true, ip: clientIp, colo }), {
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 代理测活接口
+    if (url.pathname === '/check') {
+      const proxyParam = url.searchParams.get('proxy') || url.searchParams.get('socks5') || url.searchParams.get('http') || url.searchParams.get('https');
+      if (!proxyParam) {
+        return new Response(JSON.stringify({ success: false, error: 'Missing proxy parameter' }), {
+          status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        });
+      }
+      const source = url.searchParams.get('source') || 'iplocate';
+      try {
+        const result = await checkProxyCore(proxyParam, colo, source);
+        return new Response(JSON.stringify(result), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ success: false, error: err.message || 'Check failed' }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ status: 'running', role: 'cluster-sub-worker', colo }), {
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+    });
+  }
+};
+
+function parseProxyUrl(raw) {
+  let target = raw.trim();
+  let proto = 'socks5';
+  if (/^[a-zA-Z0-9]+:\\/\\//.test(target)) {
+    const idx = target.indexOf('://');
+    proto = target.slice(0, idx).toLowerCase();
+    target = target.slice(idx + 3);
+  }
+  let username = '', password = '';
+  const atIdx = target.lastIndexOf('@');
+  if (atIdx !== -1) {
+    const auth = target.slice(0, atIdx);
+    target = target.slice(atIdx + 1);
+    const colonIdx = auth.indexOf(':');
+    if (colonIdx !== -1) {
+      username = decodeURIComponent(auth.slice(0, colonIdx));
+      password = decodeURIComponent(auth.slice(colonIdx + 1));
+    } else {
+      username = decodeURIComponent(auth);
+    }
+  }
+  const parts = target.split(':');
+  const host = parts[0];
+  const port = parseInt(parts[1] || (proto === 'http' ? '80' : proto === 'https' ? '443' : '1080'), 10);
+  return { proto, host, port, username, password };
+}
+
+async function checkProxyCore(rawProxy, colo, source) {
+  const p = parseProxyUrl(rawProxy);
+  const startTime = Date.now();
+
+  let targetHost = 'iplocate.io';
+  let targetPath = '/api/lookup/';
+  if (source === 'ipsb') { targetHost = 'api.ip.sb'; targetPath = '/geoip'; }
+  else if (source === 'ipwhois') { targetHost = 'ipwho.is'; targetPath = '/'; }
+  else if (source === 'cloudflare') { targetHost = 'cloudflare.com'; targetPath = '/cdn-cgi/trace'; }
+  else if (source === 'hackmyip') { targetHost = 'api.hackmyip.com'; targetPath = '/api/v1/ip'; }
+
+  const socket = connect({ hostname: p.host, port: p.port });
+  const writer = socket.writable.getWriter();
+  const reader = socket.readable.getReader();
+
+  try {
+    if (p.proto.startsWith('socks')) {
+      const authMethod = p.username ? 0x02 : 0x00;
+      await writer.write(new Uint8Array([0x05, 0x01, authMethod]));
+      let resp = await readChunk(reader, 2);
+      if (resp[0] !== 0x05) throw new Error('Invalid SOCKS5 handshake response');
+      if (resp[1] === 0x02) {
+        const uBytes = new TextEncoder().encode(p.username);
+        const pBytes = new TextEncoder().encode(p.password);
+        const authPayload = new Uint8Array(3 + uBytes.length + pBytes.length);
+        authPayload[0] = 0x01;
+        authPayload[1] = uBytes.length;
+        authPayload.set(uBytes, 2);
+        authPayload[2 + uBytes.length] = pBytes.length;
+        authPayload.set(pBytes, 3 + uBytes.length);
+        await writer.write(authPayload);
+        const authRes = await readChunk(reader, 2);
+        if (authRes[1] !== 0x00) throw new Error('SOCKS5 auth failed');
+      } else if (resp[1] !== 0x00) {
+        throw new Error('SOCKS5 auth method not supported');
+      }
+
+      const hostBytes = new TextEncoder().encode(targetHost);
+      const req = new Uint8Array(7 + hostBytes.length);
+      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
+      req[4] = hostBytes.length;
+      req.set(hostBytes, 5);
+      req[5 + hostBytes.length] = (80 >> 8) & 0xff;
+      req[6 + hostBytes.length] = 80 & 0xff;
+      await writer.write(req);
+      const connRes = await readChunk(reader, 10);
+      if (connRes[1] !== 0x00) throw new Error('SOCKS5 connect error: ' + connRes[1]);
+    } else {
+      const connectCmd = 'CONNECT ' + targetHost + ':80 HTTP/1.1\\r\\nHost: ' + targetHost + ':80\\r\\n\\r\\n';
+      await writer.write(new TextEncoder().encode(connectCmd));
+      const headRes = await readLine(reader);
+      if (!headRes.includes('200')) throw new Error('HTTP connect error: ' + headRes);
+    }
+
+    const latency = Date.now() - startTime;
+    const httpGet = 'GET ' + targetPath + ' HTTP/1.1\\r\\nHost: ' + targetHost + '\\r\\nUser-Agent: curl/7.88.1\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n';
+    await writer.write(new TextEncoder().encode(httpGet));
+
+    let body = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      body += new TextDecoder().decode(value, { stream: true });
+      if (body.length > 32768) break;
+    }
+
+    const jsonStart = body.indexOf('{');
+    let exitData = {};
+    if (jsonStart !== -1) {
+      try { exitData = JSON.parse(body.slice(jsonStart)); } catch (e) {}
+    } else if (source === 'cloudflare') {
+      const ipMatch = body.match(/ip=([0-9a-fA-F.:]+)/);
+      if (ipMatch) exitData = { ip: ipMatch[1], country: 'Unknown' };
+    }
+
+    return {
+      success: true,
+      latency,
+      colo,
+      proxy: { host: p.host, port: p.port, proto: p.proto },
+      exit: {
+        ip: exitData.ip || 'Unknown',
+        country: exitData.country || exitData.country_name || exitData.countryCode || '',
+        city: exitData.city || '',
+        asn: exitData.asn || (exitData.asn_number ? { asn: exitData.asn_number } : null),
+        is_datacenter: Boolean(exitData.is_datacenter || exitData.hosting)
+      }
+    };
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+    try { writer.releaseLock(); } catch (e) {}
+    try { socket.close(); } catch (e) {}
+  }
+}
+
+async function readChunk(reader, length) {
+  const buf = new Uint8Array(length);
+  let read = 0;
+  while (read < length) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error('Socket closed prematurely');
+    buf.set(value.subarray(0, length - read), read);
+    read += Math.min(value.length, length - read);
+  }
+  return buf;
+}
+
+async function readLine(reader) {
+  let line = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    line += new TextDecoder().decode(value);
+    if (line.includes('\\r\\n\\r\\n') || line.includes('\\n\\n')) break;
+  }
+  return line;
+}
+`;
+
 // ===================== Cloudflare KV 配置中心与分布式集群调度 =====================
 const KV_CONFIG_PREFIX = 'cf_proxy:';
 let memConfigCache = {
@@ -699,6 +901,154 @@ async function handleAdminAPI(request, url, env, origin) {
 				error: e.message || '网络连接超时或无法访问该节点',
 				latency: Date.now() - pingStart
 			}, { origin });
+		}
+	}
+
+	if (pathname === '/api/admin/auto-deploy-node' && request.method === 'POST') {
+		let body = {};
+		try { body = await request.json(); } catch (e) {}
+		const email = (body.email || '').trim();
+		const apiKey = (body.apiKey || body.key || body.token || '').trim();
+		const scriptName = (body.scriptName || 'check-socks5-node').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+		const customNodeName = (body.nodeName || '').trim();
+
+		if (!apiKey) {
+			return jsonResponse({ success: false, error: '请提供 Global API Key 或 API Token' }, { status: 400, origin });
+		}
+
+		// 构建 Cloudflare 官方 API 认证请求头
+		const cfHeaders = {};
+		if (email && apiKey.length > 30) {
+			cfHeaders['X-Auth-Email'] = email;
+			cfHeaders['X-Auth-Key'] = apiKey;
+		} else {
+			cfHeaders['Authorization'] = 'Bearer ' + apiKey;
+		}
+
+		try {
+			// 1. 获取 Account ID
+			const accRes = await fetch('https://api.cloudflare.com/client/v4/accounts?page=1&per_page=5', {
+				headers: cfHeaders,
+				signal: AbortSignal.timeout(10000)
+			});
+			const accData = await accRes.json();
+			if (!accData.success || !accData.result?.length) {
+				const errMsg = accData.errors?.[0]?.message || '无法获取账户信息，请检查邮箱与密钥是否正确';
+				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
+			}
+			const accountId = accData.result[0].id;
+			const accountName = accData.result[0].name || email || 'CF从节点';
+
+			// 2. 检查或获取 workers.dev 子域名
+			let subdomain = '';
+			const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+				headers: cfHeaders,
+				signal: AbortSignal.timeout(10000)
+			});
+			const subData = await subRes.json();
+			if (subData.success && subData.result?.subdomain) {
+				subdomain = subData.result.subdomain;
+			} else {
+				// 若未创建子域，尝试自动初始化一个唯一的子域名称
+				const generatedSub = 's5-' + Math.random().toString(36).slice(2, 8);
+				const setSubRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+					method: 'PUT',
+					headers: { ...cfHeaders, 'Content-Type': 'application/json' },
+					body: JSON.stringify({ subdomain: generatedSub }),
+					signal: AbortSignal.timeout(10000)
+				});
+				const setSubData = await setSubRes.json();
+				if (setSubData.success && setSubData.result?.subdomain) {
+					subdomain = setSubData.result.subdomain;
+				} else {
+					return jsonResponse({
+						success: false,
+						error: '该账号尚未开启 workers.dev 子域: ' + (setSubData.errors?.[0]?.message || '请先登录该账号分配一个 workers.dev 域名')
+					}, { status: 400, origin });
+				}
+			}
+
+			// 3. 上传部署极简从节点内核脚本 (ES Module via Multipart Form)
+			const formData = new FormData();
+			const metadata = {
+				main_module: 'index.js',
+				compatibility_date: '2024-01-01',
+				compatibility_flags: ['nodejs_compat']
+			};
+			formData.set('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }), 'metadata.json');
+			formData.set('index.js', new Blob([SUB_WORKER_SCRIPT_TEMPLATE], { type: 'application/javascript+module' }), 'index.js');
+
+			const uploadRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}`, {
+				method: 'PUT',
+				headers: cfHeaders,
+				body: formData,
+				signal: AbortSignal.timeout(15000)
+			});
+			const uploadData = await uploadRes.json();
+			if (!uploadData.success) {
+				const errMsg = uploadData.errors?.[0]?.message || '上传 Worker 脚本失败';
+				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
+			}
+
+			// 4. 开启 workers.dev 访问路由
+			await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, {
+				method: 'POST',
+				headers: { ...cfHeaders, 'Content-Type': 'application/json' },
+				body: JSON.stringify({ enabled: true }),
+				signal: AbortSignal.timeout(10000)
+			});
+
+			// 5. 组装从节点地址并保存到 KV 集群列表
+			const targetUrl = `https://${scriptName}.${subdomain}.workers.dev`;
+			const currentWorkers = (await getKVWorkers(env)) || [];
+			const nodeDisplayName = customNodeName || `${accountName} (自动部署)`;
+
+			const existingIndex = currentWorkers.findIndex(w => w.url.toLowerCase().replace(/\/+$/, '') === targetUrl.toLowerCase());
+			let savedNode;
+			if (existingIndex !== -1) {
+				savedNode = {
+					...currentWorkers[existingIndex],
+					name: nodeDisplayName,
+					url: targetUrl,
+					enabled: true
+				};
+				currentWorkers[existingIndex] = savedNode;
+			} else {
+				savedNode = {
+					id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+					name: nodeDisplayName,
+					url: targetUrl,
+					token: '',
+					enabled: true
+				};
+				currentWorkers.push(savedNode);
+			}
+			await saveKVWorkers(env, currentWorkers);
+
+			// 6. 立即进行一次快速延迟探测
+			let latency = null;
+			let colo = 'CF';
+			try {
+				const pingStart = Date.now();
+				const pRes = await fetch(targetUrl + '/ip.json', { signal: AbortSignal.timeout(6000) });
+				if (pRes.ok) {
+					latency = Date.now() - pingStart;
+					const pJson = await pRes.json();
+					colo = pJson.colo || 'CF';
+				}
+			} catch (e) {}
+
+			return jsonResponse({
+				success: true,
+				node: savedNode,
+				url: targetUrl,
+				latency,
+				colo,
+				message: `成功部署至 ${targetUrl} 并已加入集群！`
+			}, { origin });
+
+		} catch (e) {
+			return jsonResponse({ success: false, error: '部署异常: ' + e.message }, { status: 500, origin });
 		}
 	}
 
@@ -10300,6 +10650,9 @@ function generateAdminHTML(env, hasKV = false) {
 						<p class="text-xs text-slate-400 mt-0.5">将部署在不同 Cloudflare 免费账号下的 Worker 加入集群池。大批量并发时自动轮询分流；单节点触达 429 限制时自动休眠并切换下一节点重试，平稳支撑 10w+ 测活！</p>
 					</div>
 					<div class="flex items-center gap-2 flex-wrap">
+						<button onclick="openBatchDeployModal()" class="px-3.5 py-1.5 rounded-xl font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 hover:brightness-110 transition shadow-lg shadow-emerald-500/20 flex items-center gap-1.5">
+							🤖 批量自动部署从节点
+						</button>
 						<button onclick="openSubWorkerScriptModal()" class="px-3.5 py-1.5 rounded-xl font-bold text-xs border border-emerald-500/40 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/40 transition flex items-center gap-1.5">
 							📋 复制极简子节点代码
 						</button>
@@ -10558,6 +10911,65 @@ function generateAdminHTML(env, hasKV = false) {
 				</div>
 			</div>
 		</div>
+	<!-- 批量全自动部署从节点弹窗 -->
+	<div id="batchDeployModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+		<div class="glass-card max-w-2xl w-full p-6 space-y-4 max-h-[92vh] flex flex-col border border-emerald-500/30 shadow-2xl">
+			<div class="flex items-center justify-between pb-3 border-b border-white/10">
+				<div>
+					<h3 class="text-base font-bold text-white flex items-center gap-2">
+						🤖 批量全自动部署从节点 (Cloudflare 官方 API 直连)
+					</h3>
+					<p class="text-xs text-slate-400 mt-0.5">填入备用 Cloudflare 账号凭据，系统全自动创建 Worker、上传极简内核、激活 workers.dev 并一键入库集群！</p>
+				</div>
+				<button onclick="closeBatchDeployModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
+			</div>
+
+			<div class="space-y-3 text-xs overflow-y-auto flex-1 pr-1">
+				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+					<div>
+						<label class="block text-slate-300 font-semibold mb-1">统一 Worker 脚本名称</label>
+						<input type="text" id="batchDeployScriptName" value="check-socks5-node" placeholder="例如：check-socks5-node" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
+					</div>
+					<div>
+						<label class="block text-slate-300 font-semibold mb-1">部署模式</label>
+						<div class="text-[11px] text-emerald-400 py-1.5">
+							✓ 自动初始化/覆盖 + 自动开启 workers.dev + 自动测速入库
+						</div>
+					</div>
+				</div>
+
+				<div>
+					<div class="flex justify-between items-center mb-1">
+						<label class="text-slate-300 font-semibold">账号列表 (每行一个账号，支持逗号或空格分隔)</label>
+						<span id="batchDeployCount" class="text-cyan-300 font-mono text-[11px]">0 个账号待部署</span>
+					</div>
+					<textarea id="batchDeployAccounts" rows="6" oninput="updateBatchAccountsCount()" placeholder="格式1（推荐）：邮箱, Global API Key&#10;user1@gmail.com, 1a2b3c4d5e6f7g8h9i0j...&#10;user2@gmail.com, 9z8y7x6w5v4u3t2s1r0q...&#10;&#10;格式2：独立 API Token（每行一个）&#10;cf_token_abcdef123456..." class="w-full p-3 rounded-xl bg-slate-950 border border-white/10 text-xs text-cyan-200 font-mono leading-relaxed focus:outline-none focus:border-cyan-400"></textarea>
+				</div>
+
+				<div class="p-3 rounded-lg border border-cyan-500/20 bg-cyan-950/20 text-[11px] text-slate-300 space-y-1">
+					<b>💡 如何获取 Global API Key（永久免密，零验证码）：</b><br>
+					1. 登录该 Cloudflare 免费小号；<br>
+					2. 点击网页右上角头像 -> <b>「我的个人资料」</b> -> <b>「API 令牌」</b>；<br>
+					3. 找到 <b>「Global API Key」</b> 一行，点击 <b>「查看」</b>，复制那串 37 位的十六进制 Key 即可。
+				</div>
+
+				<!-- 部署日志控制台 -->
+				<div id="batchDeployConsoleWrapper" class="space-y-1 hidden">
+					<div class="flex justify-between items-center text-[11px] text-slate-400">
+						<span>实时部署执行日志：</span>
+						<span id="batchDeployStatusText" class="text-cyan-300 font-medium">就绪</span>
+					</div>
+					<div id="batchDeployConsole" class="p-3 rounded-xl bg-slate-950 border border-white/10 font-mono text-[11px] text-cyan-300 max-h-40 overflow-y-auto space-y-1 select-text"></div>
+				</div>
+			</div>
+
+			<div class="flex justify-between items-center pt-3 border-t border-white/10">
+				<button onclick="closeBatchDeployModal()" class="px-4 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
+				<button id="startBatchDeployBtn" onclick="runBatchAutoDeploy()" class="px-5 py-1.5 rounded-lg font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 hover:brightness-110 text-slate-950 shadow-lg shadow-emerald-500/20">
+					🚀 开始一键全自动部署
+				</button>
+			</div>
+		</div>
 	</div>
 
 	<!-- Toast 提示 -->
@@ -10585,210 +10997,7 @@ function generateAdminHTML(env, hasKV = false) {
 			{ key: 'ipapico', label: 'ipapi.co (高精度单条 · 有严格限速)', needKey: false, desc: '单条精细排查，注意限速30次/分。' }
 		];
 
-		const SUB_WORKER_SCRIPT_TEMPLATE = \`// ============================================================
-// CheckSocks5 极简从节点执行内核 (Standalone Sub-Worker)
-// 适用于部署到备用 Cloudflare 免费账号，免 KV、免环境变量，开箱即用！
-// ============================================================
-import { connect } from 'cloudflare:sockets';
-
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': '*'
-};
-
-export default {
-  async fetch(request, env, ctx) {
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
-    const url = new URL(request.url);
-    const colo = request.cf?.colo || 'UNKNOWN';
-
-    // 测速与探活接口
-    if (url.pathname === '/ip.json') {
-      const clientIp = request.headers.get('cf-connecting-ip') || '127.0.0.1';
-      return new Response(JSON.stringify({ success: true, ip: clientIp, colo }), {
-        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 代理测活接口
-    if (url.pathname === '/check') {
-      const proxyParam = url.searchParams.get('proxy') || url.searchParams.get('socks5') || url.searchParams.get('http') || url.searchParams.get('https');
-      if (!proxyParam) {
-        return new Response(JSON.stringify({ success: false, error: 'Missing proxy parameter' }), {
-          status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-        });
-      }
-      const source = url.searchParams.get('source') || 'iplocate';
-      try {
-        const result = await checkProxyCore(proxyParam, colo, source);
-        return new Response(JSON.stringify(result), {
-          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ success: false, error: err.message || 'Check failed' }), {
-          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-        });
-      }
-    }
-
-    return new Response(JSON.stringify({ status: 'running', role: 'cluster-sub-worker', colo }), {
-      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-    });
-  }
-};
-
-function parseProxyUrl(raw) {
-  let target = raw.trim();
-  let proto = 'socks5';
-  if (/^[a-zA-Z0-9]+:\\/\\//.test(target)) {
-    const idx = target.indexOf('://');
-    proto = target.slice(0, idx).toLowerCase();
-    target = target.slice(idx + 3);
-  }
-  let username = '', password = '';
-  const atIdx = target.lastIndexOf('@');
-  if (atIdx !== -1) {
-    const auth = target.slice(0, atIdx);
-    target = target.slice(atIdx + 1);
-    const colonIdx = auth.indexOf(':');
-    if (colonIdx !== -1) {
-      username = decodeURIComponent(auth.slice(0, colonIdx));
-      password = decodeURIComponent(auth.slice(colonIdx + 1));
-    } else {
-      username = decodeURIComponent(auth);
-    }
-  }
-  const parts = target.split(':');
-  const host = parts[0];
-  const port = parseInt(parts[1] || (proto === 'http' ? '80' : proto === 'https' ? '443' : '1080'), 10);
-  return { proto, host, port, username, password };
-}
-
-async function checkProxyCore(rawProxy, colo, source) {
-  const p = parseProxyUrl(rawProxy);
-  const startTime = Date.now();
-
-  let targetHost = 'iplocate.io';
-  let targetPath = '/api/lookup/';
-  if (source === 'ipsb') { targetHost = 'api.ip.sb'; targetPath = '/geoip'; }
-  else if (source === 'ipwhois') { targetHost = 'ipwho.is'; targetPath = '/'; }
-  else if (source === 'cloudflare') { targetHost = 'cloudflare.com'; targetPath = '/cdn-cgi/trace'; }
-  else if (source === 'hackmyip') { targetHost = 'api.hackmyip.com'; targetPath = '/api/v1/ip'; }
-
-  const socket = connect({ hostname: p.host, port: p.port });
-  const writer = socket.writable.getWriter();
-  const reader = socket.readable.getReader();
-
-  try {
-    if (p.proto.startsWith('socks')) {
-      // SOCKS5 Handshake
-      const authMethod = p.username ? 0x02 : 0x00;
-      await writer.write(new Uint8Array([0x05, 0x01, authMethod]));
-      let resp = await readChunk(reader, 2);
-      if (resp[0] !== 0x05) throw new Error('Invalid SOCKS5 handshake response');
-      if (resp[1] === 0x02) {
-        const uBytes = new TextEncoder().encode(p.username);
-        const pBytes = new TextEncoder().encode(p.password);
-        const authPayload = new Uint8Array(3 + uBytes.length + pBytes.length);
-        authPayload[0] = 0x01;
-        authPayload[1] = uBytes.length;
-        authPayload.set(uBytes, 2);
-        authPayload[2 + uBytes.length] = pBytes.length;
-        authPayload.set(pBytes, 3 + uBytes.length);
-        await writer.write(authPayload);
-        const authRes = await readChunk(reader, 2);
-        if (authRes[1] !== 0x00) throw new Error('SOCKS5 auth failed');
-      } else if (resp[1] !== 0x00) {
-        throw new Error('SOCKS5 auth method not supported');
-      }
-
-      // Connect Command
-      const hostBytes = new TextEncoder().encode(targetHost);
-      const req = new Uint8Array(7 + hostBytes.length);
-      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-      req[4] = hostBytes.length;
-      req.set(hostBytes, 5);
-      req[5 + hostBytes.length] = (80 >> 8) & 0xff;
-      req[6 + hostBytes.length] = 80 & 0xff;
-      await writer.write(req);
-      const connRes = await readChunk(reader, 10);
-      if (connRes[1] !== 0x00) throw new Error('SOCKS5 connect error: ' + connRes[1]);
-    } else {
-      // HTTP Proxy Handshake
-      const connectCmd = 'CONNECT ' + targetHost + ':80 HTTP/1.1\\r\\nHost: ' + targetHost + ':80\\r\\n\\r\\n';
-      await writer.write(new TextEncoder().encode(connectCmd));
-      const headRes = await readLine(reader);
-      if (!headRes.includes('200')) throw new Error('HTTP connect error: ' + headRes);
-    }
-
-    const latency = Date.now() - startTime;
-    // Send HTTP GET
-    const httpGet = 'GET ' + targetPath + ' HTTP/1.1\\r\\nHost: ' + targetHost + '\\r\\nUser-Agent: curl/7.88.1\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n';
-    await writer.write(new TextEncoder().encode(httpGet));
-
-    // Read Response
-    let body = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done || !value) break;
-      body += new TextDecoder().decode(value, { stream: true });
-      if (body.length > 32768) break;
-    }
-
-    const jsonStart = body.indexOf('{');
-    let exitData = {};
-    if (jsonStart !== -1) {
-      try { exitData = JSON.parse(body.slice(jsonStart)); } catch (e) {}
-    } else if (source === 'cloudflare') {
-      const ipMatch = body.match(/ip=([0-9a-fA-F.:]+)/);
-      if (ipMatch) exitData = { ip: ipMatch[1], country: 'Unknown' };
-    }
-
-    return {
-      success: true,
-      latency,
-      colo,
-      proxy: { host: p.host, port: p.port, proto: p.proto },
-      exit: {
-        ip: exitData.ip || 'Unknown',
-        country: exitData.country || exitData.country_name || exitData.countryCode || '',
-        city: exitData.city || '',
-        asn: exitData.asn || (exitData.asn_number ? { asn: exitData.asn_number } : null),
-        is_datacenter: Boolean(exitData.is_datacenter || exitData.hosting)
-      }
-    };
-  } finally {
-    try { reader.releaseLock(); } catch (e) {}
-    try { writer.releaseLock(); } catch (e) {}
-    try { socket.close(); } catch (e) {}
-  }
-}
-
-async function readChunk(reader, length) {
-  const buf = new Uint8Array(length);
-  let read = 0;
-  while (read < length) {
-    const { value, done } = await reader.read();
-    if (done) throw new Error('Socket closed prematurely');
-    buf.set(value.subarray(0, length - read), read);
-    read += Math.min(value.length, length - read);
-  }
-  return buf;
-}
-
-async function readLine(reader) {
-  let line = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    line += new TextDecoder().decode(value);
-    if (line.includes('\\r\\n\\r\\n') || line.includes('\\n\\n')) break;
-  }
-  return line;
-}\`;
+		const SUB_WORKER_SCRIPT_TEMPLATE = ${JSON.stringify(SUB_WORKER_SCRIPT_TEMPLATE)};
 
 		async function adminFetch(endpoint, options = {}) {
 			options.headers = options.headers || {};
@@ -11279,6 +11488,112 @@ async function readLine(reader) {
 			}).catch(() => {
 				alert('复制失败，请手动在文本框中全选复制');
 			});
+		}
+
+		// 批量全自动部署从节点
+		function openBatchDeployModal() {
+			document.getElementById('batchDeployModal').classList.remove('hidden');
+			document.getElementById('batchDeployConsoleWrapper').classList.add('hidden');
+			document.getElementById('batchDeployConsole').innerHTML = '';
+			updateBatchAccountsCount();
+		}
+
+		function closeBatchDeployModal() {
+			document.getElementById('batchDeployModal').classList.add('hidden');
+		}
+
+		function updateBatchAccountsCount() {
+			const text = document.getElementById('batchDeployAccounts')?.value || '';
+			const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+			const countSpan = document.getElementById('batchDeployCount');
+			if (countSpan) countSpan.textContent = lines.length + ' 个账号待部署';
+		}
+
+		async function runBatchAutoDeploy() {
+			const text = document.getElementById('batchDeployAccounts').value;
+			const scriptName = (document.getElementById('batchDeployScriptName').value || 'check-socks5-node').trim();
+			const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+
+			if (!lines.length) {
+				alert('请先输入至少一个 Cloudflare 账号凭据');
+				return;
+			}
+
+			const startBtn = document.getElementById('startBatchDeployBtn');
+			startBtn.disabled = true;
+			startBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+			const consoleWrapper = document.getElementById('batchDeployConsoleWrapper');
+			const consoleBox = document.getElementById('batchDeployConsole');
+			const statusText = document.getElementById('batchDeployStatusText');
+			consoleWrapper.classList.remove('hidden');
+			consoleBox.innerHTML = '';
+
+			function logLine(msg, type = 'info') {
+				const time = new Date().toTimeString().slice(0, 8);
+				const color = type === 'success' ? 'text-emerald-300' : (type === 'error' ? 'text-rose-400' : 'text-cyan-300');
+				const p = document.createElement('div');
+				p.className = color + ' leading-relaxed';
+				p.textContent = '[' + time + '] ' + msg;
+				consoleBox.appendChild(p);
+				consoleBox.scrollTop = consoleBox.scrollHeight;
+			}
+
+			logLine('🚀 开始批量自动部署任务，共计 ' + lines.length + ' 个账号...', 'info');
+
+			let successCount = 0;
+			let failCount = 0;
+
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i];
+				let email = '', apiKey = '';
+				if (line.includes(',')) {
+					const parts = line.split(',');
+					email = parts[0].trim();
+					apiKey = parts.slice(1).join(',').trim();
+				} else if (line.includes(' ')) {
+					const parts = line.split(/\s+/);
+					email = parts[0].trim();
+					apiKey = parts.slice(1).join(' ').trim();
+				} else {
+					apiKey = line.trim();
+				}
+
+				const targetLabel = email || (apiKey.slice(0, 8) + '...');
+				statusText.textContent = '正在处理 (' + (i + 1) + '/' + lines.length + '): ' + targetLabel;
+				logLine('正在连接 Cloudflare API 部署 [' + targetLabel + '] ...', 'info');
+
+				try {
+					const res = await adminFetch('/api/admin/auto-deploy-node', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ email, apiKey, scriptName })
+					});
+
+					if (res.success) {
+						successCount++;
+						const latText = res.latency ? ' (延迟: ' + res.latency + 'ms ' + (res.colo || '') + ')' : '';
+						logLine('✅ [' + targetLabel + '] 部署成功！' + res.url + latText + '，已自动加入集群！', 'success');
+					} else {
+						failCount++;
+						logLine('❌ [' + targetLabel + '] 部署失败: ' + (res.error || '未知错误'), 'error');
+					}
+				} catch (err) {
+					failCount++;
+					logLine('❌ [' + targetLabel + '] 网络请求异常: ' + err.message, 'error');
+				}
+			}
+
+			statusText.textContent = '全部完成！成功 ' + successCount + ' / 失败 ' + failCount;
+			logLine('🎉 批量自动化部署结束！成功: ' + successCount + ' 个，失败: ' + failCount + ' 个', successCount > 0 ? 'success' : 'error');
+
+			startBtn.disabled = false;
+			startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+
+			if (successCount > 0) {
+				showToast('已自动部署并同步加入 ' + successCount + ' 个从节点！');
+				initDashboard();
+			}
 		}
 
 		// 纯集群调度模式开关

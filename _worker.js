@@ -854,6 +854,12 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 		currentKeyUsed = pickKeyForSource('ipapi_is', env);
 		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}` : '/';
 		acceptHeader = 'application/json';
+	} else if (selectedSource === 'ipdata' || selectedSource === 'ipdata_co') {
+		targetHost = 'api.ipdata.co';
+		serverName = 'api.ipdata.co';
+		currentKeyUsed = pickKeyForSource('ipdata', env);
+		requestPath = currentKeyUsed ? `/?api-key=${encodeURIComponent(currentKeyUsed)}` : '/';
+		acceptHeader = 'application/json';
 	} else {
 		// 检查是否为后台配置的自定义源 (custom:xxx)
 		const allKVSources = (await getKVSources(env)) || {};
@@ -1287,6 +1293,48 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_vpn: Boolean(raw.is_vpn),
 					is_tor: Boolean(raw.is_tor),
 					is_abuser: Boolean(raw.is_abuser)
+				};
+			} else if (selectedSource === 'ipdata' || selectedSource === 'ipdata_co') {
+				let raw;
+				try {
+					raw = JSON.parse(bodyText.trim());
+				} catch (err) {
+					throw new Error('Target api.ipdata.co did not return valid JSON');
+				}
+				if (raw.message && !raw.ip) {
+					markKeyCooldown('ipdata', currentKeyUsed);
+					throw new Error(raw.message || 'Target api.ipdata.co rate limit reached');
+				}
+				const asnData = raw.asn || {};
+				const threatData = raw.threat || {};
+				const asnNum = parseInt(String(asnData.asn || '').replace(/^AS/i, ''), 10) || null;
+				exit = {
+					ip: raw.ip,
+					country: raw.country_name || raw.country || '',
+					countryCode: raw.country_code || '',
+					country_code: raw.country_code || '',
+					countryName: raw.country_name || raw.country || '',
+					region: raw.region || '',
+					city: raw.city || '',
+					postal_code: raw.postal || '',
+					latitude: raw.latitude,
+					longitude: raw.longitude,
+					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
+					timezone: raw.time_zone?.name || '',
+					asn: {
+						asn: asnNum,
+						org: asnData.name || '',
+						name: asnData.name || '',
+						descr: asnData.name || ''
+					},
+					asOrganization: asnData.name || '',
+					company: { name: asnData.name || '' },
+					is_datacenter: Boolean(threatData.is_datacenter || asnData.type === 'hosting'),
+					is_bogon: Boolean(raw.is_bogon),
+					is_proxy: Boolean(threatData.is_proxy),
+					is_vpn: Boolean(threatData.is_vpn),
+					is_tor: Boolean(threatData.is_tor),
+					is_abuser: Boolean(threatData.is_known_abuser)
 				};
 			} else {
 				let raw;
@@ -5834,6 +5882,7 @@ function generateHTML(备案内容, hasToken = false) {
 									<option value="ipinfo">ipinfo.io (知名老牌 · 国际权威数据库)</option>
 									<option value="ipapico">ipapi.co (高精度单条 · 有严格限速)</option>
 									<option value="ipapi_is">api.ipapi.is (深度风控 · 建议配置多Key轮询)</option>
+									<option value="ipdata">ipdata.co (国际权威数据库 · 支持配置Key)</option>
 								</select>
 							</div>
 						</div>
@@ -6053,6 +6102,11 @@ function generateHTML(备案内容, hasToken = false) {
 				badge: 'api.ipapi.is',
 				label: 'api.ipapi.is',
 				desc: '当前：<b>api.ipapi.is</b>，深度机房与风控指纹识别，支持在后台管理配置多 Key 自动轮询。'
+			},
+			ipdata: {
+				badge: 'ipdata.co',
+				label: 'ipdata.co',
+				desc: '当前：<b>ipdata.co</b>，国际权威威胁情报数据库，提供高精机房、VPN及代理识别，需配置 Key。'
 			}
 		};
 
@@ -6507,17 +6561,26 @@ function generateHTML(备案内容, hasToken = false) {
 		function updateCustomSourcesInUI(sourcesConfig) {
 			if (!ipSourceSelect || !sourcesConfig) return;
 			const currentSelected = getSelectedIpSource();
-			// 移除所有旧的自定义选项
+
+			// 1. 动态联动内置接口的显示/隐藏（若后台设置为禁用，前台直接隐藏）
+			const builtInKeys = ['iplocate', 'hackmyip', 'ip2location', 'ipwhois', 'ipsb', 'cloudflare', 'ipinfo', 'ipapico', 'ipapi_is', 'ipdata'];
+			builtInKeys.forEach(key => {
+				const opt = ipSourceSelect.querySelector('option[value="' + key + '"]');
+				if (!opt) return;
+				const isEnabled = sourcesConfig[key]?.enabled !== false;
+				opt.hidden = !isEnabled;
+				opt.disabled = !isEnabled;
+			});
+
+			// 2. 移除旧的自定义选项并挂载启用的自定义源
 			const customOptions = ipSourceSelect.querySelectorAll('option[data-custom="true"]');
 			customOptions.forEach(opt => opt.remove());
 
 			Object.keys(sourcesConfig).forEach(key => {
 				const src = sourcesConfig[key];
 				if (!src || src.enabled === false) return;
-				// 如果是内置源，跳过
-				if (['iplocate', 'hackmyip', 'ip2location', 'ipwhois', 'ipsb', 'cloudflare', 'ipinfo', 'ipapico', 'ipapi_is'].includes(key)) {
-					return;
-				}
+				if (builtInKeys.includes(key)) return;
+
 				// 注册到 IP_SOURCE_DEFINITIONS
 				IP_SOURCE_DEFINITIONS[key] = {
 					badge: src.label || key,
@@ -6531,8 +6594,18 @@ function generateHTML(备案内容, hasToken = false) {
 				ipSourceSelect.appendChild(opt);
 			});
 
-			if (currentSelected && IP_SOURCE_DEFINITIONS[currentSelected]) {
-				applyIpSource(currentSelected, false);
+			// 3. 若当前选中的接口在后台被禁用了，自动平滑切换到第一个可用接口
+			let targetSource = currentSelected;
+			const currentOpt = ipSourceSelect.querySelector('option[value="' + currentSelected + '"]');
+			if (!currentOpt || currentOpt.hidden || currentOpt.disabled) {
+				const firstAvailable = Array.from(ipSourceSelect.options).find(o => !o.hidden && !o.disabled);
+				if (firstAvailable) {
+					targetSource = firstAvailable.value;
+				}
+			}
+
+			if (targetSource && IP_SOURCE_DEFINITIONS[targetSource]) {
+				applyIpSource(targetSource, true);
 			}
 		}
 

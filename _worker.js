@@ -727,14 +727,6 @@ function safeClone(data) {
 	}
 }
 
-function withTimeout(promise, ms, errText) {
-	let timer;
-	return Promise.race([
-		promise,
-		new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(errText)), ms); })
-	]).finally(() => clearTimeout(timer));
-}
-
 // 兼容层：返回深拷贝对象与最新 lastUpdated 戳
 const memConfigCache = {
 	get tokens() { return safeClone(kvSectionCache.tokens?.val) || null; },

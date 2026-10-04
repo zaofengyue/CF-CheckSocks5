@@ -74,12 +74,14 @@ export default {
 			if (!authRes.ok) {
 				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
 			}
+			const adminAuth = await verifyAdminAuth(request, env);
 			const workers = (await getKVWorkers(env)) || [];
 			const activeWorkers = workers.filter(w => w.enabled !== false).map(w => ({
 				id: w.id,
 				name: w.name,
 				url: w.url,
-				token: w.token || '',
+				token: adminAuth.ok ? (w.token || '') : (w.token ? '***' : ''),
+				hasToken: Boolean(w.token),
 				weight: w.weight || 1
 			}));
 			const clusterSettings = await getKVClusterSettings(env);
@@ -92,11 +94,104 @@ export default {
 			}, { origin });
 		}
 
+		if (url.pathname.toLowerCase() === '/api/cluster/relay') {
+			const authRes = await checkAuthToken(request, url, env, pathTokenAuthenticated);
+			if (!authRes.ok) {
+				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
+			}
+			const targetNodeUrl = (url.searchParams.get('node') || '').trim().replace(/\/+$/, '');
+			const proxyParam = (url.searchParams.get('proxy') || '').trim();
+			const sourceParam = (url.searchParams.get('source') || 'iplocate').trim().toLowerCase();
+			if (!targetNodeUrl || !proxyParam) {
+				return jsonResponse({ success: false, error: 'Missing node or proxy parameter' }, { status: 400, origin });
+			}
+			const workers = (await getKVWorkers(env)) || [];
+			const matchedNode = workers.find(w => 
+				w.enabled !== false && 
+				w.url && 
+				(w.url.replace(/\/+$/, '').toLowerCase() === targetNodeUrl.toLowerCase() || w.id === targetNodeUrl)
+			);
+			if (!matchedNode) {
+				return jsonResponse({ success: false, error: 'Security alert: Target node is not in the active cluster whitelist' }, { status: 403, origin });
+			}
+			let parsedNodeUrl;
+			try {
+				parsedNodeUrl = new URL(matchedNode.url);
+			} catch (e) {
+				return jsonResponse({ success: false, error: 'Invalid configured node URL' }, { status: 500, origin });
+			}
+			if (parsedNodeUrl.protocol !== 'https:' && parsedNodeUrl.protocol !== 'http:') {
+				return jsonResponse({ success: false, error: 'Invalid node protocol' }, { status: 400, origin });
+			}
+			if (isPrivateHost(parsedNodeUrl.hostname)) {
+				return jsonResponse({ success: false, error: 'Security alert: Access to private networks is forbidden' }, { status: 403, origin });
+			}
+
+			const nodeBase = matchedNode.url.replace(/\/+$/, '');
+			const nodeToken = matchedNode?.token || '';
+			try {
+				let forwardUrl = `${nodeBase}/check?proxy=${encodeURIComponent(proxyParam)}&source=${encodeURIComponent(sourceParam)}`;
+				const fHeaders = {
+					'User-Agent': 'CF-CheckSocks5-Cluster-Relay/2.0'
+				};
+				if (nodeToken) {
+					fHeaders['Authorization'] = `Bearer ${nodeToken}`;
+					fHeaders['X-Token'] = nodeToken;
+				}
+				const fRes = await fetch(forwardUrl, {
+					headers: fHeaders,
+					signal: AbortSignal.timeout(18000)
+				});
+				const contentType = fRes.headers.get('content-type') || '';
+				let fData;
+				if (contentType.includes('application/json')) {
+					try {
+						fData = await fRes.json();
+					} catch (e) {
+						fData = { success: false, error: 'Invalid JSON returned by target node' };
+					}
+				} else {
+					const textBody = await fRes.text();
+					try {
+						fData = JSON.parse(textBody);
+					} catch (e) {
+						fData = { 
+							success: false, 
+							error: `Sub-worker returned non-JSON response (HTTP ${fRes.status})`,
+							preview: textBody.slice(0, 200)
+						};
+					}
+				}
+				return jsonResponse(fData, { status: fRes.status, origin });
+			} catch (err) {
+				return jsonResponse({ success: false, error: `Relay failed: ${err.message}` }, { status: 502, origin });
+			}
+		}
+
 		if (url.pathname.toLowerCase() === '/api/sources/list') {
+			const authRes = await checkAuthToken(request, url, env, pathTokenAuthenticated);
+			if (!authRes.ok) {
+				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
+			}
 			const kvSources = (await getKVSources(env)) || {};
+			const adminAuth = await verifyAdminAuth(request, env);
+			const sanitizedSources = {};
+			for (const [k, v] of Object.entries(kvSources)) {
+				if (!v || typeof v !== 'object') continue;
+				if (adminAuth.ok) {
+					sanitizedSources[k] = v;
+				} else {
+					// 严格白名单属性投影，绝不解构展开 ...v，杜绝敏感 URL/Header 泄露
+					sanitizedSources[k] = {
+						label: v.label || k,
+						enabled: v.enabled !== false,
+						hasKeys: Boolean(v.keys && v.keys.length > 0)
+					};
+				}
+			}
 			return jsonResponse({
 				success: true,
-				sources: kvSources
+				sources: sanitizedSources
 			}, { origin });
 		}
 
@@ -276,12 +371,14 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 
 // ===================== CheckSocks5 极简从节点执行内核模板 =====================
 const SUB_WORKER_SCRIPT_TEMPLATE = `// ============================================================
-// CheckSocks5 极简从节点执行内核 (Standalone Sub-Worker)
+// CheckSocks5 极简从节点执行内核 (Standalone Sub-Worker - Hardened)
 // 适用于部署到备用 Cloudflare 免费账号，免 KV、免环境变量，开箱即用！
 // ============================================================
 import { connect } from 'cloudflare:sockets';
 
 const AUTH_TOKEN = '__AUTH_TOKEN__';
+const CONNECT_TIMEOUT_MS = 8000;
+const READ_TIMEOUT_MS = 6000;
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -297,7 +394,6 @@ export default {
     const url = new URL(request.url);
     const colo = request.cf?.colo || 'UNKNOWN';
 
-    // 测速与探活接口
     if (url.pathname === '/ip.json') {
       const clientIp = request.headers.get('cf-connecting-ip') || '127.0.0.1';
       return new Response(JSON.stringify({ success: true, ip: clientIp, colo }), {
@@ -305,7 +401,6 @@ export default {
       });
     }
 
-    // 代理测活接口
     if (url.pathname === '/check') {
       if (AUTH_TOKEN && AUTH_TOKEN !== '__AUTH_TOKEN__') {
         const clientToken = url.searchParams.get('token') || request.headers.get('x-token') || (request.headers.get('authorization') || '').replace(/^Bearer\\s+/i, '');
@@ -354,9 +449,7 @@ function parseProxyUrl(raw) {
     const auth = target.slice(0, atIdx);
     target = target.slice(atIdx + 1);
     const colonIdx = auth.indexOf(':');
-    function safeDecode(s) {
-      try { return decodeURIComponent(s); } catch (e) { return s; }
-    }
+    function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return s; } }
     if (colonIdx !== -1) {
       username = safeDecode(auth.slice(0, colonIdx));
       password = safeDecode(auth.slice(colonIdx + 1));
@@ -378,6 +471,95 @@ function parseProxyUrl(raw) {
   return { proto, host, port, username, password };
 }
 
+function withTimeout(promise, ms, errText) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(errText)), ms); })
+  ]).finally(() => clearTimeout(timer));
+}
+
+class BufferedReader {
+  constructor(reader) {
+    this.reader = reader;
+    this.buffer = new Uint8Array(0);
+  }
+
+  async readExact(len, timeoutMs = READ_TIMEOUT_MS) {
+    while (this.buffer.length < len) {
+      const { value, done } = await withTimeout(this.reader.read(), timeoutMs, 'Socket read timeout');
+      if (done || !value) throw new Error('Socket closed prematurely');
+      const nextBuf = new Uint8Array(this.buffer.length + value.length);
+      nextBuf.set(this.buffer, 0);
+      nextBuf.set(value, this.buffer.length);
+      this.buffer = nextBuf;
+    }
+    const result = this.buffer.subarray(0, len);
+    this.buffer = this.buffer.subarray(len);
+    return result;
+  }
+
+  async readUntilPattern(pattern, maxLen = 8192, timeoutMs = READ_TIMEOUT_MS) {
+    const dec = new TextDecoder();
+    while (true) {
+      const text = dec.decode(this.buffer);
+      const idx = text.indexOf(pattern);
+      if (idx !== -1) {
+        const patternEnd = idx + pattern.length;
+        const result = text.slice(0, patternEnd);
+        const consumedBytes = new TextEncoder().encode(result).length;
+        this.buffer = this.buffer.subarray(consumedBytes);
+        return result;
+      }
+      if (this.buffer.length >= maxLen) throw new Error('Response headers exceeded limit');
+      const { value, done } = await withTimeout(this.reader.read(), timeoutMs, 'Socket read timeout');
+      if (done || !value) throw new Error('Socket closed prematurely');
+      const nextBuf = new Uint8Array(this.buffer.length + value.length);
+      nextBuf.set(this.buffer, 0);
+      nextBuf.set(value, this.buffer.length);
+      this.buffer = nextBuf;
+    }
+  }
+
+  async readAllAvailable(maxBytes = 32768, timeoutMs = READ_TIMEOUT_MS) {
+    const dec = new TextDecoder();
+    let text = dec.decode(this.buffer);
+    this.buffer = new Uint8Array(0);
+
+    const isCompleteJson = (str) => {
+      const start = str.indexOf('{');
+      if (start === -1) return false;
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      for (let i = start; i < str.length; i++) {
+        const c = str[i];
+        if (escape) { escape = false; }
+        else if (c === '\\\\') { escape = true; }
+        else if (c === '"') { inString = !inString; }
+        else if (!inString) {
+          if (c === '{') depth++;
+          else if (c === '}') { depth--; if (depth === 0) return true; }
+        }
+      }
+      return false;
+    };
+
+    while (text.length < maxBytes) {
+      if (isCompleteJson(text) || text.includes('\\r\\n0\\r\\n\\r\\n') || text.includes('\\n0\\n')) break;
+      let chunk;
+      try {
+        chunk = await withTimeout(this.reader.read(), timeoutMs, 'Socket read timeout');
+      } catch (e) {
+        break;
+      }
+      if (chunk.done || !chunk.value) break;
+      text += dec.decode(chunk.value, { stream: true });
+    }
+    return text;
+  }
+}
+
 async function checkProxyCore(rawProxy, colo, source) {
   const p = parseProxyUrl(rawProxy);
   const startTime = Date.now();
@@ -390,14 +572,19 @@ async function checkProxyCore(rawProxy, colo, source) {
   else if (source === 'hackmyip') { targetHost = 'api.hackmyip.com'; targetPath = '/api/v1/ip'; }
 
   const socket = connect({ hostname: p.host, port: p.port });
-  const writer = socket.writable.getWriter();
-  const reader = socket.readable.getReader();
+  let writer = null;
+  let rawReader = null;
 
   try {
+    await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'Proxy connection timed out');
+    writer = socket.writable.getWriter();
+    rawReader = socket.readable.getReader();
+    const bufferedReader = new BufferedReader(rawReader);
+
     if (p.proto.startsWith('socks')) {
-      const authMethod = p.username ? 0x02 : 0x00;
-      await writer.write(new Uint8Array([0x05, 0x01, authMethod]));
-      let resp = await readChunk(reader, 2);
+      const greetingPacket = p.username ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
+      await withTimeout(writer.write(greetingPacket), CONNECT_TIMEOUT_MS, 'SOCKS5 greeting timeout');
+      const resp = await bufferedReader.readExact(2);
       if (resp[0] !== 0x05) throw new Error('Invalid SOCKS5 handshake response');
       if (resp[1] === 0x02) {
         const uBytes = new TextEncoder().encode(p.username);
@@ -408,8 +595,8 @@ async function checkProxyCore(rawProxy, colo, source) {
         authPayload.set(uBytes, 2);
         authPayload[2 + uBytes.length] = pBytes.length;
         authPayload.set(pBytes, 3 + uBytes.length);
-        await writer.write(authPayload);
-        const authRes = await readChunk(reader, 2);
+        await withTimeout(writer.write(authPayload), CONNECT_TIMEOUT_MS, 'SOCKS5 auth write timeout');
+        const authRes = await bufferedReader.readExact(2);
         if (authRes[1] !== 0x00) throw new Error('SOCKS5 auth failed');
       } else if (resp[1] !== 0x00) {
         throw new Error('SOCKS5 auth method not supported');
@@ -422,94 +609,226 @@ async function checkProxyCore(rawProxy, colo, source) {
       req.set(hostBytes, 5);
       req[5 + hostBytes.length] = (80 >> 8) & 0xff;
       req[6 + hostBytes.length] = 80 & 0xff;
-      await writer.write(req);
-      const connRes = await readChunk(reader, 10);
-      if (connRes[1] !== 0x00) throw new Error('SOCKS5 connect error: ' + connRes[1]);
+      await withTimeout(writer.write(req), CONNECT_TIMEOUT_MS, 'SOCKS5 connect request timeout');
+
+      const head = await bufferedReader.readExact(4);
+      if (head[1] !== 0x00) throw new Error('SOCKS5 connect error: ' + head[1]);
+      const atyp = head[3];
+      if (atyp === 0x01) {
+        await bufferedReader.readExact(4 + 2);
+      } else if (atyp === 0x04) {
+        await bufferedReader.readExact(16 + 2);
+      } else if (atyp === 0x03) {
+        const domainLenBuf = await bufferedReader.readExact(1);
+        await bufferedReader.readExact(domainLenBuf[0] + 2);
+      } else {
+        throw new Error('Invalid SOCKS5 address type: ' + atyp);
+      }
     } else {
       const connectCmd = 'CONNECT ' + targetHost + ':80 HTTP/1.1\\r\\nHost: ' + targetHost + ':80\\r\\n\\r\\n';
-      await writer.write(new TextEncoder().encode(connectCmd));
-      const headRes = await readLine(reader);
-      if (!headRes.includes('200')) throw new Error('HTTP connect error: ' + headRes);
+      await withTimeout(writer.write(new TextEncoder().encode(connectCmd)), CONNECT_TIMEOUT_MS, 'HTTP CONNECT write timeout');
+      const headRes = await bufferedReader.readUntilPattern('\\r\\n\\r\\n');
+      if (!/HTTP\\/\\d(?:\\.\\d)?\\s+2\\d\\d/i.test(headRes)) throw new Error('HTTP connect error: ' + headRes.split('\\r\\n')[0]);
     }
 
     const latency = Date.now() - startTime;
     const httpGet = 'GET ' + targetPath + ' HTTP/1.1\\r\\nHost: ' + targetHost + '\\r\\nUser-Agent: curl/7.88.1\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n';
-    await writer.write(new TextEncoder().encode(httpGet));
+    await withTimeout(writer.write(new TextEncoder().encode(httpGet)), CONNECT_TIMEOUT_MS, 'HTTP GET write timeout');
 
-    let body = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done || !value) break;
-      body += new TextDecoder().decode(value, { stream: true });
-      if (body.length > 32768) break;
-    }
+    const body = await bufferedReader.readAllAvailable(32768);
 
     const jsonStart = body.indexOf('{');
+    const jsonEnd = body.lastIndexOf('}');
     let exitData = {};
-    if (jsonStart !== -1) {
-      try { exitData = JSON.parse(body.slice(jsonStart)); } catch (e) {}
+    if (jsonStart !== -1 && jsonEnd > jsonStart) {
+      try { exitData = JSON.parse(body.slice(jsonStart, jsonEnd + 1)); } catch (e) {}
     } else if (source === 'cloudflare') {
       const ipMatch = body.match(/ip=([0-9a-fA-F.:]+)/);
-      if (ipMatch) exitData = { ip: ipMatch[1], country: 'Unknown' };
+      const locMatch = body.match(/loc=([A-Z]{2})/);
+      if (ipMatch) exitData = { ip: ipMatch[1], country_code: locMatch ? locMatch[1] : 'XX' };
     }
+
+    const countryCode = (exitData.countryCode || exitData.country_code || exitData.countryIsoCode || '').toUpperCase();
+    const countryName = exitData.country || exitData.country_name || countryCode || '';
+    const orgName = exitData.org || exitData.asOrganization || exitData.connection?.org || exitData.connection?.isp || exitData.organization || exitData.asn?.name || exitData.asn?.org || '';
+    const asnVal = exitData.asn?.asn || exitData.asn || exitData.asn_number || exitData.connection?.asn || null;
+    const lat = exitData.latitude || exitData.location?.latitude || null;
+    const lon = exitData.longitude || exitData.location?.longitude || null;
 
     return {
       success: true,
+      candidate: p.host + ':' + p.port,
+      type: p.proto,
+      hostname: p.host,
+      port: p.port,
+      link: p.proto + '://' + (p.username ? p.username + ':' + p.password + '@' : '') + p.host + ':' + p.port,
       latency,
+      responseTime: latency,
       colo,
       proxy: { host: p.host, port: p.port, proto: p.proto },
       exit: {
         ip: exitData.ip || 'Unknown',
-        country: exitData.country || exitData.country_name || exitData.countryCode || '',
-        city: exitData.city || '',
-        asn: exitData.asn || (exitData.asn_number ? { asn: exitData.asn_number } : null),
-        is_datacenter: Boolean(exitData.is_datacenter || exitData.hosting)
+        country: countryName,
+        countryCode: countryCode,
+        country_code: countryCode,
+        countryName: countryName,
+        city: exitData.city || exitData.location?.city || '',
+        region: exitData.region || exitData.location?.state || '',
+        loc: lat && lon ? lat + ',' + lon : (exitData.loc || ''),
+        latitude: lat,
+        longitude: lon,
+        asn: asnVal ? { asn: typeof asnVal === 'number' ? asnVal : parseInt(String(asnVal).replace(/^AS/i, ''), 10), org: orgName } : null,
+        asOrganization: orgName,
+        org: orgName,
+        is_datacenter: Boolean(exitData.is_datacenter || exitData.hosting || exitData.privacy?.is_hosting || exitData.privacy?.type === 'datacenter'),
+        is_proxy: Boolean(exitData.is_proxy || exitData.proxy || exitData.privacy?.is_proxy),
+        is_vpn: Boolean(exitData.is_vpn || exitData.vpn || exitData.privacy?.is_vpn),
+        is_tor: Boolean(exitData.is_tor || exitData.tor || exitData.privacy?.is_tor),
+        is_abuser: Boolean(exitData.is_abuser || exitData.abuser || exitData.privacy?.is_abuser)
       }
     };
   } finally {
-    try { reader.releaseLock(); } catch (e) {}
-    try { writer.releaseLock(); } catch (e) {}
-    try { socket.close(); } catch (e) {}
+    if (rawReader) {
+      try { await rawReader.cancel(); } catch (e) {}
+      try { rawReader.releaseLock(); } catch (e) {}
+    }
+    if (writer) {
+      try { writer.releaseLock(); } catch (e) {}
+    }
+    try { await socket?.close?.().catch?.(() => {}); } catch (e) {}
   }
-}
-
-async function readChunk(reader, length) {
-  const buf = new Uint8Array(length);
-  let read = 0;
-  while (read < length) {
-    const { value, done } = await reader.read();
-    if (done) throw new Error('Socket closed prematurely');
-    buf.set(value.subarray(0, length - read), read);
-    read += Math.min(value.length, length - read);
-  }
-  return buf;
-}
-
-async function readLine(reader) {
-  let line = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    line += new TextDecoder().decode(value);
-    if (line.includes('\\r\\n\\r\\n') || line.includes('\\n\\n')) break;
-  }
-  return line;
 }
 `;
 
 // ===================== Cloudflare KV 配置中心与分布式集群调度 =====================
 const KV_CONFIG_PREFIX = 'cf_proxy:';
-let memConfigCache = {
-	tokens: null,
-	workers: null,
-	sources: null,
-	adminPass: null,
-	ts: 0
+const CONFIG_CACHE_TTL_MS = 10000;   // 正常配置项缓存 10 秒
+const NEGATIVE_CACHE_TTL_MS = 5000; // 负缓存（Key 不存在）5 秒
+const ERROR_CACHE_TTL_MS = 2000;    // 错误缓存（KV 异常）2 秒防雪崩
+const KV_READ_TIMEOUT_MS = 3500;    // KV 读取单次超时 3.5 秒
+
+// 独立分项缓存，增加 lastUpdated 戳以抵御读写竞态覆写
+const kvSectionCache = {
+	admin_password: { val: undefined, exp: 0, lastUpdated: 0 },
+	tokens: { val: undefined, exp: 0, lastUpdated: 0 },
+	workers: { val: undefined, exp: 0, lastUpdated: 0 },
+	sources: { val: undefined, exp: 0, lastUpdated: 0 },
+	cluster_settings: { val: undefined, exp: 0, lastUpdated: 0 }
 };
-const CONFIG_CACHE_TTL_MS = 6000;
+const kvInflightPromises = new Map();
+
+// 安全深拷贝工具：杜绝高并发内存引用篡改
+function safeClone(data) {
+	if (data === null || data === undefined || typeof data !== 'object') return data;
+	try {
+		return structuredClone(data);
+	} catch (e) {
+		return JSON.parse(JSON.stringify(data));
+	}
+}
+
+function withTimeout(promise, ms, errText) {
+	let timer;
+	return Promise.race([
+		promise,
+		new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(errText)), ms); })
+	]).finally(() => clearTimeout(timer));
+}
+
+// 兼容层：返回深拷贝对象与最新 lastUpdated 戳
+const memConfigCache = {
+	get tokens() { return safeClone(kvSectionCache.tokens?.val) || null; },
+	set tokens(v) { setCachedKV('tokens', v); },
+	get workers() { return safeClone(kvSectionCache.workers?.val) || null; },
+	set workers(v) { setCachedKV('workers', v); },
+	get sources() { return safeClone(kvSectionCache.sources?.val) || null; },
+	set sources(v) { setCachedKV('sources', v); },
+	get adminPass() { return kvSectionCache.admin_password?.val || null; },
+	set adminPass(v) { setCachedKV('admin_password', v); },
+	get ts() { return Math.max(...Object.values(kvSectionCache).map(e => e.lastUpdated || 0), 0); }
+};
 
 function getKV(env) {
 	return env?.KV || env?.CONFIG_KV || null;
+}
+
+async function getCachedKV(kv, subKey, type = 'json', fallback = null) {
+	if (!kv) return safeClone(fallback);
+	const now = Date.now();
+	const entry = kvSectionCache[subKey];
+	if (entry && entry.exp > now) {
+		return entry.val !== undefined ? safeClone(entry.val) : safeClone(fallback);
+	}
+
+	const inflightKey = `${subKey}:${type}`;
+	if (kvInflightPromises.has(inflightKey)) {
+		const res = await kvInflightPromises.get(inflightKey);
+		return res !== null && res !== undefined ? safeClone(res) : safeClone(fallback);
+	}
+
+	const fetchStartedAt = Date.now();
+	const p = (async () => {
+		try {
+			const fullKey = `${KV_CONFIG_PREFIX}${subKey}`;
+			const raw = await withTimeout(
+				kv.get(fullKey, type === 'json' ? { type: 'json' } : undefined),
+				KV_READ_TIMEOUT_MS,
+				`KV read timed out for key ${subKey}`
+			);
+
+			// 读写竞态防范：若在此请求读取期间已有写入操作（lastUpdated 较新），丢弃旧读结果
+			const currentEntry = kvSectionCache[subKey];
+			if (currentEntry && currentEntry.lastUpdated > fetchStartedAt) {
+				return currentEntry.val;
+			}
+
+			if (raw !== null && raw !== undefined) {
+				kvSectionCache[subKey] = {
+					val: safeClone(raw),
+					exp: Date.now() + CONFIG_CACHE_TTL_MS,
+					lastUpdated: Date.now()
+				};
+				return raw;
+			} else {
+				// 负缓存：5秒内不再重复查询不存在的 key
+				kvSectionCache[subKey] = {
+					val: safeClone(fallback),
+					exp: Date.now() + NEGATIVE_CACHE_TTL_MS,
+					lastUpdated: Date.now()
+				};
+				return fallback;
+			}
+		} catch (e) {
+			const currentEntry = kvSectionCache[subKey];
+			if (!currentEntry || currentEntry.exp <= Date.now()) {
+				kvSectionCache[subKey] = {
+					val: safeClone(fallback),
+					exp: Date.now() + ERROR_CACHE_TTL_MS,
+					lastUpdated: Date.now()
+				};
+			}
+			return fallback;
+		} finally {
+			kvInflightPromises.delete(inflightKey);
+		}
+	})();
+
+	kvInflightPromises.set(inflightKey, p);
+	const result = await p;
+	return result !== null && result !== undefined ? safeClone(result) : safeClone(fallback);
+}
+
+function setCachedKV(subKey, val) {
+	kvSectionCache[subKey] = {
+		val: safeClone(val),
+		exp: Date.now() + CONFIG_CACHE_TTL_MS,
+		lastUpdated: Date.now()
+	};
+	for (const key of kvInflightPromises.keys()) {
+		if (key.startsWith(`${subKey}:`)) {
+			kvInflightPromises.delete(key);
+		}
+	}
 }
 
 async function sha256Hex(str) {
@@ -521,10 +840,8 @@ async function sha256Hex(str) {
 async function getAdminPassword(env) {
 	const kv = getKV(env);
 	if (kv) {
-		try {
-			const pass = await kv.get(`${KV_CONFIG_PREFIX}admin_password`);
-			if (pass) return pass.trim();
-		} catch (e) {}
+		const pass = await getCachedKV(kv, 'admin_password', 'text', null);
+		if (pass) return String(pass).trim();
 	}
 	const envPass = (env?.ADMIN || env?.ADMIN_PASSWORD || env?.ADMIN_TOKEN || env?.ROOT_PASSWORD || '').toString().trim();
 	return envPass || null;
@@ -533,102 +850,65 @@ async function getAdminPassword(env) {
 async function setAdminPassword(env, password) {
 	const kv = getKV(env);
 	if (!kv) throw new Error('未检测到绑定的 KV 空间 (KV)，无法持久化存储管理员密码。请在 Cloudflare 仪表盘绑定变量名为 KV 的命名空间。');
-	await kv.put(`${KV_CONFIG_PREFIX}admin_password`, String(password).trim());
-	memConfigCache.adminPass = String(password).trim();
+	const trimmed = String(password).trim();
+	await kv.put(`${KV_CONFIG_PREFIX}admin_password`, trimmed);
+	setCachedKV('admin_password', trimmed);
 }
 
 async function getKVTokens(env) {
 	const kv = getKV(env);
 	if (!kv) return null;
-	const now = Date.now();
-	if (memConfigCache.tokens && now - memConfigCache.ts < CONFIG_CACHE_TTL_MS) {
-		return memConfigCache.tokens;
-	}
-	try {
-		const raw = await kv.get(`${KV_CONFIG_PREFIX}tokens`, { type: 'json' });
-		if (Array.isArray(raw)) {
-			memConfigCache.tokens = raw;
-			memConfigCache.ts = now;
-			return raw;
-		}
-	} catch (e) {}
-	return [];
+	const raw = await getCachedKV(kv, 'tokens', 'json', []);
+	return Array.isArray(raw) ? raw : [];
 }
 
 async function saveKVTokens(env, tokens) {
 	const kv = getKV(env);
 	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}tokens`, JSON.stringify(tokens));
-	memConfigCache.tokens = tokens;
-	memConfigCache.ts = Date.now();
+	setCachedKV('tokens', tokens);
 }
 
 async function getKVWorkers(env) {
 	const kv = getKV(env);
 	if (!kv) return [];
-	const now = Date.now();
-	if (memConfigCache.workers && now - memConfigCache.ts < CONFIG_CACHE_TTL_MS) {
-		return memConfigCache.workers;
-	}
-	try {
-		const raw = await kv.get(`${KV_CONFIG_PREFIX}workers`, { type: 'json' });
-		if (Array.isArray(raw)) {
-			memConfigCache.workers = raw;
-			memConfigCache.ts = now;
-			return raw;
-		}
-	} catch (e) {}
-	return [];
+	const raw = await getCachedKV(kv, 'workers', 'json', []);
+	return Array.isArray(raw) ? raw : [];
 }
 
 async function saveKVWorkers(env, workers) {
 	const kv = getKV(env);
 	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}workers`, JSON.stringify(workers));
-	memConfigCache.workers = workers;
-	memConfigCache.ts = Date.now();
+	setCachedKV('workers', workers);
 }
 
 async function getKVSources(env) {
 	const kv = getKV(env);
 	if (!kv) return {};
-	const now = Date.now();
-	if (memConfigCache.sources && now - memConfigCache.ts < CONFIG_CACHE_TTL_MS) {
-		return memConfigCache.sources;
-	}
-	try {
-		const raw = await kv.get(`${KV_CONFIG_PREFIX}sources`, { type: 'json' });
-		if (raw && typeof raw === 'object') {
-			memConfigCache.sources = raw;
-			memConfigCache.ts = now;
-			return raw;
-		}
-	} catch (e) {}
-	return {};
+	const raw = await getCachedKV(kv, 'sources', 'json', {});
+	return raw && typeof raw === 'object' ? raw : {};
 }
 
 async function saveKVSources(env, sources) {
 	const kv = getKV(env);
 	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}sources`, JSON.stringify(sources));
-	memConfigCache.sources = sources;
-	memConfigCache.ts = Date.now();
+	setCachedKV('sources', sources);
 }
 
 async function getKVClusterSettings(env) {
 	const kv = getKV(env);
 	if (!kv) return { pureClusterMode: false };
-	try {
-		const raw = await kv.get(`${KV_CONFIG_PREFIX}cluster_settings`, { type: 'json' });
-		if (raw && typeof raw === 'object') return raw;
-	} catch (e) {}
-	return { pureClusterMode: false };
+	const raw = await getCachedKV(kv, 'cluster_settings', 'json', { pureClusterMode: false });
+	return raw && typeof raw === 'object' ? raw : { pureClusterMode: false };
 }
 
 async function saveKVClusterSettings(env, settings) {
 	const kv = getKV(env);
 	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
 	await kv.put(`${KV_CONFIG_PREFIX}cluster_settings`, JSON.stringify(settings));
+	setCachedKV('cluster_settings', settings);
 }
 
 function getObjectByPath(obj, path) {
@@ -646,8 +926,8 @@ function getObjectByPath(obj, path) {
 const sourceKeyRotationIndex = new Map();
 const sourceKeyCooldownUntil = new Map();
 
-function getSourceKeysFromEnvOrConfig(sourceKey, env) {
-	const sources = memConfigCache.sources;
+function getSourceKeysFromEnvOrConfig(sourceKey, env, preloadedSources = null) {
+	const sources = preloadedSources || memConfigCache.sources;
 	if (sources && sources[sourceKey]?.keys && Array.isArray(sources[sourceKey].keys)) {
 		const validKeys = sources[sourceKey].keys.map(k => String(k).trim()).filter(Boolean);
 		if (validKeys.length > 0) return validKeys;
@@ -664,8 +944,8 @@ function getSourceKeysFromEnvOrConfig(sourceKey, env) {
 	return [];
 }
 
-function pickKeyForSource(sourceKey, env) {
-	const keys = getSourceKeysFromEnvOrConfig(sourceKey, env);
+function pickKeyForSource(sourceKey, env, preloadedSources = null) {
+	const keys = getSourceKeysFromEnvOrConfig(sourceKey, env, preloadedSources);
 	if (!keys.length) return '';
 	if (keys.length === 1) return keys[0];
 
@@ -687,10 +967,25 @@ function markKeyCooldown(sourceKey, key, cooldownMs = 60000) {
 	sourceKeyCooldownUntil.set(`${sourceKey}:${key}`, Date.now() + cooldownMs);
 }
 
+function isPrivateHost(host) {
+	if (!host || typeof host !== 'string') return true;
+	const h = host.replace(/^\[|\]$/g, '').toLowerCase().trim();
+	if (h === 'localhost' || h === '::1' || h === '::' || h.endsWith('.local') || h.endsWith('.internal')) return true;
+	if (h.startsWith('0.') || h.startsWith('10.') || h.startsWith('127.') || h.startsWith('169.254.') || h.startsWith('192.168.')) return true;
+	if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return true;
+	if (/^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./.test(h)) return true;
+	if (h.startsWith('::ffff:')) {
+		const v4 = h.slice(7);
+		return isPrivateHost(v4);
+	}
+	if (/^f[cd][0-9a-f]{2}:/i.test(h) || /^fe[89ab][0-9a-f]:/i.test(h) || h.startsWith('fc00:') || h.startsWith('fe80:')) return true;
+	return false;
+}
+
 async function verifyAdminAuth(request, env) {
 	const adminPass = await getAdminPassword(env);
 	if (!adminPass) {
-		return { ok: true, needSetup: true };
+		return { ok: false, needSetup: true };
 	}
 
 	const authHeader = request.headers.get('Authorization') || '';
@@ -734,7 +1029,7 @@ async function handleAdminAPI(request, url, env, origin) {
 			return jsonResponse({ success: true, token: sessionToken, message: '管理员密码初始化成功！' }, { origin });
 		}
 
-		if (!pass || (!timingSafeEqual(pass, currentAdminPass) && pass !== currentAdminPass)) {
+		if (!pass || !timingSafeEqual(pass, currentAdminPass)) {
 			return jsonResponse({ success: false, error: '密码错误，请重新输入' }, { status: 401, origin });
 		}
 
@@ -891,8 +1186,17 @@ async function handleAdminAPI(request, url, env, origin) {
 		let body = {};
 		try { body = await request.json(); } catch (e) {}
 		let targetUrl = (body.url || '').trim().replace(/\/+$/, '');
-		if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-			targetUrl = 'https://' + targetUrl;
+		if (!targetUrl.startsWith('https://')) {
+			targetUrl = 'https://' + targetUrl.replace(/^http:\/\//i, '');
+		}
+		let parsedTarget;
+		try {
+			parsedTarget = new URL(targetUrl);
+		} catch (e) {
+			return jsonResponse({ success: false, error: '目标 URL 格式无效' }, { status: 400, origin });
+		}
+		if (isPrivateHost(parsedTarget.hostname)) {
+			return jsonResponse({ success: false, error: '安全拦截：禁止探测本地与内网保留地址' }, { status: 403, origin });
 		}
 		const token = (body.token || '').trim();
 		const pingStart = Date.now();
@@ -1034,16 +1338,17 @@ async function handleAdminAPI(request, url, env, origin) {
 			const nodeDisplayName = customNodeName || `${accountName} (自动部署)`;
 
 			const existingIndex = currentWorkers.findIndex(w => (w?.url || '').toLowerCase().replace(/\/+$/, '') === targetUrl.toLowerCase());
+			let nextWorkers = [...currentWorkers];
 			let savedNode;
 			if (existingIndex !== -1) {
 				savedNode = {
-					...currentWorkers[existingIndex],
+					...nextWorkers[existingIndex],
 					name: nodeDisplayName,
 					url: targetUrl,
-					token: currentWorkers[existingIndex].token || nodeToken,
+					token: nextWorkers[existingIndex].token || nodeToken,
 					enabled: true
 				};
-				currentWorkers[existingIndex] = savedNode;
+				nextWorkers[existingIndex] = savedNode;
 			} else {
 				savedNode = {
 					id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -1052,9 +1357,9 @@ async function handleAdminAPI(request, url, env, origin) {
 					token: nodeToken,
 					enabled: true
 				};
-				currentWorkers.push(savedNode);
+				nextWorkers.push(savedNode);
 			}
-			await saveKVWorkers(env, currentWorkers);
+			await saveKVWorkers(env, nextWorkers);
 
 			// 6. 立即进行一次快速延迟探测
 			let latency = null;
@@ -1093,7 +1398,7 @@ async function handleAdminAPI(request, url, env, origin) {
 // 通过环境变量 TOKEN 或 KV 空间中的配置动态鉴权，未配置时不启用鉴权（保持向后兼容）。
 function isAuthProtectedPath(pathname) {
 	const lower = pathname.toLowerCase();
-	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check' || lower === '/api/cluster/nodes';
+	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check' || lower === '/api/cluster/nodes' || lower === '/api/cluster/relay' || lower === '/api/sources/list';
 }
 
 function getConfiguredToken(env) {
@@ -1188,6 +1493,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 
 	let tunnel = null;
 	const selectedSource = String(source || 'iplocate').toLowerCase();
+	const kvSources = (await getKVSources(env)) || {};
 	let targetHost = 'www.iplocate.io';
 	let targetPort = 443;
 	let requestPath = '/api/lookup';
@@ -1213,13 +1519,13 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 	} else if (selectedSource === 'ip2location' || selectedSource === 'ip2location_io') {
 		targetHost = 'api.ip2location.io';
 		serverName = 'api.ip2location.io';
-		currentKeyUsed = pickKeyForSource('ip2location', env);
+		currentKeyUsed = pickKeyForSource('ip2location', env, kvSources);
 		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}&format=json` : '/?format=json';
 		acceptHeader = 'application/json';
 	} else if (selectedSource === 'ipinfo') {
 		targetHost = 'ipinfo.io';
 		serverName = 'ipinfo.io';
-		currentKeyUsed = pickKeyForSource('ipinfo', env);
+		currentKeyUsed = pickKeyForSource('ipinfo', env, kvSources);
 		requestPath = currentKeyUsed ? `/json?token=${encodeURIComponent(currentKeyUsed)}` : '/json';
 		acceptHeader = 'application/json';
 	} else if (selectedSource === 'cloudflare') {
@@ -1235,23 +1541,22 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 	} else if (selectedSource === 'ipapi_is' || selectedSource === 'ipapiis' || selectedSource === 'ipapi') {
 		targetHost = 'api.ipapi.is';
 		serverName = 'api.ipapi.is';
-		currentKeyUsed = pickKeyForSource('ipapi_is', env);
+		currentKeyUsed = pickKeyForSource('ipapi_is', env, kvSources);
 		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}` : '/';
 		acceptHeader = 'application/json';
 	} else if (selectedSource === 'ipdata' || selectedSource === 'ipdata_co') {
 		targetHost = 'api.ipdata.co';
 		serverName = 'api.ipdata.co';
-		currentKeyUsed = pickKeyForSource('ipdata', env);
+		currentKeyUsed = pickKeyForSource('ipdata', env, kvSources);
 		requestPath = currentKeyUsed ? `/?api-key=${encodeURIComponent(currentKeyUsed)}` : '/';
 		acceptHeader = 'application/json';
 	} else {
 		// 检查是否为后台配置的自定义源 (custom:xxx)
-		const allKVSources = (await getKVSources(env)) || {};
-		const customDef = allKVSources[selectedSource];
+		const customDef = kvSources[selectedSource];
 		if (customDef && customDef.url) {
 			try {
 				let rawUrl = customDef.url.trim();
-				currentKeyUsed = pickKeyForSource(selectedSource, env);
+				currentKeyUsed = pickKeyForSource(selectedSource, env, kvSources);
 				if (currentKeyUsed) {
 					rawUrl = rawUrl.replace(/\{\{KEY\}\}/gi, encodeURIComponent(currentKeyUsed));
 				}
@@ -1283,17 +1588,48 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 			throw new Error(`Unsupported proxy type: ${proxy.type}`);
 		}
 
-		tunnel = await withTimeout(tunnelPromise, CHECK_TIMEOUT_MS, 'Proxy connection timed out');
-		const tlsSocket = new TlsClient(tunnel, {
+		let timedOut = false;
+		const guardPromise = tunnelPromise.then(sock => {
+			if (timedOut) {
+				try { sock?.close?.(); } catch (e) {}
+			}
+			return sock;
+		});
+		try {
+			tunnel = await withTimeout(guardPromise, CHECK_TIMEOUT_MS, 'Proxy connection timed out');
+		} catch (err) {
+			timedOut = true;
+			throw err;
+		}
+
+		const isHttpsTarget = targetPort !== 80;
+		const clientSocket = isHttpsTarget ? new TlsClient(tunnel, {
 			serverName: stripIPv6Brackets(serverName),
 			timeout: READ_TIMEOUT_MS,
 			allowChacha: true
-		});
+		}) : {
+			handshake: async () => {},
+			write: async (data) => {
+				const w = tunnel.writable.getWriter();
+				try { await w.write(data); } finally { w.releaseLock(); }
+			},
+			read: async () => {
+				const r = tunnel.readable.getReader();
+				try {
+					const res = await r.read();
+					return res.done ? null : res.value;
+				} finally {
+					r.releaseLock();
+				}
+			},
+			close: () => { try { tunnel?.close?.(); } catch (e) {} }
+		};
+
 		let exit;
 		try {
-			await withTimeout(tlsSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
+			await withTimeout(clientSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
 			const httpHostHeader = targetHost === '1.1.1.1' ? 'cloudflare.com' : targetHost;
-			await tlsSocket.write(encoder.encode([
+			await clientSocket.write(encoder.encode([
 				`GET ${requestPath} HTTP/1.1`,
 				`Host: ${httpHostHeader}`,
 				'User-Agent: Mozilla/5.0 CF-Workers-CheckProxy/2.0',
@@ -1305,7 +1641,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 
 			let responseBuffer = new Uint8Array(0);
 			while (responseBuffer.byteLength < MAX_RESPONSE_BYTES) {
-				const value = await withTimeout(tlsSocket.read(), READ_TIMEOUT_MS, 'Reading target response timed out');
+				const value = await withTimeout(clientSocket.read(), READ_TIMEOUT_MS, 'Reading target response timed out');
 				if (!value) break;
 				if (!value.byteLength) continue;
 				responseBuffer = concatUint8(responseBuffer, value);
@@ -1336,23 +1672,41 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 			const lengthMatch = headerText.match(/\r\ncontent-length:\s*(\d+)/i);
 			if (lengthMatch) bodyBytes = bodyBytes.slice(0, Number(lengthMatch[1]));
 
-			let bodyText = decoder.decode(bodyBytes);
 			if (/\r\ntransfer-encoding:\s*chunked/i.test(headerText)) {
 				let cursor = 0;
-				let output = '';
-				while (cursor < bodyText.length) {
-					const lineEnd = bodyText.indexOf('\r\n', cursor);
+				const chunks = [];
+				while (cursor < bodyBytes.byteLength) {
+					let lineEnd = -1;
+					for (let i = cursor; i < bodyBytes.byteLength - 1; i++) {
+						if (bodyBytes[i] === 0x0d && bodyBytes[i + 1] === 0x0a) {
+							lineEnd = i;
+							break;
+						}
+					}
 					if (lineEnd === -1) break;
-					const sizeText = bodyText.slice(cursor, lineEnd).split(';')[0].trim();
-					const size = parseInt(sizeText, 16);
-					if (!Number.isFinite(size)) break;
+					const sizeLine = decoder.decode(bodyBytes.subarray(cursor, lineEnd)).split(';')[0].trim();
+					const size = parseInt(sizeLine, 16);
+					if (!Number.isFinite(size) || size < 0) break;
 					cursor = lineEnd + 2;
 					if (size === 0) break;
-					output += bodyText.slice(cursor, cursor + size);
+					if (cursor + size <= bodyBytes.byteLength) {
+						chunks.push(bodyBytes.subarray(cursor, cursor + size));
+					}
 					cursor += size + 2;
 				}
-				bodyText = output || bodyText;
+				if (chunks.length > 0) {
+					const totalLen = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+					const merged = new Uint8Array(totalLen);
+					let pos = 0;
+					for (const c of chunks) {
+						merged.set(c, pos);
+						pos += c.byteLength;
+					}
+					bodyBytes = merged;
+				}
 			}
+
+			let bodyText = decoder.decode(bodyBytes);
 
 			if (selectedSource === 'cloudflare') {
 				const traceData = {};
@@ -1469,6 +1823,10 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					raw = JSON.parse(bodyText.trim());
 				} catch (err) {
 					throw new Error('Target ipinfo.io did not return valid JSON');
+				}
+				if (raw.error || raw.status === 429) {
+					if (currentKeyUsed) markKeyCooldown('ipinfo', currentKeyUsed, 300000);
+					throw new Error(raw.error?.message || 'Target ipinfo.io rate limit reached');
 				}
 				const locParts = (raw.loc || '').split(',');
 				const lat = locParts[0] ? parseFloat(locParts[0]) : null;
@@ -1604,6 +1962,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					throw new Error('Target api.ip2location.io did not return valid JSON');
 				}
 				if (raw.error) {
+					if (currentKeyUsed) markKeyCooldown('ip2location', currentKeyUsed, 300000);
 					throw new Error(raw.error.error_message || 'Target api.ip2location.io request failed');
 				}
 				const asnNum = raw.asn ? parseInt(String(raw.asn).replace(/^AS/i, ''), 10) : null;
@@ -1791,7 +2150,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 				}
 			}
 		} finally {
-			try { tlsSocket.close(); } catch (e) { }
+			try { clientSocket?.close?.(); } catch (e) { }
 		}
 
 		return buildCheckResult({
@@ -2208,8 +2567,34 @@ async function socks5Connect(proxy, targetHost, targetPort) {
 		if (hostBytes.byteLength > 255) throw new Error('Target hostname is too long for SOCKS5');
 		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
 		await writer.write(connectPacket);
-		response = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
-		if (response.done || response.value[1] !== 0x00) throw new Error(`SOCKS5 connection failed: ${response.value?.[1] ?? 'closed'}`);
+
+		// 严格按帧读取完整的 SOCKS5 CONNECT 确认报文，防止拆包导致未决字节残留在流中破坏后续 TLS 握手
+		let replyBuf = new Uint8Array(0);
+		while (replyBuf.byteLength < 4) {
+			const chunk = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
+			if (chunk.done || !chunk.value) throw new Error('SOCKS5 connection closed prematurely');
+			replyBuf = concatUint8(replyBuf, chunk.value);
+		}
+		if (replyBuf[1] !== 0x00) throw new Error(`SOCKS5 connection failed: ${replyBuf[1]}`);
+		const atyp = replyBuf[3];
+		let totalExpected = 4;
+		if (atyp === 0x01) {
+			totalExpected = 4 + 4 + 2; // IPv4: 10 bytes
+		} else if (atyp === 0x04) {
+			totalExpected = 4 + 16 + 2; // IPv6: 22 bytes
+		} else if (atyp === 0x03) {
+			if (replyBuf.byteLength < 5) {
+				const chunk = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
+				if (chunk.done || !chunk.value) throw new Error('SOCKS5 connection closed prematurely');
+				replyBuf = concatUint8(replyBuf, chunk.value);
+			}
+			totalExpected = 5 + replyBuf[4] + 2; // Domain
+		}
+		while (replyBuf.byteLength < totalExpected) {
+			const chunk = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
+			if (chunk.done || !chunk.value) throw new Error('SOCKS5 connection closed prematurely');
+			replyBuf = concatUint8(replyBuf, chunk.value);
+		}
 
 		writer.releaseLock();
 		reader.releaseLock();
@@ -3192,22 +3577,32 @@ function normalizeTxtValue(value) {
 }
 
 async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-query') {
-	try {
-		const response = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`, {
-			headers: { accept: 'application/dns-json' }
-		});
-		if (!response.ok) return [];
-		const payload = await response.json();
-		if (!Array.isArray(payload.Answer)) return [];
-		return payload.Answer.map(answer => ({
-			name: answer.name || name,
-			type: answer.type,
-			TTL: answer.TTL,
-			data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
-		}));
-	} catch (error) {
-		return [];
+	const endpoints = [
+		endpoint,
+		'https://dns.google/resolve'
+	];
+	for (const ep of endpoints) {
+		try {
+			const separator = ep.includes('?') ? '&' : '?';
+			const response = await fetch(`${ep}${separator}name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`, {
+				headers: { accept: 'application/dns-json' },
+				signal: AbortSignal.timeout(3500)
+			});
+			if (!response.ok) continue;
+			const payload = await response.json();
+			if (!Array.isArray(payload.Answer)) continue;
+			const answers = payload.Answer.map(answer => ({
+				name: answer.name || name,
+				type: answer.type,
+				TTL: answer.TTL,
+				data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
+			}));
+			if (answers.length > 0) return answers;
+		} catch (error) {
+			// 回退到备用 DoH 提供商
+		}
 	}
+	return [];
 }
 
 function generateHTML(备案内容, hasToken = false) {
@@ -6551,8 +6946,8 @@ function generateHTML(备案内容, hasToken = false) {
 		let clusterNodesPromise = null;
 		const CHECK_CONCURRENCY = 32;
 		const RESOLVE_BATCH_SIZE = 50;
-		const RESOLVE_BATCH_TIMEOUT_MS = 20000;
-		const RESOLVE_BATCH_MAX_ATTEMPTS = 3;
+		const RESOLVE_BATCH_TIMEOUT_MS = 5000;
+		const RESOLVE_BATCH_MAX_ATTEMPTS = 2;
 		const RISK_RESULT_FILTERS = [
 			{ key: 'verylow', label: '极度纯净' },
 			{ key: 'low', label: '纯净' },
@@ -6894,7 +7289,7 @@ function generateHTML(备案内容, hasToken = false) {
 				const cd = nodeCooldownUntil.get(url);
 				return !cd || now > cd;
 			});
-			if (!activeNodes.length) return clusterNodes[clusterRoundRobinIndex++ % clusterNodes.length];
+			if (!activeNodes.length) return null;
 			const selected = activeNodes[clusterRoundRobinIndex++ % activeNodes.length];
 			return selected;
 		}
@@ -7063,6 +7458,7 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		function calculateExitRiskScore(exitData) {
+			if (!exitData || !exitData.ip) return null;
 			if (exitData?.risk_score !== undefined && exitData?.risk_score !== null) {
 				const directScore = parseAbuseScore(exitData.risk_score);
 				if (directScore !== null) {
@@ -7082,9 +7478,11 @@ function generateHTML(备案内容, hasToken = false) {
 				return flag === true;
 			}).length;
 			let finalScore = baseScore + riskCount * 0.15;
+			if (exitData?.is_datacenter && !exitData?.is_proxy && !exitData?.is_vpn) {
+				finalScore += 0.05; // 普通机房出口给予 5% 轻微风险提示
+			}
 			if (exitData?.is_bogon) finalScore += 1.0;
-			if (baseScore === 0 && riskCount === 0 && !exitData?.is_bogon) return null;
-			return finalScore;
+			return Math.min(Math.max(finalScore, 0), 1.0);
 		}
 
 		function getExitRiskMeta(score) {
@@ -7525,9 +7923,14 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		function getDirectProxyTarget(input) {
-			const parsed = parseProxyUrl(input);
-			if (parsed.scheme === 'sstp' || parsed.scheme === 'https') return parsed.normalized;
-			return isClientIpAddress(parsed.hostPlain) ? parsed.normalized : '';
+			try {
+				const normalizedInput = normalizeProxyInput(input, true) || input;
+				const parsed = parseProxyUrl(normalizedInput);
+				if (parsed.scheme === 'sstp' || parsed.scheme === 'https') return parsed.normalized;
+				return isClientIpAddress(parsed.hostPlain) ? parsed.normalized : '';
+			} catch (e) {
+				return '';
+			}
 		}
 
 		function parseResolvedTarget(target) {
@@ -8021,6 +8424,7 @@ function generateHTML(备案内容, hasToken = false) {
 			const record = {
 				target: target,
 				el: itemObj.el,
+				itemObj: itemObj,
 				status: 'pending',
 				proxyType: getProxyTypeFromTarget(target),
 				riskLevels: [],
@@ -8336,6 +8740,15 @@ function generateHTML(备案内容, hasToken = false) {
 			filterPanel.hidden = !isFilterPanelExpanded;
 			filterToggle.setAttribute('aria-expanded', String(isFilterPanelExpanded));
 			filterToggleText.innerText = getFilterToggleLabel(visibleCount);
+		}
+
+		let updateFiltersRaf = null;
+		function scheduleUpdateResultFilters() {
+			if (updateFiltersRaf) return;
+			updateFiltersRaf = requestAnimationFrame(function () {
+				updateFiltersRaf = null;
+				updateResultFilters();
+			});
 		}
 
 		function updateResultFilters() {
@@ -8794,6 +9207,64 @@ function generateHTML(备案内容, hasToken = false) {
 			return text.includes('ms') ? text : text + ' ms';
 		}
 
+		function classifyCheckError(errorMsg) {
+			if (errorMsg && typeof errorMsg === 'object') {
+				errorMsg = errorMsg.message || errorMsg.error || JSON.stringify(errorMsg);
+			}
+			const msg = String(errorMsg || '').toLowerCase();
+			if (!msg) {
+				return { badge: '不可用', category: '检测未通过', description: '代理连接无响应或验证失败。' };
+			}
+			// 1. 集群中继与网关异常
+			if (msg.includes('relay failed') || (msg.includes('relay') && (msg.includes('fail') || msg.includes('err')))) {
+				return { badge: '中继失败', category: '集群中继异常', description: '主 Worker 转发请求至从节点失败，可能从节点网络阻断或脱机 (502 Relay Failed)。' };
+			}
+			if (msg.includes('502') || msg.includes('bad gateway')) {
+				return { badge: '网关错误', category: '中继网关异常', description: '从节点或上游中继网关响应 502 错误，目标集群服务暂时不可达。' };
+			}
+			if (msg.includes('504') || msg.includes('gateway timeout')) {
+				return { badge: '网关超时', category: '网关响应超时', description: '中继网关等待上游节点响应超时 (HTTP 504 Gateway Timeout)。' };
+			}
+			if (msg.includes('521') || msg.includes('522') || msg.includes('520') || msg.includes('523') || msg.includes('524')) {
+				return { badge: '节点脱机', category: 'Cloudflare异常', description: 'Cloudflare 无法连接到指定的从节点 Worker，源站服务不可用。' };
+			}
+			// 2. 超时与中断
+			if (msg.includes('abort') || msg.includes('timeout') || msg.includes('timed out') || msg.includes('超时')) {
+				return { badge: '握手超时', category: '连接或握手超时', description: '代理连接或握手超时，目标节点无响应或丢包严重。' };
+			}
+			// 3. 连接重置与拒绝
+			if (msg.includes('refused') || msg.includes('reset') || msg.includes('拒绝') || msg.includes('重置') || msg.includes('closed') || msg.includes('econn')) {
+				return { badge: '被重置/拒绝', category: '连接异常中断', description: '代理端口拒绝连接或握手被对端强制关闭/重置（目标服务未启动或被阻断）。' };
+			}
+			// 4. 权限与鉴权体系细分
+			if (msg.includes('403') || msg.includes('forbidden')) {
+				return { badge: '禁止访问', category: '访问被拒绝/拦截', description: '请求被拒绝 (HTTP 403)，可能是安全防火墙/WAF拦截，或节点令牌权限不足。' };
+			}
+			if (msg.includes('unauthorized') || (msg.includes('token') && msg.includes('invalid')) || msg.includes('401')) {
+				return { badge: '令牌无效', category: '接口鉴权失败', description: '访问令牌缺失或校验不通过 (HTTP 401 Unauthorized)，请检查 Token 设置。' };
+			}
+			if (msg.includes('407') || msg.includes('auth') || msg.includes('credential') || msg.includes('认证') || msg.includes('密码')) {
+				return { badge: '认证失败', category: '账号鉴权失败', description: '代理服务器需要鉴权或提供的用户名/密码无效 (407 Proxy Auth Required)。' };
+			}
+			// 5. DNS 解析
+			if (msg.includes('dns') || msg.includes('resolve') || msg.includes('not found') || msg.includes('解析') || msg.includes('enotfound')) {
+				return { badge: '解析失败', category: '域名无法解析', description: '代理的主机名无法通过 DNS/DoH 解析，请检查域名或 DNS。' };
+			}
+			// 6. TLS 握手
+			if (msg.includes('tls') || msg.includes('ssl') || msg.includes('cert') || msg.includes('handshake failed') || msg.includes('证书')) {
+				return { badge: 'TLS错误', category: 'TLS/证书握手失败', description: '安全加密握手失败，目标证书无效、端口不支持 SSL 或协议版本不兼容。' };
+			}
+			// 7. 速率限制
+			if (msg.includes('429') || msg.includes('1015') || msg.includes('1027') || msg.includes('rate limit') || msg.includes('限流') || msg.includes('quota')) {
+				return { badge: '被限流', category: '触发频率限制', description: '数据源或检测节点触发频率限制，建议切换节点或稍后再试。' };
+			}
+			// 8. 协议不支持
+			if (msg.includes('unsupported') || msg.includes('protocol') || msg.includes('协议')) {
+				return { badge: '协议不支持', category: '协议格式异常', description: '目标返回了非预期的握手报文，目标端口可能不是指定的代理协议。' };
+			}
+			return { badge: '不可用', category: '检测未通过', description: '无法通过该代理访问目标出口，请检查代理可用性或更换目标。' };
+		}
+
 		function getLatencyTooltipText(data) {
 			const coloCode = normalizeColoCode(data?.colo || data?.exit?.colo);
 			const coloText = coloCode ? 'Cloudflare ' + coloCode + ' 机房' : 'Cloudflare 测试机房';
@@ -9040,10 +9511,11 @@ function generateHTML(备案内容, hasToken = false) {
 				ipv4: { ok: false },
 				ipv6: { ok: false }
 			};
+			const respTime = source.responseTime ?? source.latency ?? source.connect_ms ?? source.elapsed_ms;
 			if (exit && exit.ip) {
 				probeResults[stack] = {
 					ok: true,
-					connect_ms: source.responseTime,
+					connect_ms: respTime,
 					exit: exit
 				};
 			}
@@ -9051,6 +9523,8 @@ function generateHTML(备案内容, hasToken = false) {
 			return Object.assign({}, source, {
 				type: normalizeProxyType(source.type) || (parsed ? parsed.scheme : ''),
 				exit: exit,
+				responseTime: respTime,
+				latency: respTime,
 				proxyIP: parsed ? parsed.hostPlain : (source.hostname || source.candidate || target),
 				portRemote: parsed ? parsed.port : (source.port || ''),
 				supports_ipv4: Boolean(probeResults.ipv4.ok),
@@ -9091,12 +9565,13 @@ function generateHTML(备案内容, hasToken = false) {
 					// 如果开启了纯集群模式但无可用节点，报错提示；否则如无节点或非纯集群则回退本地
 					if (pureClusterMode && !baseUrl && clusterNodes.length > 0) {
 						// 节点全部在冷却，稍候或使用第一个
-						const firstNode = clusterNodes[0];
-						baseUrl = firstNode.endsWith('/') ? firstNode.slice(0, -1) : firstNode;
+						chosenNode = clusterNodes[0];
+						baseUrl = chosenNode.endsWith('/') ? chosenNode.slice(0, -1) : chosenNode;
 					}
 
 					const nodeToken = chosenNode ? clusterNodeTokens[baseUrl] : '';
 					const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken ? '&token=' + encodeURIComponent(nodeToken) : '');
+					let isNodeFailure = false;
 					try {
 						result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
 						const status = result?.response?.status;
@@ -9105,24 +9580,63 @@ function generateHTML(备案内容, hasToken = false) {
 							reportNodeFailure(chosenNode, true);
 							continue;
 						}
-						if (chosenNode && result?.response?.ok) {
-							reportNodeSuccess(chosenNode);
+						// 如果子节点返回 500/502/503/52x 或 401/403 鉴权异常，标记节点故障并进入 Relay 或轮换
+						if (chosenNode && (!result?.response?.ok && (status >= 500 || status === 401 || status === 403))) {
+							reportNodeFailure(chosenNode, false);
+							isNodeFailure = true;
+						} else {
+							if (chosenNode && result?.response?.ok) {
+								reportNodeSuccess(chosenNode);
+							}
+							break;
 						}
-						break;
 					} catch (networkErr) {
+						// 优先响应停止信号，严禁将手动停止误记为节点故障！
+						if (isRunStopped(run)) throw networkErr;
 						if (chosenNode) {
 							reportNodeFailure(chosenNode, false);
 						}
-						if (isRunStopped(run)) throw networkErr;
-						if (attempts >= maxAttempts) {
-							if (!pureClusterMode && baseUrl) {
-								// 最后一次尝试本地 Worker
+						isNodeFailure = true;
+					}
+
+					// 若直连从节点失败（网络异常、CORS 或 50x 服务端故障），且属于跨域节点，尝试通过主 Worker 的 Relay 隧道转发
+					if (isNodeFailure && chosenNode && baseUrl) {
+						let isCrossDomain = false;
+						try {
+							isCrossDomain = new URL(baseUrl).origin !== window.location.origin;
+						} catch (e) {
+							isCrossDomain = !baseUrl.includes(window.location.host);
+						}
+
+						if (isCrossDomain) {
+							try {
+								const relayUrl = '/api/cluster/relay?node=' + encodeURIComponent(baseUrl) + '&proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken && nodeToken !== '***' ? '&token=' + encodeURIComponent(nodeToken) : '');
+								const relayResult = await fetchJsonWithTimeout(relayUrl, {}, 30000, run?.controller.signal);
+								if (relayResult?.response?.ok && relayResult?.payload && !String(relayResult.payload?.error || '').startsWith('Relay failed')) {
+									result = relayResult;
+									reportNodeSuccess(chosenNode);
+									break;
+								}
+							} catch (relayErr) {
+								if (isRunStopped(run)) throw relayErr;
+								// Relay 失败则继续正常重试/轮换
+							}
+						}
+					}
+
+					if (attempts >= maxAttempts) {
+						if (!pureClusterMode && baseUrl) {
+							// 最后一次尝试本地 Worker
+							try {
 								const fallbackUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
 								result = await fetchJsonWithTimeout(fallbackUrl, {}, 30000, run?.controller.signal);
 								break;
-							} else {
-								throw networkErr;
+							} catch (fallbackErr) {
+								if (isRunStopped(run)) throw fallbackErr;
+								throw fallbackErr;
 							}
+						} else {
+							break;
 						}
 					}
 				}
@@ -9133,14 +9647,17 @@ function generateHTML(备案内容, hasToken = false) {
 				}, target);
 				if (!result?.response?.ok) {
 					data.success = false;
-					data.error = data.error || ('HTTP ' + (result?.response?.status || 'Error'));
+					const httpError = 'HTTP ' + (result?.response?.status || 'Error');
+					if (!data.error || data.error === '检测接口没有返回有效 JSON') {
+						data.error = httpError;
+					}
 				}
 				completedCount++;
 
 				if (data.success) {
 					successCount++;
 					itemObj.el.className = 'result-item success';
-					const latency = formatLatency(data.responseTime);
+					const latency = formatLatency(data.responseTime ?? data.latency ?? data.connect_ms);
 					itemObj.badge.className = 'status-badge status-success';
 					itemObj.badge.innerText = latency;
 					setLatencyTooltip(itemObj.badge, data, latency);
@@ -9184,15 +9701,17 @@ function generateHTML(备案内容, hasToken = false) {
 					itemObj.el.className = 'result-item error';
 					updateResultFlag(itemObj, '');
 					itemObj.badge.className = 'status-badge status-error';
-					itemObj.badge.innerText = '不可用';
+					const errText = data.error || data.message || ('HTTP ' + (result?.response?.status || 'Error'));
+					const errDiag = classifyCheckError(errText);
+					itemObj.badge.innerText = errDiag.badge || '不可用';
 					const sourceDef = IP_SOURCE_DEFINITIONS[currentSource] || IP_SOURCE_DEFINITIONS.iplocate;
 					itemObj.info.innerHTML =
 						'<span class="result-label">候选目标</span>' +
 						buildCopyableTarget(target) +
-						'<span class="result-detail">无法通过该代理访问 ' + escapeHtml(sourceDef.label) + '，请更换目标后重试。</span>';
+						'<span class="result-detail">' + escapeHtml(errDiag.description || ('无法通过该代理访问 ' + sourceDef.label + '，请更换目标后重试。')) + '</span>';
 					itemObj.meta.innerHTML =
-						buildMetaChip('检测未通过', 'error', 'meta-chip-danger') +
-						buildMetaChip(data.error || data.message || '远端返回失败结果', 'info');
+						buildMetaChip(errDiag.category || '检测未通过', 'error', 'meta-chip-danger') +
+						buildMetaChip(errText, 'info');
 					itemObj.exitList.innerHTML = '';
 				}
 			} catch (error) {
@@ -9207,31 +9726,33 @@ function generateHTML(备案内容, hasToken = false) {
 					itemObj.meta.innerHTML = buildMetaChip('已停止', 'info');
 					itemObj.exitList.innerHTML = '';
 					updateProgress();
-					updateResultFilters();
+					scheduleUpdateResultFilters();
 					return;
 				}
 				completedCount++;
+				const errText = error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常');
+				const errDiag = classifyCheckError(errText);
 				const errInfo = {
 					success: false,
-					error: error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常')
+					error: errText
 				};
 				updateResultRecordAsError(resultRecord, errInfo);
 				itemObj.el.className = 'result-item error';
 				updateResultFlag(itemObj, '');
 				itemObj.badge.className = 'status-badge status-error';
-				itemObj.badge.innerText = '失败';
+				itemObj.badge.innerText = errDiag.badge || '失败';
 				itemObj.info.innerHTML =
 					'<span class="result-label">候选目标</span>' +
 					buildCopyableTarget(target) +
-					'<span class="result-detail">检测请求执行失败，可能是接口异常或网络中断。</span>';
+					'<span class="result-detail">' + escapeHtml(errDiag.description || '检测请求执行失败，可能是接口异常或网络中断。') + '</span>';
 				itemObj.meta.innerHTML =
-					buildMetaChip('请求异常', 'error', 'meta-chip-danger') +
-					buildMetaChip(error && error.name === 'AbortError' ? '检测请求超时' : '请稍后重试', 'retry');
+					buildMetaChip(errDiag.category || '请求异常', 'error', 'meta-chip-danger') +
+					buildMetaChip(errText, 'retry');
 				itemObj.exitList.innerHTML = '';
 			}
 
 			updateProgress();
-			updateResultFilters();
+			scheduleUpdateResultFilters();
 		}
 
 		function showDetails(button, exitData) {
@@ -9476,8 +9997,43 @@ function generateHTML(备案内容, hasToken = false) {
 				}
 			} catch (error) {
 				if (isRunStopped(run) || error?.name === 'AbortError') {
+					resultRecords.forEach(function (rec) {
+						if (rec && rec.status === 'pending') {
+							rec.status = 'stopped';
+							const item = rec.itemObj;
+							if (item && item.badge) {
+								item.badge.className = 'status-badge status-error';
+								item.badge.innerText = '已停止';
+								const detail = item.el ? item.el.querySelector('.result-detail') : null;
+								if (detail) {
+									detail.textContent = '检测已手动停止，未继续请求该代理。';
+								}
+								if (item.meta) {
+									item.meta.innerHTML = buildMetaChip('已停止', 'info');
+								}
+								if (item.exitList) {
+									item.exitList.innerHTML = '';
+								}
+							} else if (rec.el) {
+								const badge = rec.el.querySelector('.status-badge');
+								if (badge) {
+									badge.className = 'status-badge status-error';
+									badge.innerText = '已停止';
+								}
+								const detail = rec.el.querySelector('.result-detail');
+								if (detail) {
+									detail.textContent = '检测已手动停止，未继续请求该代理。';
+								}
+								const meta = rec.el.querySelector('.result-meta');
+								if (meta) {
+									meta.innerHTML = buildMetaChip('已停止', 'info');
+								}
+							}
+						}
+					});
 					progressText.innerText = '已停止 · 已完成 ' + completedCount + ' / ' + totalTargets + ' · 有效 ' + successCount;
 					setAppState('stopped');
+					scheduleUpdateResultFilters();
 				} else {
 					console.error(error);
 					progressText.innerText = '系统错误';
@@ -11173,8 +11729,8 @@ function generateAdminHTML(env, hasKV = false) {
 						<td class="py-3 px-3 font-semibold text-white">\${escapeHtml(t.note || '未命名')}</td>
 						<td class="py-3 px-3 font-mono text-cyan-300">
 							<span id="tok-\${t.id}">••••••••••••</span>
-							<button onclick="toggleTokenMask('\${t.id}', '\${escapeHtml(t.token)}')" class="ml-1 text-slate-400 hover:text-white">👁️</button>
-							<button onclick="copyToClipboard('\${escapeHtml(t.token)}')" class="ml-1 text-slate-400 hover:text-white">📋</button>
+							<button onclick="toggleTokenMask('\${t.id}')" class="ml-1 text-slate-400 hover:text-white">👁️</button>
+							<button onclick="copyTokenById('\${t.id}')" class="ml-1 text-slate-400 hover:text-white">📋</button>
 						</td>
 						<td class="py-3 px-3">
 							<button onclick="toggleTokenStatus('\${t.id}')" class="px-2 py-0.5 rounded text-[11px] font-medium border \${t.enabled !== false ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300' : 'bg-slate-800 border-slate-600 text-slate-400'}">
@@ -11191,13 +11747,21 @@ function generateAdminHTML(env, hasKV = false) {
 			}).join('');
 		}
 
-		function toggleTokenMask(id, realVal) {
+		function toggleTokenMask(id) {
+			const tok = (globalConfig.tokens || []).find(t => t.id === id);
+			if (!tok) return;
 			const span = document.getElementById('tok-' + id);
+			if (!span) return;
 			if (span.textContent === '••••••••••••') {
-				span.textContent = realVal;
+				span.textContent = tok.token;
 			} else {
 				span.textContent = '••••••••••••';
 			}
+		}
+
+		function copyTokenById(id) {
+			const tok = (globalConfig.tokens || []).find(t => t.id === id);
+			if (tok) copyToClipboard(tok.token);
 		}
 
 		function openTokenModal(mode, id = null) {
@@ -11714,7 +12278,7 @@ function generateAdminHTML(env, hasKV = false) {
 							\${escapeHtml(w.url)}
 						</div>
 						<div class="flex items-center justify-between text-xs pt-1">
-							<button onclick="pingSingleWorker('\${w.id}', '\${escapeHtml(w.url)}', '\${escapeHtml(w.token || '')}')" class="text-cyan-400 hover:underline">
+							<button onclick="pingWorkerById('\${w.id}')" class="text-cyan-400 hover:underline">
 								⚡ 测速
 							</button>
 							<div class="space-x-2">
@@ -11811,6 +12375,11 @@ function generateAdminHTML(env, hasKV = false) {
 
 		function editWorker(id) {
 			openWorkerModal('edit', id);
+		}
+
+		function pingWorkerById(id) {
+			const w = (globalConfig.workers || []).find(item => item.id === id);
+			if (w) pingSingleWorker(w.id, w.url, w.token || '');
 		}
 
 		async function pingSingleWorker(id, url, token) {
@@ -11947,7 +12516,9 @@ function generateAdminHTML(env, hasKV = false) {
 		}
 
 		function escapeHtml(str) {
-			return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+			return String(str || '').replace(/[&<>"']/g, function (m) {
+				return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m];
+			});
 		}
 
 		window.addEventListener('DOMContentLoaded', initDashboard);

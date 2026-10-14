@@ -33,22 +33,39 @@ export default {
 		const configuredToken = getConfiguredToken(env);
 		let pathTokenAuthenticated = false;
 
-		if (configuredToken) {
+		const activeTokens = [];
+		if (configuredToken) activeTokens.push(configuredToken);
+		const kvTokens = await getKVTokens(env);
+		if (kvTokens && kvTokens.length > 0) {
+			for (const t of kvTokens) {
+				if (t.enabled !== false && t.token) {
+					const trimmed = t.token.trim();
+					if (trimmed && !activeTokens.includes(trimmed)) {
+						activeTokens.push(trimmed);
+					}
+				}
+			}
+		}
+
+		if (activeTokens.length > 0) {
 			const rawPath = url.pathname;
 			let decodedPath = rawPath;
 			try {
 				decodedPath = decodeURIComponent(rawPath);
 			} catch (e) {}
 
-			const tokenPrefix = '/' + configuredToken;
-			if (decodedPath === tokenPrefix || decodedPath === tokenPrefix + '/') {
-				if (request.method === 'GET') {
-					return Response.redirect(`${url.origin}/?token=${encodeURIComponent(configuredToken)}`, 302);
+			for (const tok of activeTokens) {
+				const tokenPrefix = '/' + tok;
+				if (decodedPath === tokenPrefix || decodedPath === tokenPrefix + '/') {
+					if (request.method === 'GET') {
+						return Response.redirect(`${url.origin}/?token=${encodeURIComponent(tok)}`, 302);
+					}
+				} else if (decodedPath.startsWith(tokenPrefix + '/')) {
+					const remainder = decodedPath.slice(tokenPrefix.length);
+					url.pathname = remainder;
+					pathTokenAuthenticated = true;
+					break;
 				}
-			} else if (decodedPath.startsWith(tokenPrefix + '/')) {
-				const remainder = decodedPath.slice(tokenPrefix.length);
-				url.pathname = remainder;
-				pathTokenAuthenticated = true;
 			}
 		}
 
@@ -9142,6 +9159,10 @@ function generateHTML(备案内容, hasToken = false) {
 				return;
 			}
 
+			if (inputList && !inputList.value.trim() && history.length > 0) {
+				inputList.value = history[0];
+			}
+
 			history.forEach(function (item) {
 				const button = document.createElement('button');
 				button.type = 'button';
@@ -9898,7 +9919,14 @@ function generateHTML(备案内容, hasToken = false) {
 			}
 
 			const value = batchMode.checked ? normalizeBatchInputValue(inputList.value) : stripTargetLabel(inputList.value);
-			if (!value) return;
+			if (!value) {
+				if (inputList) {
+					inputList.focus();
+					inputList.classList.add('is-invalid');
+					setTimeout(function () { inputList.classList.remove('is-invalid'); }, 600);
+				}
+				return;
+			}
 
 			const lines = batchMode.checked
 				? uniqueTargets(normalizeBatchInputValue(value).split('\\n').map(function (line) { return line.trim(); }).filter(Boolean))
@@ -10118,17 +10146,18 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		async function checkTokenValidity(token) {
-			if (!token) return false;
+			if (!token) return { valid: false, status: 0 };
 			try {
 				const res = await fetch('/auth-check', {
 					headers: {
 						'Authorization': 'Bearer ' + token,
 						'X-Token': token
-					}
+					},
+					signal: AbortSignal.timeout(6000)
 				});
-				return res.ok;
+				return { valid: res.ok, status: res.status };
 			} catch (e) {
-				return false;
+				return { valid: true, status: 0, networkError: true };
 			}
 		}
 
@@ -10177,24 +10206,25 @@ function generateHTML(备案内容, hasToken = false) {
 				lockBtn.disabled = true;
 			}
 
-			const isValid = await checkTokenValidity(token);
+			const result = await checkTokenValidity(token);
 
 			if (lockBtn) {
 				lockBtn.textContent = '验证并解锁';
 				lockBtn.disabled = false;
 			}
 
-			if (isValid) {
+			if (result.valid) {
 				try {
 					localStorage.setItem('cf_proxy_token', token);
 				} catch (e) {}
 				updateTokenButtonState();
 				hideAuthLockOverlay();
 				closeTokenModal();
+				clusterNodesPromise = null;
 				loadClusterNodes();
 			} else {
 				if (errorMsg) {
-					errorMsg.textContent = 'Token 错误，请检查后重新输入';
+					errorMsg.textContent = result.networkError ? '网络连接超时，请重试' : 'Token 错误，请检查后重新输入';
 					errorMsg.classList.add('is-visible');
 				}
 				const input = document.getElementById('authLockInput');
@@ -10224,8 +10254,8 @@ function generateHTML(备案内容, hasToken = false) {
 				if (!saved) {
 					showAuthLockOverlay();
 				} else {
-					checkTokenValidity(saved).then(function (valid) {
-						if (!valid) {
+					checkTokenValidity(saved).then(function (result) {
+						if (!result.valid && result.status === 401) {
 							try { localStorage.removeItem('cf_proxy_token'); } catch (e) {}
 							updateTokenButtonState();
 							showAuthLockOverlay('本地保存的 Token 已失效，请重新输入');
@@ -10297,7 +10327,11 @@ function generateHTML(备案内容, hasToken = false) {
 		window.onload = function () {
 			initTokenManager();
 			renderHistory();
-			setModeVisuals(false);
+			if (batchMode && batchMode.checked) {
+				swapInputMode(true);
+			} else {
+				setModeVisuals(false);
+			}
 			bindInputShortcut();
 			renderDashboard();
 			updateResultFilters();
@@ -10308,7 +10342,8 @@ function generateHTML(备案内容, hasToken = false) {
 			const path = window.location.pathname.slice(1);
 			if (path && path.length > 3) {
 				const decodedPath = decodeURIComponent(path);
-				if (decodedPath !== 'resolve' && decodedPath !== 'favicon.ico') {
+				const isLikelyProxy = /^(socks5|http|https|turn|sstp):\/\//i.test(decodedPath) || /^[a-z0-9.-]+:\d+/i.test(decodedPath);
+				if (isLikelyProxy && decodedPath !== 'resolve' && decodedPath !== 'favicon.ico') {
 					inputList.value = decodedPath;
 					window.history.replaceState({}, '', '/');
 					checkBtn.click();

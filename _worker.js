@@ -287,20 +287,29 @@ export default {
 					return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers });
 				}
 
-				const inputs = uniqueStrings((Array.isArray(payload?.targets) ? payload.targets : (Array.isArray(payload?.proxyips) ? payload.proxyips : []))
+				const rawInputs = (Array.isArray(payload?.targets) ? payload.targets : (Array.isArray(payload?.proxyips) ? payload.proxyips : []))
 					.map(value => String(value || '').trim())
-					.filter(Boolean));
+					.filter(Boolean);
 
-				if (!inputs.length) return new Response(JSON.stringify({ error: 'Missing targets' }), { status: 400, headers });
-				if (inputs.length > RESOLVE_BATCH_LIMIT) return new Response(JSON.stringify({ error: `Resolve batch limit is ${RESOLVE_BATCH_LIMIT}` }), { status: 400, headers });
+				if (!rawInputs.length) return new Response(JSON.stringify({ error: 'Missing targets' }), { status: 400, headers });
+				if (rawInputs.length > RESOLVE_BATCH_LIMIT) return new Response(JSON.stringify({ error: `Resolve batch limit is ${RESOLVE_BATCH_LIMIT}` }), { status: 400, headers });
 
-				const results = await Promise.all(inputs.map(async input => {
-					try {
-						return { input, targets: await handleResolve(input) };
-					} catch (error) {
-						return { input, targets: [], error: error.message };
-					}
-				}));
+				const resolveCache = new Map();
+				const uniqueList = uniqueStrings(rawInputs);
+				const concurrency = 8;
+				for (let i = 0; i < uniqueList.length; i += concurrency) {
+					const slice = uniqueList.slice(i, i + concurrency);
+					await Promise.all(slice.map(async input => {
+						try {
+							const targets = await handleResolve(input);
+							resolveCache.set(input, { input, targets });
+						} catch (error) {
+							resolveCache.set(input, { input, targets: [], error: error.message });
+						}
+					}));
+				}
+
+				const results = rawInputs.map(input => resolveCache.get(input) || { input, targets: [] });
 
 				return new Response(JSON.stringify({ results }, null, 2), { headers });
 			}
@@ -6955,7 +6964,7 @@ function generateHTML(备案内容, hasToken = false) {
 		let clusterNodesPromise = null;
 		const CHECK_CONCURRENCY = 32;
 		const RESOLVE_BATCH_SIZE = 50;
-		const RESOLVE_BATCH_TIMEOUT_MS = 5000;
+		const RESOLVE_BATCH_TIMEOUT_MS = 15000;
 		const RESOLVE_BATCH_MAX_ATTEMPTS = 2;
 		const RISK_RESULT_FILTERS = [
 			{ key: 'verylow', label: '极度纯净' },
@@ -7317,6 +7326,7 @@ function generateHTML(备案内容, hasToken = false) {
 		function reportNodeSuccess(nodeUrl) {
 			if (!nodeUrl) return;
 			nodeFailures.delete(nodeUrl);
+			nodeCooldownUntil.delete(nodeUrl);
 		}
 
 		let clusterNodeTokens = {};
@@ -7343,6 +7353,7 @@ function generateHTML(备案内容, hasToken = false) {
 					}
 				} catch (e) {
 					// Standalone worker mode
+					clusterNodesPromise = null;
 				}
 				// 动态加载自定义源
 				try {
@@ -8259,7 +8270,11 @@ function generateHTML(备案内容, hasToken = false) {
 			async function runNext() {
 				while (nextIndex < items.length && !isRunStopped(run)) {
 					const currentIndex = nextIndex++;
-					await worker(items[currentIndex], currentIndex);
+					try {
+						await worker(items[currentIndex], currentIndex);
+					} catch (taskErr) {
+						console.error('Worker task execution error for item', currentIndex, taskErr);
+					}
 				}
 			}
 
@@ -9130,14 +9145,18 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function saveHistory(value) {
 			if (!value || value.includes('\\n')) return;
-			let history = getHistory();
-			history = history.filter(function (item) {
-				return item !== value;
-			});
-			history.unshift(value);
-			history = history.slice(0, 10);
-			localStorage.setItem('cf_proxy_history', JSON.stringify(history));
-			renderHistory();
+			try {
+				let history = getHistory();
+				history = history.filter(function (item) {
+					return item !== value;
+				});
+				history.unshift(value);
+				history = history.slice(0, 10);
+				localStorage.setItem('cf_proxy_history', JSON.stringify(history));
+				renderHistory();
+			} catch (e) {
+				console.warn('Failed to save history to localStorage', e);
+			}
 		}
 
 		function selectHistory(value) {
@@ -9558,8 +9577,13 @@ function generateHTML(备案内容, hasToken = false) {
 			itemObj = itemObj || addResultItem(target);
 			const resultRecord = itemObj.record;
 			const currentSource = getSelectedIpSource();
+			let isCounted = false;
 
 			try {
+				if (clusterNodesPromise) {
+					try { await clusterNodesPromise; } catch (e) {}
+				}
+
 				let result = null;
 				let attempts = 0;
 				const maxAttempts = (clusterNodes && clusterNodes.length > 1) ? Math.min(clusterNodes.length + 1, 3) : 2;
@@ -9583,36 +9607,39 @@ function generateHTML(备案内容, hasToken = false) {
 					}
 
 					const nodeToken = chosenNode ? clusterNodeTokens[baseUrl] : '';
-					const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken ? '&token=' + encodeURIComponent(nodeToken) : '');
 					let isNodeFailure = false;
-					try {
-						result = await fetchJsonWithTimeout(checkUrl, {}, 30000, run?.controller.signal);
-						const status = result?.response?.status;
-						// 如果遇到 429、1015 或 1027，该子节点超限，将其标记熔断并重试下一个节点
-						if (chosenNode && (status === 429 || status === 1015 || status === 1027)) {
-							reportNodeFailure(chosenNode, true);
-							continue;
-						}
-						// 如果子节点返回 500/502/503/52x 或 401/403 鉴权异常，标记节点故障并进入 Relay 或轮换
-						if (chosenNode && (!result?.response?.ok && (status >= 500 || status === 401 || status === 403))) {
-							reportNodeFailure(chosenNode, false);
-							isNodeFailure = true;
-						} else {
-							if (chosenNode && result?.response?.ok) {
-								reportNodeSuccess(chosenNode);
-							}
-							break;
-						}
-					} catch (networkErr) {
-						// 优先响应停止信号，严禁将手动停止误记为节点故障！
-						if (isRunStopped(run)) throw networkErr;
-						if (chosenNode) {
-							reportNodeFailure(chosenNode, false);
-						}
+
+					// 若 Token 为脱敏的 '***'，直接走 Relay，杜绝带 '***' 直连被 403 封锁
+					if (nodeToken === '***') {
 						isNodeFailure = true;
+					} else {
+						const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken ? '&token=' + encodeURIComponent(nodeToken) : '');
+						try {
+							result = await fetchJsonWithTimeout(checkUrl, {}, 12000, run?.controller.signal);
+							const status = result?.response?.status;
+							if (chosenNode && (status === 429 || status === 1015 || status === 1027)) {
+								reportNodeFailure(chosenNode, true);
+								continue;
+							}
+							if (chosenNode && (!result?.response?.ok && (status >= 500 || status === 401 || status === 403))) {
+								reportNodeFailure(chosenNode, false);
+								isNodeFailure = true;
+							} else {
+								if (chosenNode && result?.response?.ok) {
+									reportNodeSuccess(chosenNode);
+								}
+								break;
+							}
+						} catch (networkErr) {
+							if (isRunStopped(run)) throw networkErr;
+							if (chosenNode) {
+								reportNodeFailure(chosenNode, false);
+							}
+							isNodeFailure = true;
+						}
 					}
 
-					// 若直连从节点失败（网络异常、CORS 或 50x 服务端故障），且属于跨域节点，尝试通过主 Worker 的 Relay 隧道转发
+					// 若直连从节点失败，且属于跨域节点，尝试通过主 Worker 的 Relay 隧道转发
 					if (isNodeFailure && chosenNode && baseUrl) {
 						let isCrossDomain = false;
 						try {
@@ -9624,7 +9651,7 @@ function generateHTML(备案内容, hasToken = false) {
 						if (isCrossDomain) {
 							try {
 								const relayUrl = '/api/cluster/relay?node=' + encodeURIComponent(baseUrl) + '&proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken && nodeToken !== '***' ? '&token=' + encodeURIComponent(nodeToken) : '');
-								const relayResult = await fetchJsonWithTimeout(relayUrl, {}, 30000, run?.controller.signal);
+								const relayResult = await fetchJsonWithTimeout(relayUrl, {}, 12000, run?.controller.signal);
 								if (relayResult?.response?.ok && relayResult?.payload && !String(relayResult.payload?.error || '').startsWith('Relay failed')) {
 									result = relayResult;
 									reportNodeSuccess(chosenNode);
@@ -9632,17 +9659,15 @@ function generateHTML(备案内容, hasToken = false) {
 								}
 							} catch (relayErr) {
 								if (isRunStopped(run)) throw relayErr;
-								// Relay 失败则继续正常重试/轮换
 							}
 						}
 					}
 
 					if (attempts >= maxAttempts) {
 						if (!pureClusterMode && baseUrl) {
-							// 最后一次尝试本地 Worker
 							try {
 								const fallbackUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
-								result = await fetchJsonWithTimeout(fallbackUrl, {}, 30000, run?.controller.signal);
+								result = await fetchJsonWithTimeout(fallbackUrl, {}, 12000, run?.controller.signal);
 								break;
 							} catch (fallbackErr) {
 								if (isRunStopped(run)) throw fallbackErr;
@@ -9665,7 +9690,6 @@ function generateHTML(备案内容, hasToken = false) {
 						data.error = httpError;
 					}
 				}
-				completedCount++;
 
 				if (data.success) {
 					successCount++;
@@ -9742,7 +9766,6 @@ function generateHTML(备案内容, hasToken = false) {
 					scheduleUpdateResultFilters();
 					return;
 				}
-				completedCount++;
 				const errText = error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常');
 				const errDiag = classifyCheckError(errText);
 				const errInfo = {
@@ -9762,10 +9785,14 @@ function generateHTML(备案内容, hasToken = false) {
 					buildMetaChip(errDiag.category || '请求异常', 'error', 'meta-chip-danger') +
 					buildMetaChip(errText, 'retry');
 				itemObj.exitList.innerHTML = '';
+			} finally {
+				if (!isRunStopped(run) && !isCounted) {
+					isCounted = true;
+					completedCount++;
+					updateProgress();
+					scheduleUpdateResultFilters();
+				}
 			}
-
-			updateProgress();
-			scheduleUpdateResultFilters();
 		}
 
 		function showDetails(button, exitData) {
@@ -10115,6 +10142,8 @@ function generateHTML(备案内容, hasToken = false) {
 			} catch (e) {}
 			updateTokenButtonState();
 			closeTokenModal();
+			clusterNodesPromise = null;
+			loadClusterNodes();
 		}
 
 		function clearToken() {
@@ -10324,15 +10353,19 @@ function generateHTML(备案内容, hasToken = false) {
 			});
 		}
 
-		window.onload = function () {
+		let isAppBootstrapped = false;
+		function bootstrapApp() {
+			if (isAppBootstrapped) return;
+			isAppBootstrapped = true;
+
 			initTokenManager();
 			renderHistory();
 			if (batchMode && batchMode.checked) {
 				swapInputMode(true);
 			} else {
 				setModeVisuals(false);
+				bindInputShortcut();
 			}
-			bindInputShortcut();
 			renderDashboard();
 			updateResultFilters();
 			loadCfLocations();
@@ -10349,7 +10382,14 @@ function generateHTML(备案内容, hasToken = false) {
 					checkBtn.click();
 				}
 			}
-		};
+		}
+
+		if (document.readyState === 'loading') {
+			document.addEventListener('DOMContentLoaded', bootstrapApp);
+		} else {
+			bootstrapApp();
+		}
+		window.addEventListener('load', bootstrapApp);
 	</script>
 	<!-- Token 配置模态弹窗 -->
 	<div class="token-modal-backdrop" id="tokenModalBackdrop" aria-hidden="true">

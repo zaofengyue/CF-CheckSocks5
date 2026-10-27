@@ -4,7 +4,7 @@ const CHECK_TIMEOUT_MS = 12000;
 const CONNECT_TIMEOUT_MS = 9999;
 const READ_TIMEOUT_MS = 8000;
 const MAX_RESPONSE_BYTES = 96 * 1024;
-const RESOLVE_BATCH_LIMIT = 50;
+const RESOLVE_BATCH_LIMIT = 20;
 const PROXY_TYPES = ['socks5', 'http', 'https', 'turn', 'sstp'];
 const DEFAULT_PORTS = {
 	socks5: 1080,
@@ -588,6 +588,9 @@ class BufferedReader {
 
 async function checkProxyCore(rawProxy, colo, source) {
   const p = parseProxyUrl(rawProxy);
+  if (p.proto !== 'socks5' && p.proto !== 'http') {
+    throw new Error('Sub-worker currently only supports direct socks5 and http testing; please use master relay');
+  }
   const startTime = Date.now();
 
   let targetHost = 'iplocate.io';
@@ -681,6 +684,9 @@ async function checkProxyCore(rawProxy, colo, source) {
     const lat = exitData.latitude || exitData.location?.latitude || null;
     const lon = exitData.longitude || exitData.location?.longitude || null;
 
+    if (!exitData.ip || exitData.ip === 'Unknown') {
+      throw new Error('Target lookup failed: could not extract exit IP');
+    }
     return {
       success: true,
       candidate: p.host + ':' + p.port,
@@ -818,14 +824,17 @@ async function getCachedKV(kv, subKey, type = 'json', fallback = null) {
 			}
 		} catch (e) {
 			const currentEntry = kvSectionCache[subKey];
-			if (!currentEntry || currentEntry.exp <= Date.now()) {
-				kvSectionCache[subKey] = {
-					val: safeClone(fallback),
-					exp: Date.now() + ERROR_CACHE_TTL_MS,
-					lastUpdated: Date.now()
-				};
+			if (currentEntry && currentEntry.val !== undefined && currentEntry.val !== null) {
+				// 容灾保护：KV 发生超时或异常时，保留并沿用上一次已有的缓存有效值（延长 2 秒错误缓存窗口），绝不覆写为空 fallback
+				currentEntry.exp = Date.now() + ERROR_CACHE_TTL_MS;
+				return safeClone(currentEntry.val);
 			}
-			return fallback;
+			kvSectionCache[subKey] = {
+				val: safeClone(fallback),
+				exp: Date.now() + ERROR_CACHE_TTL_MS,
+				lastUpdated: Date.now()
+			};
+			return safeClone(fallback);
 		} finally {
 			kvInflightPromises.delete(inflightKey);
 		}
@@ -1363,7 +1372,7 @@ async function handleAdminAPI(request, url, env, origin) {
 					...nextWorkers[existingIndex],
 					name: nodeDisplayName,
 					url: targetUrl,
-					token: nextWorkers[existingIndex].token || nodeToken,
+					token: nodeToken || nextWorkers[existingIndex].token,
 					enabled: true
 				};
 				nextWorkers[existingIndex] = savedNode;
@@ -1917,7 +1926,8 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_proxy: false,
 					is_vpn: false,
 					is_tor: false,
-					is_abuser: false
+					is_abuser: false,
+					has_risk_data: false
 				};
 			} else if (selectedSource === 'hackmyip' || selectedSource === 'hack_my_ip') {
 				let raw;
@@ -1970,7 +1980,8 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_tor: false,
 					is_abuser: abuserScore && abuserScore > 50,
 					risk_score: abuserScore,
-					risk_grade: riskGrade
+					risk_grade: riskGrade,
+					has_risk_data: true
 				};
 			} else if (selectedSource === 'ip2location' || selectedSource === 'ip2location_io') {
 				let raw;
@@ -2011,7 +2022,8 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_proxy: isProxy,
 					is_vpn: false,
 					is_tor: false,
-					is_abuser: false
+					is_abuser: false,
+					has_risk_data: true
 				};
 			} else if (selectedSource === 'ipapi_is' || selectedSource === 'ipapiis' || selectedSource === 'ipapi') {
 				let raw;
@@ -2164,6 +2176,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 						is_vpn: raw.privacy?.is_vpn || false,
 						is_tor: raw.privacy?.is_tor || false,
 						is_abuser: raw.privacy?.is_abuser || false,
+						has_risk_data: Boolean(raw.privacy),
 					};
 				}
 			}
@@ -3608,16 +3621,22 @@ async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-
 			});
 			if (!response.ok) continue;
 			const payload = await response.json();
-			if (!Array.isArray(payload.Answer)) continue;
-			const answers = payload.Answer.map(answer => ({
-				name: answer.name || name,
-				type: answer.type,
-				TTL: answer.TTL,
-				data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
-			}));
-			if (answers.length > 0) return answers;
+			// Status 0 为 NOERROR (解析成功，无该类型记录属于合法空结果)；Status 3 为 NXDOMAIN (域名不存在)
+			// 仅当遭遇网络异常、HTTP非200或 SERVFAIL (Status 2) 时才回退至备用提供商，绝不因无 AAAA 记录误耗子请求
+			if (payload && (payload.Status === 0 || payload.Status === 3)) {
+				if (!Array.isArray(payload.Answer) || payload.Answer.length === 0) {
+					return [];
+				}
+				return payload.Answer.map(answer => ({
+					name: answer.name || name,
+					type: answer.type,
+					TTL: answer.TTL,
+					data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
+				}));
+			}
+			continue;
 		} catch (error) {
-			// 回退到备用 DoH 提供商
+			// 网络异常回退到备用 DoH 提供商
 		}
 	}
 	return [];
@@ -6963,7 +6982,7 @@ function generateHTML(备案内容, hasToken = false) {
 		let clusterRoundRobinIndex = 0;
 		let clusterNodesPromise = null;
 		const CHECK_CONCURRENCY = 32;
-		const RESOLVE_BATCH_SIZE = 50;
+		const RESOLVE_BATCH_SIZE = 20;
 		const RESOLVE_BATCH_TIMEOUT_MS = 15000;
 		const RESOLVE_BATCH_MAX_ATTEMPTS = 2;
 		const RISK_RESULT_FILTERS = [
@@ -7479,29 +7498,41 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function calculateExitRiskScore(exitData) {
 			if (!exitData || !exitData.ip) return null;
+			if (exitData?.has_risk_data === false) return null;
 			if (exitData?.risk_score !== undefined && exitData?.risk_score !== null) {
 				const directScore = parseAbuseScore(exitData.risk_score);
 				if (directScore !== null) {
 					return directScore / 100;
 				}
 			}
+			const hasCompanyScore = exitData?.company?.abuser_score !== undefined;
+			const hasAsnScore = exitData?.asnInfo?.abuser_score !== undefined;
 			const companyScore = parseAbuseScore(exitData?.company?.abuser_score) || 0;
 			const asnScore = parseAbuseScore(exitData?.asnInfo?.abuser_score) || 0;
 			const baseScore = ((companyScore + asnScore) / 2) * 5;
-			const riskCount = [
+
+			const riskFlags = [
 				exitData?.is_crawler,
 				exitData?.is_proxy,
 				exitData?.is_vpn,
 				exitData?.is_tor,
 				exitData?.is_abuser
-			].filter(function (flag) {
-				return flag === true;
-			}).length;
-			let finalScore = baseScore + riskCount * 0.15;
-			if (exitData?.is_datacenter && !exitData?.is_proxy && !exitData?.is_vpn) {
-				finalScore += 0.05; // 普通机房出口给予 5% 轻微风险提示
+			];
+			const riskCount = riskFlags.filter(flag => flag === true).length;
+			const isDatacenter = exitData?.is_datacenter === true;
+			const isBogon = exitData?.is_bogon === true;
+
+			// 若没有提供任何风险评分、也没有任何阳性风控标记，且属于无风控源，则返回 null（恢复显示“未知”，绝不误报“极度纯净”）
+			const hasAnyPositiveRisk = riskCount > 0 || isDatacenter || isBogon || hasCompanyScore || hasAsnScore;
+			if (!hasAnyPositiveRisk && exitData?.has_risk_data !== true) {
+				return null;
 			}
-			if (exitData?.is_bogon) finalScore += 1.0;
+
+			let finalScore = baseScore + riskCount * 0.15;
+			if (isDatacenter && !exitData?.is_proxy && !exitData?.is_vpn) {
+				finalScore += 0.05;
+			}
+			if (isBogon) finalScore += 1.0;
 			return Math.min(Math.max(finalScore, 0), 1.0);
 		}
 
@@ -10375,7 +10406,7 @@ function generateHTML(备案内容, hasToken = false) {
 			const path = window.location.pathname.slice(1);
 			if (path && path.length > 3) {
 				const decodedPath = decodeURIComponent(path);
-				const isLikelyProxy = /^(socks5|http|https|turn|sstp):\/\//i.test(decodedPath) || /^[a-z0-9.-]+:\d+/i.test(decodedPath);
+				const isLikelyProxy = /^(socks5|http|https|turn|sstp):\\/\\//i.test(decodedPath) || /^[a-z0-9.-]+:\\d+/i.test(decodedPath);
 				if (isLikelyProxy && decodedPath !== 'resolve' && decodedPath !== 'favicon.ico') {
 					inputList.value = decodedPath;
 					window.history.replaceState({}, '', '/');

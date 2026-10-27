@@ -4,7 +4,7 @@ const CHECK_TIMEOUT_MS = 12000;
 const CONNECT_TIMEOUT_MS = 9999;
 const READ_TIMEOUT_MS = 8000;
 const MAX_RESPONSE_BYTES = 96 * 1024;
-const RESOLVE_BATCH_LIMIT = 20;
+const RESOLVE_BATCH_LIMIT = 50;
 const PROXY_TYPES = ['socks5', 'http', 'https', 'turn', 'sstp'];
 const DEFAULT_PORTS = {
 	socks5: 1080,
@@ -163,20 +163,13 @@ export default {
 				if (!inputs.length) return new Response(JSON.stringify({ error: 'Missing targets' }), { status: 400, headers });
 				if (inputs.length > RESOLVE_BATCH_LIMIT) return new Response(JSON.stringify({ error: `Resolve batch limit is ${RESOLVE_BATCH_LIMIT}` }), { status: 400, headers });
 
-				const results = new Array(inputs.length);
-				let resolveIdx = 0;
-				const resolveWorkers = Array.from({ length: Math.min(8, inputs.length) }, async () => {
-					while (resolveIdx < inputs.length) {
-						const curr = resolveIdx++;
-						const input = inputs[curr];
-						try {
-							results[curr] = { input, targets: await handleResolve(input) };
-						} catch (error) {
-							results[curr] = { input, targets: [], error: error.message };
-						}
+				const results = await Promise.all(inputs.map(async input => {
+					try {
+						return { input, targets: await handleResolve(input) };
+					} catch (error) {
+						return { input, targets: [], error: error.message };
 					}
-				});
-				await Promise.all(resolveWorkers);
+				}));
 
 				return new Response(JSON.stringify({ results }, null, 2), { headers });
 			}
@@ -861,21 +854,12 @@ async function socks5Connect(proxy, targetHost, targetPort) {
 			throw new Error(`SOCKS5 unsupported auth method: ${selectedMethod}`);
 		}
 
-		const cleanHost = stripIPv6Brackets(targetHost);
-		let connectPacket;
-		if (isIPv4(cleanHost)) {
-			const parts = cleanHost.split('.').map(Number);
-			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x01, ...parts, targetPort >> 8, targetPort & 0xff]);
-		} else {
-			const hostBytes = encoder.encode(cleanHost);
-			if (hostBytes.byteLength > 255) throw new Error('Target hostname is too long for SOCKS5');
-			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
-		}
+		const hostBytes = encoder.encode(targetHost);
+		if (hostBytes.byteLength > 255) throw new Error('Target hostname is too long for SOCKS5');
+		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
 		await writer.write(connectPacket);
 		response = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
-		if (response.done || !response.value || response.value.byteLength < 2 || response.value[1] !== 0x00) {
-			throw new Error(`SOCKS5 connection failed: ${response.value?.[1] ?? 'closed'}`);
-		}
+		if (response.done || response.value[1] !== 0x00) throw new Error(`SOCKS5 connection failed: ${response.value?.[1] ?? 'closed'}`);
 
 		writer.releaseLock();
 		reader.releaseLock();
@@ -1860,8 +1844,7 @@ function normalizeTxtValue(value) {
 async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-query') {
 	try {
 		const response = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`, {
-			headers: { accept: 'application/dns-json' },
-			signal: AbortSignal.timeout(3500)
+			headers: { accept: 'application/dns-json' }
 		});
 		if (!response.ok) return [];
 		const payload = await response.json();
@@ -4964,7 +4947,7 @@ function generateHTML(备案内容, hasToken = false) {
 		let appState = 'idle';
 		let activeRun = null;
 		const CHECK_CONCURRENCY = 32;
-		const RESOLVE_BATCH_SIZE = 20;
+		const RESOLVE_BATCH_SIZE = 50;
 		const RESOLVE_BATCH_TIMEOUT_MS = 20000;
 		const RESOLVE_BATCH_MAX_ATTEMPTS = 3;
 		const RISK_RESULT_FILTERS = [
@@ -6123,11 +6106,7 @@ function generateHTML(备案内容, hasToken = false) {
 			async function runNext() {
 				while (nextIndex < items.length && !isRunStopped(run)) {
 					const currentIndex = nextIndex++;
-					try {
-						await worker(items[currentIndex], currentIndex);
-					} catch (workerErr) {
-						console.error('Task error in concurrency runner:', workerErr);
-					}
+					await worker(items[currentIndex], currentIndex);
 				}
 			}
 
@@ -6671,7 +6650,7 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function getExportableRecords() {
 			return getCurrentFilteredRecords().filter(function (record) {
-				return Boolean(record && (record.data || record.target));
+				return record.status === 'success' && Boolean(record.data);
 			});
 		}
 
@@ -6738,15 +6717,14 @@ function generateHTML(备案内容, hasToken = false) {
 			return candidates[0] || null;
 		}
 
-		function getTextExportTarget(data, record) {
+		function getTextExportTarget(data) {
 			const link = normalizeExportValue(data?.link).split('#')[0].trim();
 			if (link) return link;
-			if (record?.target) return record.target;
 
 			const proxyIP = normalizeExportValue(data?.proxyIP);
 			const portRemote = normalizeExportValue(data?.portRemote);
 			if (!proxyIP || !portRemote) {
-				return normalizeExportValue(data?.rawValue) || '';
+				return '';
 			}
 
 			const type = normalizeProxyType(data?.type) || 'socks5';
@@ -6771,15 +6749,9 @@ function generateHTML(备案内容, hasToken = false) {
 			return riskText && riskText !== '未知' ? '[' + riskText + ']' : '';
 		}
 
-		function buildTextExportLine(record) {
-			const data = record?.data;
-			const exportTarget = getTextExportTarget(data, record);
+		function buildTextExportLine(data) {
+			const exportTarget = getTextExportTarget(data);
 			if (!exportTarget) return '';
-
-			if (record?.status === 'error' || data?.success === false) {
-				const errMsg = normalizeExportValue(data?.error || data?.message || '检测失败');
-				return exportTarget + ' #[检测失败: ' + errMsg + ']';
-			}
 
 			const exitData = getPreferredTextExportProbe(data)?.exit || {};
 			const country = normalizeExportValue(exitData.country);
@@ -6794,8 +6766,8 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function buildTextExport(records) {
 			return records.map(function (record) {
-				return buildTextExportLine(record);
-			}).filter(Boolean).join('\n');
+				return buildTextExportLine(record.data);
+			}).filter(Boolean).join('\\n');
 		}
 
 		function escapeCsvValue(value) {
@@ -6811,29 +6783,11 @@ function generateHTML(备案内容, hasToken = false) {
 				return escapeCsvValue(column.header);
 			}).join(',');
 			const rows = records.map(function (record) {
-				const isSuccess = record.status === 'success';
-				let parsedTarget = null;
-				try {
-					parsedTarget = parseProxyUrl(record?.target || record?.data?.link || '');
-				} catch (e) {}
-
-				const fallbackData = Object.assign({}, record?.data || {}, {
-					status: isSuccess ? '成功' : '失败',
-					error: isSuccess ? '' : normalizeExportValue(record?.data?.error || '检测失败'),
-					type: record?.proxyType || record?.data?.type || parsedTarget?.scheme || '',
-					link: record?.target || record?.data?.link || '',
-					hostname: record?.data?.hostname || parsedTarget?.hostPlain || parsedTarget?.hostname || '',
-					port: record?.data?.port || parsedTarget?.port || '',
-					username: record?.data?.username || parsedTarget?.username || '',
-					password: record?.data?.password || parsedTarget?.password || ''
-				});
-				if (!fallbackData.status) fallbackData.status = isSuccess ? '成功' : '失败';
-
 				return EXPORT_CSV_COLUMNS.map(function (column) {
-					return escapeCsvValue(getNestedExportValue(fallbackData, column.path));
+					return escapeCsvValue(getNestedExportValue(record?.data, column.path));
 				}).join(',');
 			});
-			return [headerLine].concat(rows).join('\n');
+			return [headerLine].concat(rows).join('\\n');
 		}
 
 		function padExportDatePart(value) {
@@ -6994,11 +6948,7 @@ function generateHTML(备案内容, hasToken = false) {
 			});
 			history.unshift(value);
 			history = history.slice(0, 10);
-			try {
-				localStorage.setItem('cf_proxy_history', JSON.stringify(history));
-			} catch (e) {
-				console.warn('Failed to save history to localStorage:', e);
-			}
+			localStorage.setItem('cf_proxy_history', JSON.stringify(history));
 			renderHistory();
 		}
 
@@ -7356,7 +7306,7 @@ function generateHTML(备案内容, hasToken = false) {
 			const resultRecord = itemObj.record;
 
 			try {
-				const result = await fetchJsonWithTimeout('/check?proxy=' + encodeURIComponent(target), {}, 12000, run?.controller.signal);
+				const result = await fetchJsonWithTimeout('/check?proxy=' + encodeURIComponent(target), {}, 30000, run?.controller.signal);
 				const data = normalizeCheckDataForUi(result.payload || {
 					success: false,
 					error: '检测接口没有返回有效 JSON'
@@ -7440,11 +7390,7 @@ function generateHTML(备案内容, hasToken = false) {
 					return;
 				}
 				completedCount++;
-				const errInfo = {
-					success: false,
-					error: error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常')
-				};
-				updateResultRecordAsError(resultRecord, errInfo);
+				updateResultRecordAsError(resultRecord, null);
 				itemObj.el.className = 'result-item error';
 				updateResultFlag(itemObj, '');
 				itemObj.badge.className = 'status-badge status-error';
@@ -7614,12 +7560,7 @@ function generateHTML(备案内容, hasToken = false) {
 			}
 
 			const value = batchMode.checked ? normalizeBatchInputValue(inputList.value) : stripTargetLabel(inputList.value);
-			if (!value) {
-				inputList.focus();
-				inputList.classList.add('is-invalid');
-				setTimeout(function () { inputList.classList.remove('is-invalid'); }, 600);
-				return;
-			}
+			if (!value) return;
 
 			const lines = batchMode.checked
 				? uniqueTargets(normalizeBatchInputValue(value).split('\\n').map(function (line) { return line.trim(); }).filter(Boolean))
@@ -7974,11 +7915,7 @@ function generateHTML(备案内容, hasToken = false) {
 			});
 		}
 
-		let isAppBootstrapped = false;
-		function bootstrapApp() {
-			if (isAppBootstrapped) return;
-			isAppBootstrapped = true;
-
+		window.onload = function () {
 			initTokenManager();
 			renderHistory();
 			setModeVisuals(false);
@@ -7991,21 +7928,13 @@ function generateHTML(备案内容, hasToken = false) {
 			const path = window.location.pathname.slice(1);
 			if (path && path.length > 3) {
 				const decodedPath = decodeURIComponent(path);
-				const isLikelyProxy = /^(socks5|http|https|turn|sstp):\\/\\//i.test(decodedPath) || /^[\\w.-]+:\\d{1,5}$/.test(decodedPath);
-				if (isLikelyProxy && decodedPath !== 'resolve' && decodedPath !== 'favicon.ico') {
+				if (decodedPath !== 'resolve' && decodedPath !== 'favicon.ico') {
 					inputList.value = decodedPath;
 					window.history.replaceState({}, '', '/');
 					checkBtn.click();
 				}
 			}
-		}
-
-		if (document.readyState === 'loading') {
-			document.addEventListener('DOMContentLoaded', bootstrapApp);
-		} else {
-			bootstrapApp();
-		}
-		window.addEventListener('load', bootstrapApp);
+		};
 	</script>
 	<!-- Token 配置模态弹窗 -->
 	<div class="token-modal-backdrop" id="tokenModalBackdrop" aria-hidden="true">

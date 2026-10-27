@@ -17,7 +17,33 @@ const DEFAULT_PORTS = {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-const DEFAULT_BEIAN_CONTENT = `© 2025 - 2026 Check Socks5 · 基于 <a href="https://github.com/zaofengyue/CF-CheckSocks5/tree/main" target="_blank" rel="noreferrer">Cloudflare Workers 构建与运行</a> · 站点维护：<a href="https://github.com/zaofengyue/CF-CheckSocks5/tree/main" target="_blank" rel="noreferrer">zaofengyue</a>`;
+const DEFAULT_BEIAN_CONTENT = `© 2025 - 2026 Check Socks5 · 基于 <a href="https://github.com/zaofengyue/CF-CheckSocks5/tree/main" target="_blank" rel="noreferrer">Cloudflare Workers 构建与运行</a> · 今日访问人数：<span id="visit-count">···</span> · 站点维护：<a href="https://github.com/zaofengyue/CF-CheckSocks5/tree/main" target="_blank" rel="noreferrer">zaofengyue</a>
+<script>
+(function () {
+	const visitCountElement = document.getElementById('visit-count');
+	if (!visitCountElement) return;
+
+	const hostname = String(window.location.hostname || window.location.host || '').trim().toLowerCase();
+	const statsId = hostname || 'unknown-host';
+
+	fetch('https://tongji.090227.xyz/?id=' + encodeURIComponent(statsId))
+		.then(function (response) {
+			if (!response.ok) throw new Error('Failed to load visit count: ' + response.status);
+			return response.json();
+		})
+		.then(function (data) {
+			if (data && data.visitCount !== undefined) {
+				visitCountElement.textContent = data.visitCount;
+				return;
+			}
+			throw new Error('visitCount is missing in response');
+		})
+		.catch(function (error) {
+			console.error('Failed to fetch visit count', error);
+			visitCountElement.textContent = '加载失败';
+		});
+})();
+</script>`;
 
 export default {
 	async fetch(request, env, ctx) {
@@ -190,8 +216,7 @@ export default {
 						error: 'Missing proxy parameter. Use /check?socks5=host:port, /check?http=host:port, /check?https=host:port, /check?turn=host:port, /check?sstp=host:port or /check?proxy=socks5://host:port'
 					}, { status: 400, origin });
 				}
-				const source = url.searchParams.get('source') || 'iplocate';
-				const result = await checkProxy(checkParams, request.cf?.colo ?? null, source);
+				const result = await checkProxy(checkParams, request.cf?.colo ?? null);
 				return jsonResponse(result, { origin });
 			} else if (url.pathname === '/locations') return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 
@@ -312,9 +337,6 @@ async function checkProxy({ type, value }, colo) {
 	let tunnel = null;
 	const targetHost = 'www.iplocate.io';
 	const targetPort = 443;
-	const requestPath = '/api/lookup';
-	const acceptHeader = 'application/json';
-	const serverName = 'www.iplocate.io';
 
 	try {
 		let tunnelPromise;
@@ -334,19 +356,18 @@ async function checkProxy({ type, value }, colo) {
 
 		tunnel = await withTimeout(tunnelPromise, CHECK_TIMEOUT_MS, 'Proxy connection timed out');
 		const tlsSocket = new TlsClient(tunnel, {
-			serverName: stripIPv6Brackets(serverName),
+			serverName: stripIPv6Brackets(targetHost),
 			timeout: READ_TIMEOUT_MS,
 			allowChacha: true
 		});
 		let exit;
 		try {
 			await withTimeout(tlsSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
-			const httpHostHeader = targetHost === '1.1.1.1' ? 'cloudflare.com' : targetHost;
 			await tlsSocket.write(encoder.encode([
-				`GET ${requestPath} HTTP/1.1`,
-				`Host: ${httpHostHeader}`,
+				'GET /api/lookup HTTP/1.1',
+				`Host: ${targetHost}`,
 				'User-Agent: Mozilla/5.0 CF-Workers-CheckProxy/2.0',
-				`Accept: ${acceptHeader}`,
+				'Accept: application/json',
 				'Connection: close',
 				'',
 				''
@@ -378,7 +399,7 @@ async function checkProxy({ type, value }, colo) {
 			const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d+)/i);
 			const statusCode = statusMatch ? Number(statusMatch[1]) : NaN;
 			if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) {
-				throw new Error(`Target ${targetHost} request failed: ${statusLine || 'invalid status'}`);
+				throw new Error(`Target /api/lookup request failed: ${statusLine || 'invalid status'}`);
 			}
 
 			let bodyBytes = responseBuffer.slice(headerEndIndex);
@@ -403,7 +424,6 @@ async function checkProxy({ type, value }, colo) {
 				bodyText = output || bodyText;
 			}
 
-			let exit;
 			try {
 				exit = JSON.parse(bodyText.trim());
 			} catch (error) {
@@ -415,8 +435,8 @@ async function checkProxy({ type, value }, colo) {
 				...exit,
 				asn: exit.asn ? {
 					...exit.asn,
-					org: exit.asn.name || exit.asn.org,
-					descr: exit.asn.name || exit.asn.descr,
+					org: exit.asn.name,
+					descr: exit.asn.name,
 				} : exit.asn,
 				rir: exit.asn?.rir || null,
 				is_datacenter: exit.privacy?.is_hosting || false,
@@ -1843,12 +1863,7 @@ async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-
 			headers: { accept: 'application/dns-json' },
 			signal: AbortSignal.timeout(3500)
 		});
-		if (!response.ok) {
-			if (endpoint.includes('cloudflare-dns.com')) {
-				return DoH查询(name, type, 'https://dns.google/resolve');
-			}
-			return [];
-		}
+		if (!response.ok) return [];
 		const payload = await response.json();
 		if (!Array.isArray(payload.Answer)) return [];
 		return payload.Answer.map(answer => ({
@@ -1858,13 +1873,6 @@ async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-
 			data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
 		}));
 	} catch (error) {
-		if (endpoint.includes('cloudflare-dns.com')) {
-			try {
-				return await DoH查询(name, type, 'https://dns.google/resolve');
-			} catch (e) {
-				return [];
-			}
-		}
 		return [];
 	}
 }
@@ -2849,94 +2857,6 @@ function generateHTML(备案内容, hasToken = false) {
 			border-radius: 22px;
 			background: rgba(255, 255, 255, 0.03);
 			border: 1px solid rgba(255, 255, 255, 0.07);
-		}
-
-		.source-card {
-			flex: 1 1 260px;
-			min-width: 240px;
-			display: flex;
-			flex-direction: column;
-			justify-content: center;
-			gap: 8px;
-			padding: 14px 18px;
-			border-radius: 22px;
-			background: rgba(97, 219, 255, 0.03);
-			border: 1px solid rgba(97, 219, 255, 0.18);
-		}
-
-		.source-card-header {
-			display: flex;
-			align-items: center;
-			justify-content: space-between;
-			gap: 8px;
-		}
-
-		.source-card-title {
-			display: flex;
-			align-items: center;
-			gap: 8px;
-		}
-
-		.source-card-title strong {
-			font-size: 0.95rem;
-			color: #ffffff;
-		}
-
-		.source-badge {
-			padding: 2px 8px;
-			border-radius: 6px;
-			font-size: 0.74rem;
-			font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-			color: #61dbff;
-			background: rgba(10, 30, 50, 0.85);
-			border: 1px solid rgba(97, 219, 255, 0.28);
-		}
-
-		.source-select-wrapper {
-			position: relative;
-			width: 100%;
-		}
-
-		.source-select {
-			width: 100%;
-			height: 38px;
-			padding: 0 32px 0 12px;
-			border-radius: 12px;
-			border: 1px solid rgba(97, 219, 255, 0.24);
-			background: rgba(4, 14, 24, 0.85);
-			color: #e0f2fe;
-			font-size: 0.82rem;
-			font-weight: 500;
-			cursor: pointer;
-			outline: none;
-			appearance: none;
-			background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2361dbff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
-			background-repeat: no-repeat;
-			background-position: right 12px center;
-			transition: border-color 0.2s ease, box-shadow 0.2s ease;
-		}
-
-		.source-select:focus {
-			border-color: rgba(97, 219, 255, 0.5);
-			box-shadow: 0 0 0 3px rgba(97, 219, 255, 0.12);
-		}
-
-		.source-select option {
-			background: #081320;
-			color: #ffffff;
-		}
-
-		.source-hint-row {
-			display: flex;
-			align-items: center;
-			gap: 8px;
-			margin-top: 12px;
-			padding: 8px 14px;
-			border-radius: 12px;
-			background: rgba(255, 255, 255, 0.02);
-			border: 1px solid rgba(255, 255, 255, 0.05);
-			font-size: 0.82rem;
-			color: var(--muted);
 		}
 
 		.mode-copy strong {
@@ -4266,39 +4186,6 @@ function generateHTML(备案内容, hasToken = false) {
 			border-color: rgba(95, 123, 150, 0.14);
 		}
 
-		html[data-theme='light'] .source-card {
-			background: rgba(14, 165, 233, 0.04);
-			border-color: rgba(14, 165, 233, 0.2);
-		}
-
-		html[data-theme='light'] .source-card-title strong {
-			color: #10253d;
-		}
-
-		html[data-theme='light'] .source-badge {
-			background: rgba(14, 165, 233, 0.08);
-			border-color: rgba(14, 165, 233, 0.25);
-			color: #0c7fb3;
-		}
-
-		html[data-theme='light'] .source-select {
-			background-color: rgba(255, 255, 255, 0.95);
-			border-color: rgba(14, 165, 233, 0.28);
-			color: #10253d;
-			background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%230c7fb3' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
-		}
-
-		html[data-theme='light'] .source-select option {
-			background: #ffffff;
-			color: #10253d;
-		}
-
-		html[data-theme='light'] .source-hint-row {
-			background: rgba(227, 239, 248, 0.6);
-			border-color: rgba(95, 123, 150, 0.12);
-			color: #365168;
-		}
-
 		html[data-theme='light'] .map-detail-map-panel,
 		html[data-theme='light'] .exit-detail-card {
 			border-color: rgba(95, 123, 150, 0.12);
@@ -4896,15 +4783,11 @@ function generateHTML(备案内容, hasToken = false) {
 							</label>
 						</div>
 
-
-
 						<button class="primary-btn" id="checkBtn" type="button">
 							<span>开始检测</span>
 							<small>Resolve + Check</small>
 						</button>
 					</div>
-
-
 
 				</div>
 
@@ -5060,9 +4943,52 @@ function generateHTML(备案内容, hasToken = false) {
 		const filterEmpty = document.getElementById('filterEmpty');
 		const themeToggle = document.getElementById('themeToggle');
 		const THEME_STORAGE_KEY = 'cf_proxy_theme';
+		const systemThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+		const BASE_MAP_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+		const BASE_MAP_TILE_OPTIONS = {
+			maxZoom: 19,
+			attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer noopener">OpenStreetMap</a> contributors'
+		};
+
+		let map = null;
+		let mapLayers = [];
+		let redLocationIcon = null;
+		let cfLocationIndex = new Map();
+		let cfLocationsPromise = null;
+		let backendServicePromise = null;
+		let mapRenderToken = 0;
+		let totalTargets = 0;
+		let completedCount = 0;
+		let successCount = 0;
+		let inputCount = 0;
+		let appState = 'idle';
+		let activeRun = null;
+		const CHECK_CONCURRENCY = 32;
+		const RESOLVE_BATCH_SIZE = 20;
+		const RESOLVE_BATCH_TIMEOUT_MS = 20000;
+		const RESOLVE_BATCH_MAX_ATTEMPTS = 3;
+		const RISK_RESULT_FILTERS = [
+			{ key: 'verylow', label: '极度纯净' },
+			{ key: 'low', label: '纯净' },
+			{ key: 'elevated', label: '轻微风险' },
+			{ key: 'high', label: '高风险' },
+			{ key: 'critical', label: '极度危险' },
+			{ key: 'unknown', label: '未知' }
+		];
+		const PRIMARY_RESULT_FILTERS = [
+			{ key: 'all', label: '全部' },
+			{ key: 'success', label: '有效' },
+			{ key: 'failed', label: '失败' },
+			...RISK_RESULT_FILTERS
+		];
+		const PROTOCOL_RESULT_FILTERS = [
+			{ key: 'socks5', label: 'SOCKS5' },
+			{ key: 'http', label: 'HTTP' },
+			{ key: 'https', label: 'HTTPS' },
+			{ key: 'turn', label: 'TURN' },
+			{ key: 'sstp', label: 'SSTP' }
+		];
 		const EXPORT_CSV_COLUMNS = [
-			{ header: 'STATUS', path: 'status' },
-			{ header: 'ERROR', path: 'error' },
 			{ header: 'TYPE', path: 'type' },
 			{ header: 'USERNAME', path: 'username' },
 			{ header: 'PASSWORD', path: 'password' },
@@ -5167,6 +5093,8 @@ function generateHTML(备案内容, hasToken = false) {
 			const storedTheme = getStoredTheme();
 			applyTheme(storedTheme || getSystemTheme(), storedTheme ? 'stored' : 'system');
 		}
+
+		initializeTheme();
 
 		function initMap() {
 			if (map) return;
@@ -6743,7 +6671,7 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function getExportableRecords() {
 			return getCurrentFilteredRecords().filter(function (record) {
-				return Boolean(record && (record.data || record.target));
+				return record.status === 'success' && Boolean(record.data);
 			});
 		}
 
@@ -6810,15 +6738,14 @@ function generateHTML(备案内容, hasToken = false) {
 			return candidates[0] || null;
 		}
 
-		function getTextExportTarget(data, record) {
+		function getTextExportTarget(data) {
 			const link = normalizeExportValue(data?.link).split('#')[0].trim();
 			if (link) return link;
-			if (record?.target) return record.target;
 
 			const proxyIP = normalizeExportValue(data?.proxyIP);
 			const portRemote = normalizeExportValue(data?.portRemote);
 			if (!proxyIP || !portRemote) {
-				return normalizeExportValue(data?.rawValue) || '';
+				return '';
 			}
 
 			const type = normalizeProxyType(data?.type) || 'socks5';
@@ -6843,15 +6770,9 @@ function generateHTML(备案内容, hasToken = false) {
 			return riskText && riskText !== '未知' ? '[' + riskText + ']' : '';
 		}
 
-		function buildTextExportLine(record) {
-			const data = record?.data;
-			const exportTarget = getTextExportTarget(data, record);
+		function buildTextExportLine(data) {
+			const exportTarget = getTextExportTarget(data);
 			if (!exportTarget) return '';
-
-			if (record?.status === 'error' || data?.success === false) {
-				const errMsg = normalizeExportValue(data?.error || data?.message || '检测失败');
-				return exportTarget + ' #[检测失败: ' + errMsg + ']';
-			}
 
 			const exitData = getPreferredTextExportProbe(data)?.exit || {};
 			const country = normalizeExportValue(exitData.country);
@@ -6866,7 +6787,7 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function buildTextExport(records) {
 			return records.map(function (record) {
-				return buildTextExportLine(record);
+				return buildTextExportLine(record.data);
 			}).filter(Boolean).join('\\n');
 		}
 
@@ -6883,26 +6804,8 @@ function generateHTML(备案内容, hasToken = false) {
 				return escapeCsvValue(column.header);
 			}).join(',');
 			const rows = records.map(function (record) {
-				const isSuccess = record.status === 'success';
-				let parsedTarget = null;
-				try {
-					parsedTarget = parseProxyUrl(record?.target || record?.data?.link || '');
-				} catch (e) {}
-
-				const fallbackData = Object.assign({}, record?.data || {}, {
-					status: isSuccess ? '成功' : '失败',
-					error: isSuccess ? '' : normalizeExportValue(record?.data?.error || '检测失败'),
-					type: record?.proxyType || record?.data?.type || parsedTarget?.scheme || '',
-					link: record?.target || record?.data?.link || '',
-					hostname: record?.data?.hostname || parsedTarget?.hostPlain || parsedTarget?.hostname || '',
-					port: record?.data?.port || parsedTarget?.port || '',
-					username: record?.data?.username || parsedTarget?.username || '',
-					password: record?.data?.password || parsedTarget?.password || ''
-				});
-				if (!fallbackData.status) fallbackData.status = isSuccess ? '成功' : '失败';
-
 				return EXPORT_CSV_COLUMNS.map(function (column) {
-					return escapeCsvValue(getNestedExportValue(fallbackData, column.path));
+					return escapeCsvValue(getNestedExportValue(record?.data, column.path));
 				}).join(',');
 			});
 			return [headerLine].concat(rows).join('\\n');
@@ -7016,7 +6919,7 @@ function generateHTML(备案内容, hasToken = false) {
 		async function handleExport(format) {
 			const records = getExportableRecords();
 			if (!records.length) {
-				showExportToast('当前筛选没有可导出的结果', 'error');
+				showExportToast('当前筛选没有可导出的有效结果', 'error');
 				return;
 			}
 
@@ -7083,10 +6986,6 @@ function generateHTML(备案内容, hasToken = false) {
 		function renderHistory() {
 			const history = getHistory();
 			historyDropdown.innerHTML = '';
-
-			if (history.length && !inputList.value && !batchMode.checked) {
-				inputList.value = history[0];
-			}
 
 			if (!history.length) {
 				const emptyItem = document.createElement('button');
@@ -7430,11 +7329,9 @@ function generateHTML(备案内容, hasToken = false) {
 			if (isRunStopped(run)) return;
 			itemObj = itemObj || addResultItem(target);
 			const resultRecord = itemObj.record;
-			// single source mode
 
 			try {
-				const checkUrl = '/check?proxy=' + encodeURIComponent(target);
-				const result = await fetchJsonWithTimeout(checkUrl, {}, 12000, run?.controller.signal);
+				const result = await fetchJsonWithTimeout('/check?proxy=' + encodeURIComponent(target), {}, 12000, run?.controller.signal);
 				const data = normalizeCheckDataForUi(result.payload || {
 					success: false,
 					error: '检测接口没有返回有效 JSON'
@@ -7496,7 +7393,7 @@ function generateHTML(备案内容, hasToken = false) {
 					itemObj.info.innerHTML =
 						'<span class="result-label">候选目标</span>' +
 						buildCopyableTarget(target) +
-						'<span class="result-detail">无法通过该代理访问 iplocate.io，请更换目标后重试。</span>';
+						'<span class="result-detail">无法通过该代理访问 www.iplocate.io，请更换目标后重试。</span>';
 					itemObj.meta.innerHTML =
 						buildMetaChip('检测未通过', 'error', 'meta-chip-danger') +
 						buildMetaChip(data.error || data.message || '远端返回失败结果', 'info');
@@ -7518,11 +7415,7 @@ function generateHTML(备案内容, hasToken = false) {
 					return;
 				}
 				completedCount++;
-				const errInfo = {
-					success: false,
-					error: error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常')
-				};
-				updateResultRecordAsError(resultRecord, errInfo);
+				updateResultRecordAsError(resultRecord, null);
 				itemObj.el.className = 'result-item error';
 				updateResultFlag(itemObj, '');
 				itemObj.badge.className = 'status-badge status-error';
@@ -7836,15 +7729,8 @@ function generateHTML(备案内容, hasToken = false) {
 			hasPromptedTokenAuth = false;
 		}
 
-		async function saveToken(tokenValue) {
+		function saveToken(tokenValue) {
 			const trimmed = (tokenValue || '').trim();
-			if (window.__TOKEN_REQUIRED__ && trimmed) {
-				const authRes = await checkTokenValidity(trimmed);
-				if (!authRes.valid && authRes.status === 401) {
-					alert('Token 错误，请检查后重新输入');
-					return;
-				}
-			}
 			try {
 				if (trimmed) {
 					localStorage.setItem('cf_proxy_token', trimmed);
@@ -7885,18 +7771,17 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		async function checkTokenValidity(token) {
-			if (!token) return { valid: false, status: 0 };
+			if (!token) return false;
 			try {
 				const res = await fetch('/auth-check', {
 					headers: {
 						'Authorization': 'Bearer ' + token,
 						'X-Token': token
-					},
-					signal: AbortSignal.timeout(6000)
+					}
 				});
-				return { valid: res.ok, status: res.status };
+				return res.ok;
 			} catch (e) {
-				return { valid: false, status: 0, networkError: true };
+				return false;
 			}
 		}
 
@@ -7945,14 +7830,14 @@ function generateHTML(备案内容, hasToken = false) {
 				lockBtn.disabled = true;
 			}
 
-			const authRes = await checkTokenValidity(token);
+			const isValid = await checkTokenValidity(token);
 
 			if (lockBtn) {
 				lockBtn.textContent = '验证并解锁';
 				lockBtn.disabled = false;
 			}
 
-			if (authRes && authRes.valid) {
+			if (isValid) {
 				try {
 					localStorage.setItem('cf_proxy_token', token);
 				} catch (e) {}
@@ -7960,7 +7845,7 @@ function generateHTML(备案内容, hasToken = false) {
 				hideAuthLockOverlay();
 			} else {
 				if (errorMsg) {
-					errorMsg.textContent = authRes && authRes.status === 401 ? 'Token 错误，请检查后重新输入' : '验证失败，请检查网络或凭据';
+					errorMsg.textContent = 'Token 错误，请检查后重新输入';
 					errorMsg.classList.add('is-visible');
 				}
 				const input = document.getElementById('authLockInput');
@@ -7990,8 +7875,8 @@ function generateHTML(备案内容, hasToken = false) {
 				if (!saved) {
 					showAuthLockOverlay();
 				} else {
-					checkTokenValidity(saved).then(function (authRes) {
-						if (!authRes.valid && authRes.status === 401) {
+					checkTokenValidity(saved).then(function (valid) {
+						if (!valid) {
 							try { localStorage.removeItem('cf_proxy_token'); } catch (e) {}
 							updateTokenButtonState();
 							showAuthLockOverlay('本地保存的 Token 已失效，请重新输入');

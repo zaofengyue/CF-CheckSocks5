@@ -6671,7 +6671,7 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function getExportableRecords() {
 			return getCurrentFilteredRecords().filter(function (record) {
-				return record.status === 'success' && Boolean(record.data);
+				return Boolean(record && (record.data || record.target));
 			});
 		}
 
@@ -6738,14 +6738,15 @@ function generateHTML(备案内容, hasToken = false) {
 			return candidates[0] || null;
 		}
 
-		function getTextExportTarget(data) {
+		function getTextExportTarget(data, record) {
 			const link = normalizeExportValue(data?.link).split('#')[0].trim();
 			if (link) return link;
+			if (record?.target) return record.target;
 
 			const proxyIP = normalizeExportValue(data?.proxyIP);
 			const portRemote = normalizeExportValue(data?.portRemote);
 			if (!proxyIP || !portRemote) {
-				return '';
+				return normalizeExportValue(data?.rawValue) || '';
 			}
 
 			const type = normalizeProxyType(data?.type) || 'socks5';
@@ -6770,9 +6771,15 @@ function generateHTML(备案内容, hasToken = false) {
 			return riskText && riskText !== '未知' ? '[' + riskText + ']' : '';
 		}
 
-		function buildTextExportLine(data) {
-			const exportTarget = getTextExportTarget(data);
+		function buildTextExportLine(record) {
+			const data = record?.data;
+			const exportTarget = getTextExportTarget(data, record);
 			if (!exportTarget) return '';
+
+			if (record?.status === 'error' || data?.success === false) {
+				const errMsg = normalizeExportValue(data?.error || data?.message || '检测失败');
+				return exportTarget + ' #[检测失败: ' + errMsg + ']';
+			}
 
 			const exitData = getPreferredTextExportProbe(data)?.exit || {};
 			const country = normalizeExportValue(exitData.country);
@@ -6787,8 +6794,8 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function buildTextExport(records) {
 			return records.map(function (record) {
-				return buildTextExportLine(record.data);
-			}).filter(Boolean).join('\\n');
+				return buildTextExportLine(record);
+			}).filter(Boolean).join('\n');
 		}
 
 		function escapeCsvValue(value) {
@@ -6804,11 +6811,29 @@ function generateHTML(备案内容, hasToken = false) {
 				return escapeCsvValue(column.header);
 			}).join(',');
 			const rows = records.map(function (record) {
+				const isSuccess = record.status === 'success';
+				let parsedTarget = null;
+				try {
+					parsedTarget = parseProxyUrl(record?.target || record?.data?.link || '');
+				} catch (e) {}
+
+				const fallbackData = Object.assign({}, record?.data || {}, {
+					status: isSuccess ? '成功' : '失败',
+					error: isSuccess ? '' : normalizeExportValue(record?.data?.error || '检测失败'),
+					type: record?.proxyType || record?.data?.type || parsedTarget?.scheme || '',
+					link: record?.target || record?.data?.link || '',
+					hostname: record?.data?.hostname || parsedTarget?.hostPlain || parsedTarget?.hostname || '',
+					port: record?.data?.port || parsedTarget?.port || '',
+					username: record?.data?.username || parsedTarget?.username || '',
+					password: record?.data?.password || parsedTarget?.password || ''
+				});
+				if (!fallbackData.status) fallbackData.status = isSuccess ? '成功' : '失败';
+
 				return EXPORT_CSV_COLUMNS.map(function (column) {
-					return escapeCsvValue(getNestedExportValue(record?.data, column.path));
+					return escapeCsvValue(getNestedExportValue(fallbackData, column.path));
 				}).join(',');
 			});
-			return [headerLine].concat(rows).join('\\n');
+			return [headerLine].concat(rows).join('\n');
 		}
 
 		function padExportDatePart(value) {
@@ -7415,7 +7440,11 @@ function generateHTML(备案内容, hasToken = false) {
 					return;
 				}
 				completedCount++;
-				updateResultRecordAsError(resultRecord, null);
+				const errInfo = {
+					success: false,
+					error: error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常')
+				};
+				updateResultRecordAsError(resultRecord, errInfo);
 				itemObj.el.className = 'result-item error';
 				updateResultFlag(itemObj, '');
 				itemObj.badge.className = 'status-badge status-error';

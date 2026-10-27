@@ -291,7 +291,7 @@ function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
 }
 // ===================== Token 鉴权结束 =====================
 
-async function checkProxy({ type, value }, colo, source = 'iplocate') {
+async function checkProxy({ type, value }, colo) {
 	const startedAt = Date.now();
 	let proxy;
 
@@ -310,39 +310,11 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 	}
 
 	let tunnel = null;
-	const selectedSource = String(source || 'iplocate').toLowerCase();
-	let targetHost = 'www.iplocate.io';
-	let targetPort = 443;
-	let requestPath = '/api/lookup';
-	let acceptHeader = 'application/json';
-	let serverName = 'www.iplocate.io';
-
-	if (selectedSource === 'ipsb') {
-		targetHost = 'api.ip.sb';
-		serverName = 'api.ip.sb';
-		requestPath = '/geoip';
-		acceptHeader = 'application/json';
-	} else if (selectedSource === 'ipwhois' || selectedSource === 'ipwho_is') {
-		targetHost = 'ipwho.is';
-		serverName = 'ipwho.is';
-		requestPath = '/';
-		acceptHeader = 'application/json';
-	} else if (selectedSource === 'ipinfo') {
-		targetHost = 'ipinfo.io';
-		serverName = 'ipinfo.io';
-		requestPath = '/json';
-		acceptHeader = 'application/json';
-	} else if (selectedSource === 'cloudflare') {
-		targetHost = '1.1.1.1';
-		serverName = 'cloudflare.com';
-		requestPath = '/cdn-cgi/trace';
-		acceptHeader = 'text/plain';
-	} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
-		targetHost = 'ipapi.co';
-		serverName = 'ipapi.co';
-		requestPath = '/json/';
-		acceptHeader = 'application/json';
-	}
+	const targetHost = 'www.iplocate.io';
+	const targetPort = 443;
+	const requestPath = '/api/lookup';
+	const acceptHeader = 'application/json';
+	const serverName = 'www.iplocate.io';
 
 	try {
 		let tunnelPromise;
@@ -431,220 +403,30 @@ async function checkProxy({ type, value }, colo, source = 'iplocate') {
 				bodyText = output || bodyText;
 			}
 
-			if (selectedSource === 'cloudflare') {
-				const traceData = {};
-				const lines = bodyText.split('\n');
-				for (const line of lines) {
-					const eqIdx = line.indexOf('=');
-					if (eqIdx !== -1) {
-						traceData[line.slice(0, eqIdx).trim().toLowerCase()] = line.slice(eqIdx + 1).trim();
-					}
-				}
-				if (!traceData.ip) throw new Error('Cloudflare trace did not return IP');
-				const locCode = (traceData.loc || 'XX').toUpperCase();
-				exit = {
-					ip: traceData.ip,
-					country: locCode,
-					countryCode: locCode,
-					country_code: locCode,
-					countryName: locCode,
-					region: traceData.colo ? `Colo ${traceData.colo}` : '',
-					city: traceData.colo ? `Colo ${traceData.colo}` : '',
-					asn: {
-						asn: null,
-						org: 'Cloudflare Trace Verified',
-						name: 'Cloudflare Trace Verified',
-						descr: `WARP: ${traceData.warp || 'off'}, Colo: ${traceData.colo || 'unknown'}`
-					},
-					asOrganization: 'Cloudflare Network',
-					company: { name: 'Cloudflare Network' },
-					is_datacenter: false,
-					is_bogon: false,
-					is_proxy: false,
-					is_vpn: traceData.warp === 'on',
-					is_tor: false,
-					is_abuser: false
-				};
-			} else if (selectedSource === 'ipsb') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target api.ip.sb did not return valid JSON');
-				}
-				exit = {
-					ip: raw.ip,
-					country: raw.country,
-					countryCode: raw.country_code,
-					country_code: raw.country_code,
-					countryName: raw.country,
-					region: raw.region,
-					city: raw.city,
-					postal_code: raw.postal_code,
-					latitude: raw.latitude,
-					longitude: raw.longitude,
-					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
-					timezone: raw.timezone,
-					asn: raw.asn ? {
-						asn: raw.asn,
-						org: raw.organization,
-						name: raw.organization,
-						descr: raw.organization
-					} : null,
-					asOrganization: raw.organization,
-					company: { name: raw.organization },
-					is_datacenter: false,
-					is_bogon: false,
-					is_proxy: false,
-					is_vpn: false,
-					is_tor: false,
-					is_abuser: false
-				};
-			} else if (selectedSource === 'ipwhois' || selectedSource === 'ipwho_is') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target ipwho.is did not return valid JSON');
-				}
-				if (raw.success === false) {
-					throw new Error(raw.message || 'Target ipwho.is lookup failed');
-				}
-				const asnNum = raw.connection?.asn ? parseInt(raw.connection.asn, 10) : null;
-				const orgName = raw.connection?.org || raw.connection?.isp || '';
-				exit = {
-					ip: raw.ip,
-					country: raw.country,
-					countryCode: raw.country_code,
-					country_code: raw.country_code,
-					countryName: raw.country,
-					region: raw.region,
-					city: raw.city,
-					postal_code: raw.postal,
-					latitude: raw.latitude,
-					longitude: raw.longitude,
-					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
-					timezone: raw.timezone?.id || raw.timezone,
-					asn: {
-						asn: asnNum,
-						org: orgName,
-						name: orgName,
-						descr: orgName
-					},
-					asOrganization: orgName,
-					company: { name: orgName },
-					is_datacenter: false,
-					is_bogon: false,
-					is_proxy: false,
-					is_vpn: false,
-					is_tor: false,
-					is_abuser: false
-				};
-			} else if (selectedSource === 'ipinfo') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target ipinfo.io did not return valid JSON');
-				}
-				const locParts = (raw.loc || '').split(',');
-				const lat = locParts[0] ? parseFloat(locParts[0]) : null;
-				const lon = locParts[1] ? parseFloat(locParts[1]) : null;
-				const orgMatch = (raw.org || '').match(/^AS(\d+)\s+(.*)$/i);
-				const asnNum = orgMatch ? parseInt(orgMatch[1], 10) : null;
-				const asnOrg = orgMatch ? orgMatch[2] : raw.org;
-				exit = {
-					ip: raw.ip,
-					country: raw.country,
-					countryCode: raw.country,
-					country_code: raw.country,
-					countryName: raw.country,
-					region: raw.region,
-					city: raw.city,
-					postal_code: raw.postal,
-					latitude: lat,
-					longitude: lon,
-					loc: raw.loc || '',
-					timezone: raw.timezone,
-					asn: {
-						asn: asnNum,
-						org: asnOrg,
-						name: asnOrg,
-						descr: asnOrg
-					},
-					asOrganization: asnOrg,
-					company: { name: asnOrg },
-					is_datacenter: false,
-					is_bogon: false,
-					is_proxy: false,
-					is_vpn: false,
-					is_tor: false,
-					is_abuser: false
-				};
-			} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target ipapi.co did not return valid JSON');
-				}
-				if (raw.error) {
-					throw new Error(raw.reason || raw.message || 'Target ipapi.co rate limit reached');
-				}
-				const asnNum = raw.asn ? parseInt(String(raw.asn).replace(/^AS/i, ''), 10) : null;
-				exit = {
-					ip: raw.ip,
-					country: raw.country_name || raw.country,
-					countryCode: raw.country_code || raw.country,
-					country_code: raw.country_code || raw.country,
-					countryName: raw.country_name || raw.country,
-					region: raw.region,
-					city: raw.city,
-					postal_code: raw.postal,
-					latitude: raw.latitude,
-					longitude: raw.longitude,
-					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
-					timezone: raw.timezone,
-					asn: {
-						asn: asnNum,
-						org: raw.org,
-						name: raw.org,
-						descr: raw.org
-					},
-					asOrganization: raw.org,
-					company: { name: raw.org },
-					is_datacenter: false,
-					is_bogon: false,
-					is_proxy: false,
-					is_vpn: false,
-					is_tor: false,
-					is_abuser: false
-				};
-			} else {
-				try {
-					exit = JSON.parse(bodyText.trim());
-				} catch (error) {
-					throw new Error('Target /api/lookup did not return valid JSON');
-				}
-
-				// Transform iplocate.io response to maintain compatibility with existing frontend
-				exit = {
-					...exit,
-					asn: exit.asn ? {
-						...exit.asn,
-						org: exit.asn.name || exit.asn.org,
-						descr: exit.asn.name || exit.asn.descr,
-					} : exit.asn,
-					rir: exit.asn?.rir || null,
-					is_datacenter: exit.privacy?.is_hosting || false,
-					is_crawler: false,
-					is_bogon: exit.privacy?.is_bogon || false,
-					is_proxy: exit.privacy?.is_proxy || false,
-					is_vpn: exit.privacy?.is_vpn || false,
-					is_tor: exit.privacy?.is_tor || false,
-					is_abuser: exit.privacy?.is_abuser || false,
-				};
+			let exit;
+			try {
+				exit = JSON.parse(bodyText.trim());
+			} catch (error) {
+				throw new Error('Target /api/lookup did not return valid JSON');
 			}
+
+			// Transform iplocate.io response to maintain compatibility with existing frontend
+			exit = {
+				...exit,
+				asn: exit.asn ? {
+					...exit.asn,
+					org: exit.asn.name || exit.asn.org,
+					descr: exit.asn.name || exit.asn.descr,
+				} : exit.asn,
+				rir: exit.asn?.rir || null,
+				is_datacenter: exit.privacy?.is_hosting || false,
+				is_crawler: false,
+				is_bogon: exit.privacy?.is_bogon || false,
+				is_proxy: exit.privacy?.is_proxy || false,
+				is_vpn: exit.privacy?.is_vpn || false,
+				is_tor: exit.privacy?.is_tor || false,
+				is_abuser: exit.privacy?.is_abuser || false,
+			};
 		} finally {
 			try { tlsSocket.close(); } catch (e) { }
 		}
@@ -5114,29 +4896,7 @@ function generateHTML(备案内容, hasToken = false) {
 							</label>
 						</div>
 
-						<div class="mode-card source-card">
-							<div class="source-card-header">
-								<div class="source-card-title">
-									<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #61dbff;">
-										<circle cx="12" cy="12" r="10"></circle>
-										<line x1="2" y1="12" x2="22" y2="12"></line>
-										<path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
-									</svg>
-									<strong>出口 IP 接口</strong>
-								</div>
-								<span class="source-badge" id="sourceBadge">iplocate.io</span>
-							</div>
-							<div class="source-select-wrapper">
-								<select id="ipSourceSelect" class="source-select" aria-label="选择出口 IP 检测源">
-									<option value="iplocate">iplocate.io (默认 · 综合地理定位与机房风控)</option>
-									<option value="ipwhois">ipwho.is (高精度 · 规范全字段 / 海外稳定)</option>
-									<option value="ipsb">api.ip.sb (极速响应 · 大批量测活首选)</option>
-									<option value="cloudflare">Cloudflare 官方 (cdn-cgi/trace · 1w+大批量推荐)</option>
-									<option value="ipinfo">ipinfo.io (知名老牌 · 国际权威数据库)</option>
-									<option value="ipapico">ipapi.co (高精度单条 · 有严格限速)</option>
-								</select>
-							</div>
-						</div>
+
 
 						<button class="primary-btn" id="checkBtn" type="button">
 							<span>开始检测</span>
@@ -5144,10 +4904,7 @@ function generateHTML(备案内容, hasToken = false) {
 						</button>
 					</div>
 
-					<div class="source-hint-row" id="sourceHintRow">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0; color:#61dbff;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
-						<span id="sourceHintText">当前：<b>iplocate.io</b>，提供详细的国家、城市、经纬度与 ASN 组织信息。</span>
-					</div>
+
 
 				</div>
 
@@ -5303,122 +5060,6 @@ function generateHTML(备案内容, hasToken = false) {
 		const filterEmpty = document.getElementById('filterEmpty');
 		const themeToggle = document.getElementById('themeToggle');
 		const THEME_STORAGE_KEY = 'cf_proxy_theme';
-		const ipSourceSelect = document.getElementById('ipSourceSelect');
-		const sourceBadge = document.getElementById('sourceBadge');
-		const sourceHintText = document.getElementById('sourceHintText');
-		const IP_SOURCE_STORAGE_KEY = 'cf_proxy_ip_source';
-
-		const IP_SOURCE_DEFINITIONS = {
-			iplocate: {
-				badge: 'iplocate.io',
-				label: 'iplocate.io',
-				desc: '当前：<b>iplocate.io</b>，提供详细的国家、城市、经纬度与 ASN 组织信息。'
-			},
-			ipwhois: {
-				badge: 'ipwho.is',
-				label: 'ipwho.is',
-				desc: '当前：<b>ipwho.is</b>，高精度地理定位与网络运营商信息，全字段规范，海外测活稳定。'
-			},
-			ipsb: {
-				badge: 'api.ip.sb',
-				label: 'api.ip.sb',
-				desc: '当前：<b>api.ip.sb</b>，海外全球节点解析速度极快，延迟低，查询高效，大批量推荐。'
-			},
-			cloudflare: {
-				badge: 'Cloudflare',
-				label: 'Cloudflare Trace (1.1.1.1)',
-				desc: '当前：<b>Cloudflare 官方 Trace</b>，基于 Workers 内核直连，零风控防封，1w+ 大批量推荐。'
-			},
-			ipinfo: {
-				badge: 'ipinfo.io',
-				label: 'ipinfo.io',
-				desc: '当前：<b>ipinfo.io</b>，全球老牌权威 IP 数据库，稳定性极佳。'
-			},
-			ipapico: {
-				badge: 'ipapi.co',
-				label: 'ipapi.co',
-				desc: '当前：<b>ipapi.co</b>，地理与网络信息详尽，但每分钟限制 30 次且对并发敏感，适合单条或少量节点测试。'
-			}
-		};
-
-		function getStoredIpSource() {
-			try {
-				let stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
-				if (stored === 'ipapi_is') stored = 'ipwhois';
-				return stored && IP_SOURCE_DEFINITIONS[stored] ? stored : 'iplocate';
-			} catch {
-				return 'iplocate';
-			}
-		}
-
-		function applyIpSource(sourceKey, persist = true) {
-			const validKey = IP_SOURCE_DEFINITIONS[sourceKey] ? sourceKey : 'iplocate';
-			const def = IP_SOURCE_DEFINITIONS[validKey];
-			if (ipSourceSelect && ipSourceSelect.value !== validKey) {
-				ipSourceSelect.value = validKey;
-			}
-			if (sourceBadge) {
-				sourceBadge.textContent = def.badge;
-			}
-			if (sourceHintText) {
-				sourceHintText.innerHTML = def.desc;
-			}
-			if (persist) {
-				try {
-					localStorage.setItem(IP_SOURCE_STORAGE_KEY, validKey);
-				} catch (e) {}
-			}
-		}
-
-		function getSelectedIpSource() {
-			return (ipSourceSelect && ipSourceSelect.value) || getStoredIpSource();
-		}
-
-		const systemThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
-		const BASE_MAP_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-		const BASE_MAP_TILE_OPTIONS = {
-			maxZoom: 19,
-			attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer noopener">OpenStreetMap</a> contributors'
-		};
-
-		let map = null;
-		let mapLayers = [];
-		let redLocationIcon = null;
-		let cfLocationIndex = new Map();
-		let cfLocationsPromise = null;
-		let backendServicePromise = null;
-		let mapRenderToken = 0;
-		let totalTargets = 0;
-		let completedCount = 0;
-		let successCount = 0;
-		let inputCount = 0;
-		let appState = 'idle';
-		let activeRun = null;
-		const CHECK_CONCURRENCY = 32;
-		const RESOLVE_BATCH_SIZE = 20;
-		const RESOLVE_BATCH_TIMEOUT_MS = 20000;
-		const RESOLVE_BATCH_MAX_ATTEMPTS = 3;
-		const RISK_RESULT_FILTERS = [
-			{ key: 'verylow', label: '极度纯净' },
-			{ key: 'low', label: '纯净' },
-			{ key: 'elevated', label: '轻微风险' },
-			{ key: 'high', label: '高风险' },
-			{ key: 'critical', label: '极度危险' },
-			{ key: 'unknown', label: '未知' }
-		];
-		const PRIMARY_RESULT_FILTERS = [
-			{ key: 'all', label: '全部' },
-			{ key: 'success', label: '有效' },
-			{ key: 'failed', label: '失败' },
-			...RISK_RESULT_FILTERS
-		];
-		const PROTOCOL_RESULT_FILTERS = [
-			{ key: 'socks5', label: 'SOCKS5' },
-			{ key: 'http', label: 'HTTP' },
-			{ key: 'https', label: 'HTTPS' },
-			{ key: 'turn', label: 'TURN' },
-			{ key: 'sstp', label: 'SSTP' }
-		];
 		const EXPORT_CSV_COLUMNS = [
 			{ header: 'STATUS', path: 'status' },
 			{ header: 'ERROR', path: 'error' },
@@ -5526,18 +5167,6 @@ function generateHTML(备案内容, hasToken = false) {
 			const storedTheme = getStoredTheme();
 			applyTheme(storedTheme || getSystemTheme(), storedTheme ? 'stored' : 'system');
 		}
-
-		function initializeIpSource() {
-			applyIpSource(getStoredIpSource(), false);
-			if (ipSourceSelect) {
-				ipSourceSelect.addEventListener('change', function () {
-					applyIpSource(ipSourceSelect.value, true);
-				});
-			}
-		}
-
-		initializeTheme();
-		initializeIpSource();
 
 		function initMap() {
 			if (map) return;
@@ -7801,10 +7430,10 @@ function generateHTML(备案内容, hasToken = false) {
 			if (isRunStopped(run)) return;
 			itemObj = itemObj || addResultItem(target);
 			const resultRecord = itemObj.record;
-			const currentSource = getSelectedIpSource();
+			// single source mode
 
 			try {
-				const checkUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+				const checkUrl = '/check?proxy=' + encodeURIComponent(target);
 				const result = await fetchJsonWithTimeout(checkUrl, {}, 12000, run?.controller.signal);
 				const data = normalizeCheckDataForUi(result.payload || {
 					success: false,
@@ -7864,11 +7493,10 @@ function generateHTML(备案内容, hasToken = false) {
 					updateResultFlag(itemObj, '');
 					itemObj.badge.className = 'status-badge status-error';
 					itemObj.badge.innerText = '不可用';
-					const sourceDef = IP_SOURCE_DEFINITIONS[currentSource] || IP_SOURCE_DEFINITIONS.iplocate;
 					itemObj.info.innerHTML =
 						'<span class="result-label">候选目标</span>' +
 						buildCopyableTarget(target) +
-						'<span class="result-detail">无法通过该代理访问 ' + escapeHtml(sourceDef.label) + '，请更换目标后重试。</span>';
+						'<span class="result-detail">无法通过该代理访问 iplocate.io，请更换目标后重试。</span>';
 					itemObj.meta.innerHTML =
 						buildMetaChip('检测未通过', 'error', 'meta-chip-danger') +
 						buildMetaChip(data.error || data.message || '远端返回失败结果', 'info');
@@ -8208,8 +7836,15 @@ function generateHTML(备案内容, hasToken = false) {
 			hasPromptedTokenAuth = false;
 		}
 
-		function saveToken(tokenValue) {
+		async function saveToken(tokenValue) {
 			const trimmed = (tokenValue || '').trim();
+			if (window.__TOKEN_REQUIRED__ && trimmed) {
+				const authRes = await checkTokenValidity(trimmed);
+				if (!authRes.valid && authRes.status === 401) {
+					alert('Token 错误，请检查后重新输入');
+					return;
+				}
+			}
 			try {
 				if (trimmed) {
 					localStorage.setItem('cf_proxy_token', trimmed);
@@ -8310,14 +7945,14 @@ function generateHTML(备案内容, hasToken = false) {
 				lockBtn.disabled = true;
 			}
 
-			const isValid = await checkTokenValidity(token);
+			const authRes = await checkTokenValidity(token);
 
 			if (lockBtn) {
 				lockBtn.textContent = '验证并解锁';
 				lockBtn.disabled = false;
 			}
 
-			if (isValid) {
+			if (authRes && authRes.valid) {
 				try {
 					localStorage.setItem('cf_proxy_token', token);
 				} catch (e) {}
@@ -8325,7 +7960,7 @@ function generateHTML(备案内容, hasToken = false) {
 				hideAuthLockOverlay();
 			} else {
 				if (errorMsg) {
-					errorMsg.textContent = 'Token 错误，请检查后重新输入';
+					errorMsg.textContent = authRes && authRes.status === 401 ? 'Token 错误，请检查后重新输入' : '验证失败，请检查网络或凭据';
 					errorMsg.classList.add('is-visible');
 				}
 				const input = document.getElementById('authLockInput');

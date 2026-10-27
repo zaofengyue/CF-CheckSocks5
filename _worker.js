@@ -33,183 +33,27 @@ export default {
 		const configuredToken = getConfiguredToken(env);
 		let pathTokenAuthenticated = false;
 
-		const activeTokens = [];
-		if (configuredToken) activeTokens.push(configuredToken);
-		const kvTokens = await getKVTokens(env);
-		if (kvTokens && kvTokens.length > 0) {
-			for (const t of kvTokens) {
-				if (t.enabled !== false && t.token) {
-					const trimmed = t.token.trim();
-					if (trimmed && !activeTokens.includes(trimmed)) {
-						activeTokens.push(trimmed);
-					}
-				}
-			}
-		}
-
-		if (activeTokens.length > 0) {
+		if (configuredToken) {
 			const rawPath = url.pathname;
 			let decodedPath = rawPath;
 			try {
 				decodedPath = decodeURIComponent(rawPath);
 			} catch (e) {}
 
-			for (const tok of activeTokens) {
-				const tokenPrefix = '/' + tok;
-				if (decodedPath === tokenPrefix || decodedPath === tokenPrefix + '/') {
-					if (request.method === 'GET') {
-						return Response.redirect(`${url.origin}/?token=${encodeURIComponent(tok)}`, 302);
-					}
-				} else if (decodedPath.startsWith(tokenPrefix + '/')) {
-					const remainder = decodedPath.slice(tokenPrefix.length);
-					url.pathname = remainder;
-					pathTokenAuthenticated = true;
-					break;
+			const tokenPrefix = '/' + configuredToken;
+			if (decodedPath === tokenPrefix || decodedPath === tokenPrefix + '/') {
+				if (request.method === 'GET') {
+					return Response.redirect(`${url.origin}/?token=${encodeURIComponent(configuredToken)}`, 302);
 				}
+			} else if (decodedPath.startsWith(tokenPrefix + '/')) {
+				const remainder = decodedPath.slice(tokenPrefix.length);
+				url.pathname = remainder;
+				pathTokenAuthenticated = true;
 			}
 		}
 
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders(origin) });
-		}
-
-		if (url.pathname.toLowerCase() === '/admin' || url.pathname.toLowerCase() === '/admin/') {
-			return new Response(generateAdminHTML(env, Boolean(getKV(env))), {
-				headers: {
-					'Content-Type': 'text/html; charset=UTF-8',
-					'Cache-Control': 'no-cache, no-store, must-revalidate'
-				}
-			});
-		}
-
-		if (url.pathname.toLowerCase().startsWith('/api/admin/')) {
-			return handleAdminAPI(request, url, env, origin);
-		}
-
-		if (url.pathname.toLowerCase() === '/api/cluster/nodes') {
-			const authRes = await checkAuthToken(request, url, env, pathTokenAuthenticated);
-			if (!authRes.ok) {
-				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
-			}
-			const adminAuth = await verifyAdminAuth(request, env);
-			const workers = (await getKVWorkers(env)) || [];
-			const activeWorkers = workers.filter(w => w.enabled !== false).map(w => ({
-				id: w.id,
-				name: w.name,
-				url: w.url,
-				token: adminAuth.ok ? (w.token || '') : (w.token ? '***' : ''),
-				hasToken: Boolean(w.token),
-				weight: w.weight || 1
-			}));
-			const clusterSettings = await getKVClusterSettings(env);
-			return jsonResponse({
-				success: true,
-				hasKV: Boolean(getKV(env)),
-				clusterEnabled: activeWorkers.length > 0,
-				pureClusterMode: Boolean(clusterSettings.pureClusterMode),
-				nodes: activeWorkers
-			}, { origin });
-		}
-
-		if (url.pathname.toLowerCase() === '/api/cluster/relay') {
-			const authRes = await checkAuthToken(request, url, env, pathTokenAuthenticated);
-			if (!authRes.ok) {
-				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
-			}
-			const targetNodeUrl = (url.searchParams.get('node') || '').trim().replace(/\/+$/, '');
-			const proxyParam = (url.searchParams.get('proxy') || '').trim();
-			const sourceParam = (url.searchParams.get('source') || 'iplocate').trim().toLowerCase();
-			if (!targetNodeUrl || !proxyParam) {
-				return jsonResponse({ success: false, error: 'Missing node or proxy parameter' }, { status: 400, origin });
-			}
-			const workers = (await getKVWorkers(env)) || [];
-			const matchedNode = workers.find(w => 
-				w.enabled !== false && 
-				w.url && 
-				(w.url.replace(/\/+$/, '').toLowerCase() === targetNodeUrl.toLowerCase() || w.id === targetNodeUrl)
-			);
-			if (!matchedNode) {
-				return jsonResponse({ success: false, error: 'Security alert: Target node is not in the active cluster whitelist' }, { status: 403, origin });
-			}
-			let parsedNodeUrl;
-			try {
-				parsedNodeUrl = new URL(matchedNode.url);
-			} catch (e) {
-				return jsonResponse({ success: false, error: 'Invalid configured node URL' }, { status: 500, origin });
-			}
-			if (parsedNodeUrl.protocol !== 'https:' && parsedNodeUrl.protocol !== 'http:') {
-				return jsonResponse({ success: false, error: 'Invalid node protocol' }, { status: 400, origin });
-			}
-			if (isPrivateHost(parsedNodeUrl.hostname)) {
-				return jsonResponse({ success: false, error: 'Security alert: Access to private networks is forbidden' }, { status: 403, origin });
-			}
-
-			const nodeBase = matchedNode.url.replace(/\/+$/, '');
-			const nodeToken = matchedNode?.token || '';
-			try {
-				let forwardUrl = `${nodeBase}/check?proxy=${encodeURIComponent(proxyParam)}&source=${encodeURIComponent(sourceParam)}`;
-				const fHeaders = {
-					'User-Agent': 'CF-CheckSocks5-Cluster-Relay/2.0'
-				};
-				if (nodeToken) {
-					fHeaders['Authorization'] = `Bearer ${nodeToken}`;
-					fHeaders['X-Token'] = nodeToken;
-				}
-				const fRes = await fetch(forwardUrl, {
-					headers: fHeaders,
-					signal: AbortSignal.timeout(18000)
-				});
-				const contentType = fRes.headers.get('content-type') || '';
-				let fData;
-				if (contentType.includes('application/json')) {
-					try {
-						fData = await fRes.json();
-					} catch (e) {
-						fData = { success: false, error: 'Invalid JSON returned by target node' };
-					}
-				} else {
-					const textBody = await fRes.text();
-					try {
-						fData = JSON.parse(textBody);
-					} catch (e) {
-						fData = { 
-							success: false, 
-							error: `Sub-worker returned non-JSON response (HTTP ${fRes.status})`,
-							preview: textBody.slice(0, 200)
-						};
-					}
-				}
-				return jsonResponse(fData, { status: fRes.status, origin });
-			} catch (err) {
-				return jsonResponse({ success: false, error: `Relay failed: ${err.message}` }, { status: 502, origin });
-			}
-		}
-
-		if (url.pathname.toLowerCase() === '/api/sources/list') {
-			const authRes = await checkAuthToken(request, url, env, pathTokenAuthenticated);
-			if (!authRes.ok) {
-				return jsonResponse({ success: false, error: 'Unauthorized: missing or invalid token' }, { status: 401, origin });
-			}
-			const kvSources = (await getKVSources(env)) || {};
-			const adminAuth = await verifyAdminAuth(request, env);
-			const sanitizedSources = {};
-			for (const [k, v] of Object.entries(kvSources)) {
-				if (!v || typeof v !== 'object') continue;
-				if (adminAuth.ok) {
-					sanitizedSources[k] = v;
-				} else {
-					// 严格白名单属性投影，绝不解构展开 ...v，杜绝敏感 URL/Header 泄露
-					sanitizedSources[k] = {
-						label: v.label || k,
-						enabled: v.enabled !== false,
-						hasKeys: Boolean(v.keys && v.keys.length > 0)
-					};
-				}
-			}
-			return jsonResponse({
-				success: true,
-				sources: sanitizedSources
-			}, { origin });
 		}
 
 		// Cloudflare Pages 静态资源直通（如 demo.png 等静态资产）
@@ -220,8 +64,7 @@ export default {
 			} catch (e) {}
 		}
 
-		const authCheck = await checkAuthToken(request, url, env, pathTokenAuthenticated);
-		if (!authCheck.ok) {
+		if (!checkAuthToken(request, url, env, pathTokenAuthenticated).ok) {
 			return jsonResponse({
 				success: false,
 				error: 'Unauthorized: missing or invalid token'
@@ -287,29 +130,27 @@ export default {
 					return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers });
 				}
 
-				const rawInputs = (Array.isArray(payload?.targets) ? payload.targets : (Array.isArray(payload?.proxyips) ? payload.proxyips : []))
+				const inputs = uniqueStrings((Array.isArray(payload?.targets) ? payload.targets : (Array.isArray(payload?.proxyips) ? payload.proxyips : []))
 					.map(value => String(value || '').trim())
-					.filter(Boolean);
+					.filter(Boolean));
 
-				if (!rawInputs.length) return new Response(JSON.stringify({ error: 'Missing targets' }), { status: 400, headers });
-				if (rawInputs.length > RESOLVE_BATCH_LIMIT) return new Response(JSON.stringify({ error: `Resolve batch limit is ${RESOLVE_BATCH_LIMIT}` }), { status: 400, headers });
+				if (!inputs.length) return new Response(JSON.stringify({ error: 'Missing targets' }), { status: 400, headers });
+				if (inputs.length > RESOLVE_BATCH_LIMIT) return new Response(JSON.stringify({ error: `Resolve batch limit is ${RESOLVE_BATCH_LIMIT}` }), { status: 400, headers });
 
-				const resolveCache = new Map();
-				const uniqueList = uniqueStrings(rawInputs);
-				const concurrency = 8;
-				for (let i = 0; i < uniqueList.length; i += concurrency) {
-					const slice = uniqueList.slice(i, i + concurrency);
-					await Promise.all(slice.map(async input => {
+				const results = new Array(inputs.length);
+				let resolveIdx = 0;
+				const resolveWorkers = Array.from({ length: Math.min(8, inputs.length) }, async () => {
+					while (resolveIdx < inputs.length) {
+						const curr = resolveIdx++;
+						const input = inputs[curr];
 						try {
-							const targets = await handleResolve(input);
-							resolveCache.set(input, { input, targets });
+							results[curr] = { input, targets: await handleResolve(input) };
 						} catch (error) {
-							resolveCache.set(input, { input, targets: [], error: error.message });
+							results[curr] = { input, targets: [], error: error.message };
 						}
-					}));
-				}
-
-				const results = rawInputs.map(input => resolveCache.get(input) || { input, targets: [] });
+					}
+				});
+				await Promise.all(resolveWorkers);
 
 				return new Response(JSON.stringify({ results }, null, 2), { headers });
 			}
@@ -350,12 +191,11 @@ export default {
 					}, { status: 400, origin });
 				}
 				const source = url.searchParams.get('source') || 'iplocate';
-				const result = await checkProxy(checkParams, request.cf?.colo ?? null, source, env);
+				const result = await checkProxy(checkParams, request.cf?.colo ?? null, source);
 				return jsonResponse(result, { origin });
 			} else if (url.pathname === '/locations') return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 
-			const tokenRequired = await isTokenRequired(env);
-			return new Response(generateHTML(备案内容, tokenRequired), {
+			return new Response(generateHTML(备案内容, !!configuredToken), {
 				headers: {
 					'Content-Type': 'text/html; charset=UTF-8',
 					'Cache-Control': 'no-cache, no-store, must-revalidate'
@@ -395,1037 +235,16 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 	});
 }
 
-// ===================== CheckSocks5 极简从节点执行内核模板 =====================
-const SUB_WORKER_SCRIPT_TEMPLATE = `// ============================================================
-// CheckSocks5 极简从节点执行内核 (Standalone Sub-Worker - Hardened)
-// 适用于部署到备用 Cloudflare 免费账号，免 KV、免环境变量，开箱即用！
-// ============================================================
-import { connect } from 'cloudflare:sockets';
-
-const AUTH_TOKEN = '__AUTH_TOKEN__';
-const CONNECT_TIMEOUT_MS = 8000;
-const READ_TIMEOUT_MS = 6000;
-
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': '*'
-};
-
-export default {
-  async fetch(request, env, ctx) {
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
-    const url = new URL(request.url);
-    const colo = request.cf?.colo || 'UNKNOWN';
-
-    if (url.pathname === '/ip.json') {
-      const clientIp = request.headers.get('cf-connecting-ip') || '127.0.0.1';
-      return new Response(JSON.stringify({ success: true, ip: clientIp, colo }), {
-        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-      });
-    }
-
-    if (url.pathname === '/check') {
-      if (AUTH_TOKEN && AUTH_TOKEN !== '__AUTH_TOKEN__') {
-        const clientToken = url.searchParams.get('token') || request.headers.get('x-token') || (request.headers.get('authorization') || '').replace(/^Bearer\\s+/i, '');
-        if (clientToken !== AUTH_TOKEN) {
-          return new Response(JSON.stringify({ success: false, error: 'Unauthorized: Invalid node token' }), {
-            status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-          });
-        }
-      }
-      const proxyParam = url.searchParams.get('proxy') || url.searchParams.get('socks5') || url.searchParams.get('http') || url.searchParams.get('https');
-      if (!proxyParam) {
-        return new Response(JSON.stringify({ success: false, error: 'Missing proxy parameter' }), {
-          status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-        });
-      }
-      const source = url.searchParams.get('source') || 'iplocate';
-      try {
-        const result = await checkProxyCore(proxyParam, colo, source);
-        return new Response(JSON.stringify(result), {
-          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ success: false, error: err.message || 'Check failed' }), {
-          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-        });
-      }
-    }
-
-    return new Response(JSON.stringify({ status: 'running', role: 'cluster-sub-worker', colo }), {
-      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-    });
-  }
-};
-
-function parseProxyUrl(raw) {
-  let target = raw.trim();
-  let proto = 'socks5';
-  if (target.includes('://')) {
-    const idx = target.indexOf('://');
-    proto = target.slice(0, idx).toLowerCase();
-    target = target.slice(idx + 3);
-  }
-  let username = '', password = '';
-  const atIdx = target.lastIndexOf('@');
-  if (atIdx !== -1) {
-    const auth = target.slice(0, atIdx);
-    target = target.slice(atIdx + 1);
-    const colonIdx = auth.indexOf(':');
-    function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return s; } }
-    if (colonIdx !== -1) {
-      username = safeDecode(auth.slice(0, colonIdx));
-      password = safeDecode(auth.slice(colonIdx + 1));
-    } else {
-      username = safeDecode(auth);
-    }
-  }
-  let host = '', port = (proto === 'http' ? 80 : proto === 'https' ? 443 : 1080);
-  if (target.startsWith('[')) {
-    const bracketEnd = target.indexOf(']');
-    host = bracketEnd !== -1 ? target.slice(1, bracketEnd) : target;
-    const portPart = bracketEnd !== -1 ? target.slice(bracketEnd + 1).replace(/^:/, '') : '';
-    if (portPart) port = parseInt(portPart, 10);
-  } else {
-    const parts = target.split(':');
-    host = parts[0];
-    if (parts[1]) port = parseInt(parts[1], 10);
-  }
-  return { proto, host, port, username, password };
-}
-
-function withTimeout(promise, ms, errText) {
-  let timer;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(errText)), ms); })
-  ]).finally(() => clearTimeout(timer));
-}
-
-class BufferedReader {
-  constructor(reader) {
-    this.reader = reader;
-    this.buffer = new Uint8Array(0);
-  }
-
-  async readExact(len, timeoutMs = READ_TIMEOUT_MS) {
-    while (this.buffer.length < len) {
-      const { value, done } = await withTimeout(this.reader.read(), timeoutMs, 'Socket read timeout');
-      if (done || !value) throw new Error('Socket closed prematurely');
-      const nextBuf = new Uint8Array(this.buffer.length + value.length);
-      nextBuf.set(this.buffer, 0);
-      nextBuf.set(value, this.buffer.length);
-      this.buffer = nextBuf;
-    }
-    const result = this.buffer.subarray(0, len);
-    this.buffer = this.buffer.subarray(len);
-    return result;
-  }
-
-  async readUntilPattern(pattern, maxLen = 8192, timeoutMs = READ_TIMEOUT_MS) {
-    const dec = new TextDecoder();
-    while (true) {
-      const text = dec.decode(this.buffer);
-      const idx = text.indexOf(pattern);
-      if (idx !== -1) {
-        const patternEnd = idx + pattern.length;
-        const result = text.slice(0, patternEnd);
-        const consumedBytes = new TextEncoder().encode(result).length;
-        this.buffer = this.buffer.subarray(consumedBytes);
-        return result;
-      }
-      if (this.buffer.length >= maxLen) throw new Error('Response headers exceeded limit');
-      const { value, done } = await withTimeout(this.reader.read(), timeoutMs, 'Socket read timeout');
-      if (done || !value) throw new Error('Socket closed prematurely');
-      const nextBuf = new Uint8Array(this.buffer.length + value.length);
-      nextBuf.set(this.buffer, 0);
-      nextBuf.set(value, this.buffer.length);
-      this.buffer = nextBuf;
-    }
-  }
-
-  async readAllAvailable(maxBytes = 32768, timeoutMs = READ_TIMEOUT_MS) {
-    const dec = new TextDecoder();
-    let text = dec.decode(this.buffer);
-    this.buffer = new Uint8Array(0);
-
-    const isCompleteJson = (str) => {
-      const start = str.indexOf('{');
-      if (start === -1) return false;
-      let depth = 0;
-      let inString = false;
-      let escape = false;
-      for (let i = start; i < str.length; i++) {
-        const c = str[i];
-        if (escape) { escape = false; }
-        else if (c === '\\\\') { escape = true; }
-        else if (c === '"') { inString = !inString; }
-        else if (!inString) {
-          if (c === '{') depth++;
-          else if (c === '}') { depth--; if (depth === 0) return true; }
-        }
-      }
-      return false;
-    };
-
-    while (text.length < maxBytes) {
-      if (isCompleteJson(text) || text.includes('\\r\\n0\\r\\n\\r\\n') || text.includes('\\n0\\n')) break;
-      let chunk;
-      try {
-        chunk = await withTimeout(this.reader.read(), timeoutMs, 'Socket read timeout');
-      } catch (e) {
-        break;
-      }
-      if (chunk.done || !chunk.value) break;
-      text += dec.decode(chunk.value, { stream: true });
-    }
-    return text;
-  }
-}
-
-async function checkProxyCore(rawProxy, colo, source) {
-  const p = parseProxyUrl(rawProxy);
-  if (p.proto !== 'socks5' && p.proto !== 'http') {
-    throw new Error('Sub-worker currently only supports direct socks5 and http testing; please use master relay');
-  }
-  const startTime = Date.now();
-
-  let targetHost = 'iplocate.io';
-  let targetPath = '/api/lookup/';
-  if (source === 'ipsb') { targetHost = 'api.ip.sb'; targetPath = '/geoip'; }
-  else if (source === 'ipwhois') { targetHost = 'ipwho.is'; targetPath = '/'; }
-  else if (source === 'cloudflare') { targetHost = 'cloudflare.com'; targetPath = '/cdn-cgi/trace'; }
-  else if (source === 'hackmyip') { targetHost = 'api.hackmyip.com'; targetPath = '/api/v1/ip'; }
-
-  const socket = connect({ hostname: p.host, port: p.port });
-  let writer = null;
-  let rawReader = null;
-
-  try {
-    await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'Proxy connection timed out');
-    writer = socket.writable.getWriter();
-    rawReader = socket.readable.getReader();
-    const bufferedReader = new BufferedReader(rawReader);
-
-    if (p.proto.startsWith('socks')) {
-      const greetingPacket = p.username ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
-      await withTimeout(writer.write(greetingPacket), CONNECT_TIMEOUT_MS, 'SOCKS5 greeting timeout');
-      const resp = await bufferedReader.readExact(2);
-      if (resp[0] !== 0x05) throw new Error('Invalid SOCKS5 handshake response');
-      if (resp[1] === 0x02) {
-        const uBytes = new TextEncoder().encode(p.username);
-        const pBytes = new TextEncoder().encode(p.password);
-        const authPayload = new Uint8Array(3 + uBytes.length + pBytes.length);
-        authPayload[0] = 0x01;
-        authPayload[1] = uBytes.length;
-        authPayload.set(uBytes, 2);
-        authPayload[2 + uBytes.length] = pBytes.length;
-        authPayload.set(pBytes, 3 + uBytes.length);
-        await withTimeout(writer.write(authPayload), CONNECT_TIMEOUT_MS, 'SOCKS5 auth write timeout');
-        const authRes = await bufferedReader.readExact(2);
-        if (authRes[1] !== 0x00) throw new Error('SOCKS5 auth failed');
-      } else if (resp[1] !== 0x00) {
-        throw new Error('SOCKS5 auth method not supported');
-      }
-
-      const hostBytes = new TextEncoder().encode(targetHost);
-      const req = new Uint8Array(7 + hostBytes.length);
-      req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-      req[4] = hostBytes.length;
-      req.set(hostBytes, 5);
-      req[5 + hostBytes.length] = (80 >> 8) & 0xff;
-      req[6 + hostBytes.length] = 80 & 0xff;
-      await withTimeout(writer.write(req), CONNECT_TIMEOUT_MS, 'SOCKS5 connect request timeout');
-
-      const head = await bufferedReader.readExact(4);
-      if (head[1] !== 0x00) throw new Error('SOCKS5 connect error: ' + head[1]);
-      const atyp = head[3];
-      if (atyp === 0x01) {
-        await bufferedReader.readExact(4 + 2);
-      } else if (atyp === 0x04) {
-        await bufferedReader.readExact(16 + 2);
-      } else if (atyp === 0x03) {
-        const domainLenBuf = await bufferedReader.readExact(1);
-        await bufferedReader.readExact(domainLenBuf[0] + 2);
-      } else {
-        throw new Error('Invalid SOCKS5 address type: ' + atyp);
-      }
-    } else {
-      const connectCmd = 'CONNECT ' + targetHost + ':80 HTTP/1.1\\r\\nHost: ' + targetHost + ':80\\r\\n\\r\\n';
-      await withTimeout(writer.write(new TextEncoder().encode(connectCmd)), CONNECT_TIMEOUT_MS, 'HTTP CONNECT write timeout');
-      const headRes = await bufferedReader.readUntilPattern('\\r\\n\\r\\n');
-      if (!/HTTP\\/\\d(?:\\.\\d)?\\s+2\\d\\d/i.test(headRes)) throw new Error('HTTP connect error: ' + headRes.split('\\r\\n')[0]);
-    }
-
-    const latency = Date.now() - startTime;
-    const httpGet = 'GET ' + targetPath + ' HTTP/1.1\\r\\nHost: ' + targetHost + '\\r\\nUser-Agent: curl/7.88.1\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n';
-    await withTimeout(writer.write(new TextEncoder().encode(httpGet)), CONNECT_TIMEOUT_MS, 'HTTP GET write timeout');
-
-    const body = await bufferedReader.readAllAvailable(32768);
-
-    const jsonStart = body.indexOf('{');
-    const jsonEnd = body.lastIndexOf('}');
-    let exitData = {};
-    if (jsonStart !== -1 && jsonEnd > jsonStart) {
-      try { exitData = JSON.parse(body.slice(jsonStart, jsonEnd + 1)); } catch (e) {}
-    } else if (source === 'cloudflare') {
-      const ipMatch = body.match(/ip=([0-9a-fA-F.:]+)/);
-      const locMatch = body.match(/loc=([A-Z]{2})/);
-      if (ipMatch) exitData = { ip: ipMatch[1], country_code: locMatch ? locMatch[1] : 'XX' };
-    }
-
-    const countryCode = (exitData.countryCode || exitData.country_code || exitData.countryIsoCode || '').toUpperCase();
-    const countryName = exitData.country || exitData.country_name || countryCode || '';
-    const orgName = exitData.org || exitData.asOrganization || exitData.connection?.org || exitData.connection?.isp || exitData.organization || exitData.asn?.name || exitData.asn?.org || '';
-    const asnVal = exitData.asn?.asn || exitData.asn || exitData.asn_number || exitData.connection?.asn || null;
-    const lat = exitData.latitude || exitData.location?.latitude || null;
-    const lon = exitData.longitude || exitData.location?.longitude || null;
-
-    if (!exitData.ip || exitData.ip === 'Unknown') {
-      throw new Error('Target lookup failed: could not extract exit IP');
-    }
-    return {
-      success: true,
-      candidate: p.host + ':' + p.port,
-      type: p.proto,
-      hostname: p.host,
-      port: p.port,
-      link: p.proto + '://' + (p.username ? p.username + ':' + p.password + '@' : '') + p.host + ':' + p.port,
-      latency,
-      responseTime: latency,
-      colo,
-      proxy: { host: p.host, port: p.port, proto: p.proto },
-      exit: {
-        ip: exitData.ip || 'Unknown',
-        country: countryName,
-        countryCode: countryCode,
-        country_code: countryCode,
-        countryName: countryName,
-        city: exitData.city || exitData.location?.city || '',
-        region: exitData.region || exitData.location?.state || '',
-        loc: lat && lon ? lat + ',' + lon : (exitData.loc || ''),
-        latitude: lat,
-        longitude: lon,
-        asn: asnVal ? { asn: typeof asnVal === 'number' ? asnVal : parseInt(String(asnVal).replace(/^AS/i, ''), 10), org: orgName } : null,
-        asOrganization: orgName,
-        org: orgName,
-        is_datacenter: Boolean(exitData.is_datacenter || exitData.hosting || exitData.privacy?.is_hosting || exitData.privacy?.type === 'datacenter'),
-        is_proxy: Boolean(exitData.is_proxy || exitData.proxy || exitData.privacy?.is_proxy),
-        is_vpn: Boolean(exitData.is_vpn || exitData.vpn || exitData.privacy?.is_vpn),
-        is_tor: Boolean(exitData.is_tor || exitData.tor || exitData.privacy?.is_tor),
-        is_abuser: Boolean(exitData.is_abuser || exitData.abuser || exitData.privacy?.is_abuser)
-      }
-    };
-  } finally {
-    if (rawReader) {
-      try { await rawReader.cancel(); } catch (e) {}
-      try { rawReader.releaseLock(); } catch (e) {}
-    }
-    if (writer) {
-      try { writer.releaseLock(); } catch (e) {}
-    }
-    try { await socket?.close?.().catch?.(() => {}); } catch (e) {}
-  }
-}
-`;
-
-// ===================== Cloudflare KV 配置中心与分布式集群调度 =====================
-const KV_CONFIG_PREFIX = 'cf_proxy:';
-const CONFIG_CACHE_TTL_MS = 10000;   // 正常配置项缓存 10 秒
-const NEGATIVE_CACHE_TTL_MS = 5000; // 负缓存（Key 不存在）5 秒
-const ERROR_CACHE_TTL_MS = 2000;    // 错误缓存（KV 异常）2 秒防雪崩
-const KV_READ_TIMEOUT_MS = 3500;    // KV 读取单次超时 3.5 秒
-
-// 独立分项缓存，增加 lastUpdated 戳以抵御读写竞态覆写
-const kvSectionCache = {
-	admin_password: { val: undefined, exp: 0, lastUpdated: 0 },
-	tokens: { val: undefined, exp: 0, lastUpdated: 0 },
-	workers: { val: undefined, exp: 0, lastUpdated: 0 },
-	sources: { val: undefined, exp: 0, lastUpdated: 0 },
-	cluster_settings: { val: undefined, exp: 0, lastUpdated: 0 }
-};
-const kvInflightPromises = new Map();
-
-// 安全深拷贝工具：杜绝高并发内存引用篡改
-function safeClone(data) {
-	if (data === null || data === undefined || typeof data !== 'object') return data;
-	try {
-		return structuredClone(data);
-	} catch (e) {
-		return JSON.parse(JSON.stringify(data));
-	}
-}
-
-// 兼容层：返回深拷贝对象与最新 lastUpdated 戳
-const memConfigCache = {
-	get tokens() { return safeClone(kvSectionCache.tokens?.val) || null; },
-	set tokens(v) { setCachedKV('tokens', v); },
-	get workers() { return safeClone(kvSectionCache.workers?.val) || null; },
-	set workers(v) { setCachedKV('workers', v); },
-	get sources() { return safeClone(kvSectionCache.sources?.val) || null; },
-	set sources(v) { setCachedKV('sources', v); },
-	get adminPass() { return kvSectionCache.admin_password?.val || null; },
-	set adminPass(v) { setCachedKV('admin_password', v); },
-	get ts() { return Math.max(...Object.values(kvSectionCache).map(e => e.lastUpdated || 0), 0); }
-};
-
-function getKV(env) {
-	return env?.KV || env?.CONFIG_KV || null;
-}
-
-async function getCachedKV(kv, subKey, type = 'json', fallback = null) {
-	if (!kv) return safeClone(fallback);
-	const now = Date.now();
-	const entry = kvSectionCache[subKey];
-	if (entry && entry.exp > now) {
-		return entry.val !== undefined ? safeClone(entry.val) : safeClone(fallback);
-	}
-
-	const inflightKey = `${subKey}:${type}`;
-	if (kvInflightPromises.has(inflightKey)) {
-		const res = await kvInflightPromises.get(inflightKey);
-		return res !== null && res !== undefined ? safeClone(res) : safeClone(fallback);
-	}
-
-	const fetchStartedAt = Date.now();
-	const p = (async () => {
-		try {
-			const fullKey = `${KV_CONFIG_PREFIX}${subKey}`;
-			const raw = await withTimeout(
-				kv.get(fullKey, type === 'json' ? { type: 'json' } : undefined),
-				KV_READ_TIMEOUT_MS,
-				`KV read timed out for key ${subKey}`
-			);
-
-			// 读写竞态防范：若在此请求读取期间已有写入操作（lastUpdated 较新），丢弃旧读结果
-			const currentEntry = kvSectionCache[subKey];
-			if (currentEntry && currentEntry.lastUpdated > fetchStartedAt) {
-				return currentEntry.val;
-			}
-
-			if (raw !== null && raw !== undefined) {
-				kvSectionCache[subKey] = {
-					val: safeClone(raw),
-					exp: Date.now() + CONFIG_CACHE_TTL_MS,
-					lastUpdated: Date.now()
-				};
-				return raw;
-			} else {
-				// 负缓存：5秒内不再重复查询不存在的 key
-				kvSectionCache[subKey] = {
-					val: safeClone(fallback),
-					exp: Date.now() + NEGATIVE_CACHE_TTL_MS,
-					lastUpdated: Date.now()
-				};
-				return fallback;
-			}
-		} catch (e) {
-			const currentEntry = kvSectionCache[subKey];
-			if (currentEntry && currentEntry.val !== undefined && currentEntry.val !== null) {
-				// 容灾保护：KV 发生超时或异常时，保留并沿用上一次已有的缓存有效值（延长 2 秒错误缓存窗口），绝不覆写为空 fallback
-				currentEntry.exp = Date.now() + ERROR_CACHE_TTL_MS;
-				return safeClone(currentEntry.val);
-			}
-			kvSectionCache[subKey] = {
-				val: safeClone(fallback),
-				exp: Date.now() + ERROR_CACHE_TTL_MS,
-				lastUpdated: Date.now()
-			};
-			return safeClone(fallback);
-		} finally {
-			kvInflightPromises.delete(inflightKey);
-		}
-	})();
-
-	kvInflightPromises.set(inflightKey, p);
-	const result = await p;
-	return result !== null && result !== undefined ? safeClone(result) : safeClone(fallback);
-}
-
-function setCachedKV(subKey, val) {
-	kvSectionCache[subKey] = {
-		val: safeClone(val),
-		exp: Date.now() + CONFIG_CACHE_TTL_MS,
-		lastUpdated: Date.now()
-	};
-	for (const key of kvInflightPromises.keys()) {
-		if (key.startsWith(`${subKey}:`)) {
-			kvInflightPromises.delete(key);
-		}
-	}
-}
-
-async function sha256Hex(str) {
-	const data = encoder.encode(str);
-	const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-	return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-async function getAdminPassword(env) {
-	const kv = getKV(env);
-	if (kv) {
-		const pass = await getCachedKV(kv, 'admin_password', 'text', null);
-		if (pass) return String(pass).trim();
-	}
-	const envPass = (env?.ADMIN || env?.ADMIN_PASSWORD || env?.ADMIN_TOKEN || env?.ROOT_PASSWORD || '').toString().trim();
-	return envPass || null;
-}
-
-async function setAdminPassword(env, password) {
-	const kv = getKV(env);
-	if (!kv) throw new Error('未检测到绑定的 KV 空间 (KV)，无法持久化存储管理员密码。请在 Cloudflare 仪表盘绑定变量名为 KV 的命名空间。');
-	const trimmed = String(password).trim();
-	await kv.put(`${KV_CONFIG_PREFIX}admin_password`, trimmed);
-	setCachedKV('admin_password', trimmed);
-}
-
-async function getKVTokens(env) {
-	const kv = getKV(env);
-	if (!kv) return null;
-	const raw = await getCachedKV(kv, 'tokens', 'json', []);
-	return Array.isArray(raw) ? raw : [];
-}
-
-async function saveKVTokens(env, tokens) {
-	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
-	await kv.put(`${KV_CONFIG_PREFIX}tokens`, JSON.stringify(tokens));
-	setCachedKV('tokens', tokens);
-}
-
-async function getKVWorkers(env) {
-	const kv = getKV(env);
-	if (!kv) return [];
-	const raw = await getCachedKV(kv, 'workers', 'json', []);
-	return Array.isArray(raw) ? raw : [];
-}
-
-async function saveKVWorkers(env, workers) {
-	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
-	await kv.put(`${KV_CONFIG_PREFIX}workers`, JSON.stringify(workers));
-	setCachedKV('workers', workers);
-}
-
-async function getKVSources(env) {
-	const kv = getKV(env);
-	if (!kv) return {};
-	const raw = await getCachedKV(kv, 'sources', 'json', {});
-	return raw && typeof raw === 'object' ? raw : {};
-}
-
-async function saveKVSources(env, sources) {
-	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
-	await kv.put(`${KV_CONFIG_PREFIX}sources`, JSON.stringify(sources));
-	setCachedKV('sources', sources);
-}
-
-async function getKVClusterSettings(env) {
-	const kv = getKV(env);
-	if (!kv) return { pureClusterMode: false };
-	const raw = await getCachedKV(kv, 'cluster_settings', 'json', { pureClusterMode: false });
-	return raw && typeof raw === 'object' ? raw : { pureClusterMode: false };
-}
-
-async function saveKVClusterSettings(env, settings) {
-	const kv = getKV(env);
-	if (!kv) throw new Error('未绑定 KV 空间 (KV)');
-	await kv.put(`${KV_CONFIG_PREFIX}cluster_settings`, JSON.stringify(settings));
-	setCachedKV('cluster_settings', settings);
-}
-
-function getObjectByPath(obj, path) {
-	if (!obj || !path) return null;
-	const parts = String(path).split('.');
-	let current = obj;
-	for (const p of parts) {
-		if (current === null || current === undefined || typeof current !== 'object') return null;
-		current = current[p];
-	}
-	return current;
-}
-
-// 多 Key 轮询与熔断管理
-const sourceKeyRotationIndex = new Map();
-const sourceKeyCooldownUntil = new Map();
-
-function getSourceKeysFromEnvOrConfig(sourceKey, env, preloadedSources = null) {
-	const sources = preloadedSources || memConfigCache.sources;
-	if (sources && sources[sourceKey]?.keys && Array.isArray(sources[sourceKey].keys)) {
-		const validKeys = sources[sourceKey].keys.map(k => String(k).trim()).filter(Boolean);
-		if (validKeys.length > 0) return validKeys;
-	}
-	if (sourceKey === 'ipapi_is' && env?.IPAPI_IS_KEY) {
-		return String(env.IPAPI_IS_KEY).split(/[,;\n\r]+/).map(k => k.trim()).filter(Boolean);
-	}
-	if (sourceKey === 'ipinfo' && (env?.IPINFO_TOKEN || env?.IPINFO_KEY)) {
-		return String(env.IPINFO_TOKEN || env.IPINFO_KEY).split(/[,;\n\r]+/).map(k => k.trim()).filter(Boolean);
-	}
-	if (sourceKey === 'ip2location' && env?.IP2LOCATION_KEY) {
-		return String(env.IP2LOCATION_KEY).split(/[,;\n\r]+/).map(k => k.trim()).filter(Boolean);
-	}
-	return [];
-}
-
-function pickKeyForSource(sourceKey, env, preloadedSources = null) {
-	const keys = getSourceKeysFromEnvOrConfig(sourceKey, env, preloadedSources);
-	if (!keys.length) return '';
-	if (keys.length === 1) return keys[0];
-
-	const now = Date.now();
-	const availableKeys = keys.filter(k => {
-		const cooldown = sourceKeyCooldownUntil.get(`${sourceKey}:${k}`);
-		return !cooldown || now > cooldown;
-	});
-
-	const activePool = availableKeys.length > 0 ? availableKeys : keys;
-	let idx = sourceKeyRotationIndex.get(sourceKey) || 0;
-	const selected = activePool[idx % activePool.length];
-	sourceKeyRotationIndex.set(sourceKey, (idx + 1) % activePool.length);
-	return selected;
-}
-
-function markKeyCooldown(sourceKey, key, cooldownMs = 60000) {
-	if (!key) return;
-	sourceKeyCooldownUntil.set(`${sourceKey}:${key}`, Date.now() + cooldownMs);
-}
-
-function isPrivateHost(host) {
-	if (!host || typeof host !== 'string') return true;
-	const h = host.replace(/^\[|\]$/g, '').toLowerCase().trim();
-	if (h === 'localhost' || h === '::1' || h === '::' || h.endsWith('.local') || h.endsWith('.internal')) return true;
-	if (h.startsWith('0.') || h.startsWith('10.') || h.startsWith('127.') || h.startsWith('169.254.') || h.startsWith('192.168.')) return true;
-	if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return true;
-	if (/^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./.test(h)) return true;
-	if (h.startsWith('::ffff:')) {
-		const v4 = h.slice(7);
-		return isPrivateHost(v4);
-	}
-	if (/^f[cd][0-9a-f]{2}:/i.test(h) || /^fe[89ab][0-9a-f]:/i.test(h) || h.startsWith('fc00:') || h.startsWith('fe80:')) return true;
-	return false;
-}
-
-async function verifyAdminAuth(request, env) {
-	const adminPass = await getAdminPassword(env);
-	if (!adminPass) {
-		return { ok: false, needSetup: true };
-	}
-
-	const authHeader = request.headers.get('Authorization') || '';
-	const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
-	const providedToken = tokenMatch ? tokenMatch[1].trim() : (request.headers.get('X-Admin-Token') || '').trim();
-
-	if (!providedToken) return { ok: false, needSetup: false };
-
-	if (timingSafeEqual(providedToken, adminPass)) {
-		return { ok: true, needSetup: false };
-	}
-
-	const expectedSession = await sha256Hex(adminPass + ':cf_admin_session');
-	if (timingSafeEqual(providedToken, expectedSession)) {
-		return { ok: true, needSetup: false };
-	}
-
-	return { ok: false, needSetup: false };
-}
-
-async function handleAdminAPI(request, url, env, origin) {
-	const pathname = url.pathname.toLowerCase().replace(/\/+$/, '');
-	const auth = await verifyAdminAuth(request, env);
-
-	if (pathname === '/api/admin/login' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		const pass = (body.password || '').toString().trim();
-		const currentAdminPass = await getAdminPassword(env);
-
-		if (!currentAdminPass) {
-			if (!pass || pass.length < 4) {
-				return jsonResponse({ success: false, error: '管理员初始密码长度不能少于 4 个字符' }, { status: 400, origin });
-			}
-			try {
-				await setAdminPassword(env, pass);
-			} catch (e) {
-				return jsonResponse({ success: false, error: e.message || '保存管理员密码失败' }, { status: 500, origin });
-			}
-			const sessionToken = await sha256Hex(pass + ':cf_admin_session');
-			return jsonResponse({ success: true, token: sessionToken, message: '管理员密码初始化成功！' }, { origin });
-		}
-
-		if (!pass || !timingSafeEqual(pass, currentAdminPass)) {
-			return jsonResponse({ success: false, error: '密码错误，请重新输入' }, { status: 401, origin });
-		}
-
-		const sessionToken = await sha256Hex(currentAdminPass + ':cf_admin_session');
-		return jsonResponse({ success: true, token: sessionToken, message: '登录成功' }, { origin });
-	}
-
-	if (!auth.ok) {
-		return jsonResponse({ success: false, error: '管理员未授权或会话已过期，请重新登录', needSetup: auth.needSetup }, { status: 401, origin });
-	}
-
-	if (pathname === '/api/admin/config' && request.method === 'GET') {
-		const adminPass = await getAdminPassword(env);
-		const tokens = (await getKVTokens(env)) || [];
-		const workers = (await getKVWorkers(env)) || [];
-		const sources = (await getKVSources(env)) || {};
-		const clusterSettings = (await getKVClusterSettings(env)) || {};
-		return jsonResponse({
-			success: true,
-			hasKV: Boolean(getKV(env)),
-			needSetup: !adminPass,
-			tokens,
-			workers,
-			sources,
-			clusterSettings,
-			envTokenConfigured: Boolean(getConfiguredToken(env)),
-			hasEnvAdminPassword: Boolean(env?.ADMIN || env?.ADMIN_PASSWORD)
-		}, { origin });
-	}
-
-	if (pathname === '/api/admin/cluster-settings' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		const currentSettings = (await getKVClusterSettings(env)) || {};
-		const nextSettings = { ...currentSettings, ...body };
-		try {
-			await saveKVClusterSettings(env, nextSettings);
-			return jsonResponse({ success: true, clusterSettings: nextSettings }, { origin });
-		} catch (e) {
-			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
-		}
-	}
-
-	if (pathname === '/api/admin/tokens' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		const currentTokens = (await getKVTokens(env)) || [];
-		let nextTokens = [...currentTokens];
-
-		if (body.action === 'save_all' && Array.isArray(body.tokens)) {
-			nextTokens = body.tokens;
-		} else if (body.action === 'add') {
-			const tok = (body.token?.token || '').trim();
-			if (!tok) return jsonResponse({ success: false, error: 'Token 内容不能为空' }, { status: 400, origin });
-			nextTokens.unshift({
-				id: 't_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-				token: tok,
-				note: (body.token?.note || '').trim(),
-				enabled: body.token?.enabled !== false,
-				createdAt: Date.now()
-			});
-		} else if (body.action === 'toggle' && body.id) {
-			nextTokens = nextTokens.map(t => t.id === body.id ? { ...t, enabled: !t.enabled } : t);
-		} else if (body.action === 'delete' && body.id) {
-			nextTokens = nextTokens.filter(t => t.id !== body.id);
-		} else if (body.action === 'update' && body.token?.id) {
-			nextTokens = nextTokens.map(t => t.id === body.token.id ? { ...t, ...body.token } : t);
-		}
-
-		try {
-			await saveKVTokens(env, nextTokens);
-			return jsonResponse({ success: true, tokens: nextTokens }, { origin });
-		} catch (e) {
-			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
-		}
-	}
-
-	if (pathname === '/api/admin/workers' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		const currentWorkers = (await getKVWorkers(env)) || [];
-		let nextWorkers = [...currentWorkers];
-
-		if (body.action === 'save_all' && Array.isArray(body.workers)) {
-			nextWorkers = body.workers;
-		} else if (body.action === 'add') {
-			let nodeUrl = (body.worker?.url || '').trim().replace(/\/+$/, '');
-			if (!nodeUrl.startsWith('http://') && !nodeUrl.startsWith('https://')) {
-				nodeUrl = 'https://' + nodeUrl;
-			}
-			if (!nodeUrl) return jsonResponse({ success: false, error: '节点 URL 不能为空' }, { status: 400, origin });
-			nextWorkers.push({
-				id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-				name: (body.worker?.name || 'Worker 节点').trim(),
-				url: nodeUrl,
-				token: (body.worker?.token || '').trim(),
-				enabled: body.worker?.enabled !== false,
-				weight: Number(body.worker?.weight) || 1,
-				createdAt: Date.now()
-			});
-		} else if (body.action === 'toggle' && body.id) {
-			nextWorkers = nextWorkers.map(w => w.id === body.id ? { ...w, enabled: !w.enabled } : w);
-		} else if (body.action === 'delete' && body.id) {
-			nextWorkers = nextWorkers.filter(w => w.id !== body.id);
-		} else if (body.action === 'update' && body.worker?.id) {
-			nextWorkers = nextWorkers.map(w => w.id === body.worker.id ? { ...w, ...body.worker } : w);
-		}
-
-		try {
-			await saveKVWorkers(env, nextWorkers);
-			return jsonResponse({ success: true, workers: nextWorkers }, { origin });
-		} catch (e) {
-			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
-		}
-	}
-
-	if (pathname === '/api/admin/sources' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		if (!body.sources || typeof body.sources !== 'object') {
-			return jsonResponse({ success: false, error: '无效的接口配置数据' }, { status: 400, origin });
-		}
-		try {
-			await saveKVSources(env, body.sources);
-			return jsonResponse({ success: true, sources: body.sources }, { origin });
-		} catch (e) {
-			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
-		}
-	}
-
-	if (pathname === '/api/admin/password' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		const oldPass = (body.oldPassword || '').trim();
-		const newPass = (body.newPassword || '').trim();
-		const currentAdminPass = await getAdminPassword(env);
-
-		if (currentAdminPass && oldPass !== currentAdminPass) {
-			return jsonResponse({ success: false, error: '原密码验证不正确' }, { status: 400, origin });
-		}
-		if (!newPass || newPass.length < 4) {
-			return jsonResponse({ success: false, error: '新密码不能少于 4 个字符' }, { status: 400, origin });
-		}
-		try {
-			await setAdminPassword(env, newPass);
-			const sessionToken = await sha256Hex(newPass + ':cf_admin_session');
-			return jsonResponse({ success: true, token: sessionToken, message: '管理员密码修改成功' }, { origin });
-		} catch (e) {
-			return jsonResponse({ success: false, error: e.message }, { status: 500, origin });
-		}
-	}
-
-	if (pathname === '/api/admin/ping' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		let targetUrl = (body.url || '').trim().replace(/\/+$/, '');
-		if (!targetUrl.startsWith('https://')) {
-			targetUrl = 'https://' + targetUrl.replace(/^http:\/\//i, '');
-		}
-		let parsedTarget;
-		try {
-			parsedTarget = new URL(targetUrl);
-		} catch (e) {
-			return jsonResponse({ success: false, error: '目标 URL 格式无效' }, { status: 400, origin });
-		}
-		if (isPrivateHost(parsedTarget.hostname)) {
-			return jsonResponse({ success: false, error: '安全拦截：禁止探测本地与内网保留地址' }, { status: 403, origin });
-		}
-		const token = (body.token || '').trim();
-		const pingStart = Date.now();
-		try {
-			const reqHeaders = {};
-			if (token) {
-				reqHeaders['X-Token'] = token;
-				reqHeaders['Authorization'] = 'Bearer ' + token;
-			}
-			const pingRes = await fetch(targetUrl + '/ip.json', {
-				headers: reqHeaders,
-				signal: AbortSignal.timeout(8000)
-			});
-			const latency = Date.now() - pingStart;
-			let data = null;
-			try { data = await pingRes.json(); } catch (e) {}
-			return jsonResponse({
-				success: pingRes.ok,
-				status: pingRes.status,
-				latency,
-				colo: data?.colo || null,
-				ip: data?.ip || null
-			}, { origin });
-		} catch (e) {
-			return jsonResponse({
-				success: false,
-				error: e.message || '网络连接超时或无法访问该节点',
-				latency: Date.now() - pingStart
-			}, { origin });
-		}
-	}
-
-	if (pathname === '/api/admin/auto-deploy-node' && request.method === 'POST') {
-		let body = {};
-		try { body = await request.json(); } catch (e) {}
-		const email = (body.email || '').trim();
-		const apiKey = (body.apiKey || body.key || body.token || '').trim();
-		const scriptName = (body.scriptName || 'check-socks5-node').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-		const customNodeName = (body.nodeName || '').trim();
-
-		if (!apiKey) {
-			return jsonResponse({ success: false, error: '请提供 Global API Key 或 API Token' }, { status: 400, origin });
-		}
-
-		// 构建 Cloudflare 官方 API 认证请求头 (精确区分 Global API Key 与 API Token)
-		const isGlobalKey = /^[0-9a-f]{37}$/i.test(apiKey);
-		const cfHeaders = {};
-		if (email && isGlobalKey) {
-			cfHeaders['X-Auth-Email'] = email;
-			cfHeaders['X-Auth-Key'] = apiKey;
-		} else {
-			cfHeaders['Authorization'] = 'Bearer ' + apiKey;
-		}
-
-		try {
-			// 1. 获取 Account ID
-			const accRes = await fetch('https://api.cloudflare.com/client/v4/accounts?page=1&per_page=5', {
-				headers: cfHeaders,
-				signal: AbortSignal.timeout(10000)
-			});
-			const accData = await accRes.json();
-			if (!accData.success || !accData.result?.length) {
-				const errMsg = accData.errors?.[0]?.message || '无法获取账户信息，请检查邮箱与密钥是否正确';
-				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
-			}
-			const accountId = accData.result[0].id;
-			const accountName = accData.result[0].name || email || 'CF从节点';
-
-			// 2. 检查或获取 workers.dev 子域名
-			let subdomain = '';
-			const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
-				headers: cfHeaders,
-				signal: AbortSignal.timeout(10000)
-			});
-			const subData = await subRes.json();
-			if (subData.success && subData.result?.subdomain) {
-				subdomain = subData.result.subdomain;
-			} else {
-				// 若未创建子域，尝试自动初始化一个唯一的子域名称
-				const generatedSub = 's5-' + Math.random().toString(36).slice(2, 8);
-				const setSubRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
-					method: 'PUT',
-					headers: { ...cfHeaders, 'Content-Type': 'application/json' },
-					body: JSON.stringify({ subdomain: generatedSub }),
-					signal: AbortSignal.timeout(10000)
-				});
-				const setSubData = await setSubRes.json();
-				if (setSubData.success && setSubData.result?.subdomain) {
-					subdomain = setSubData.result.subdomain;
-				} else {
-					return jsonResponse({
-						success: false,
-						error: '该账号尚未开启 workers.dev 子域: ' + (setSubData.errors?.[0]?.message || '请先登录该账号分配一个 workers.dev 域名')
-					}, { status: 400, origin });
-				}
-			}
-
-			// 3. 上传部署极简从节点内核脚本 (注入专属随机鉴权 Token 防白嫖)
-			const nodeToken = 's5_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
-			const customizedScript = SUB_WORKER_SCRIPT_TEMPLATE.replace('__AUTH_TOKEN__', nodeToken);
-
-			const formData = new FormData();
-			const metadata = {
-				main_module: 'index.js',
-				compatibility_date: '2024-01-01',
-				compatibility_flags: ['nodejs_compat']
-			};
-			formData.set('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }), 'metadata.json');
-			formData.set('index.js', new Blob([customizedScript], { type: 'application/javascript+module' }), 'index.js');
-
-			const uploadRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}`, {
-				method: 'PUT',
-				headers: cfHeaders,
-				body: formData,
-				signal: AbortSignal.timeout(15000)
-			});
-			const uploadData = await uploadRes.json();
-			if (!uploadData.success) {
-				const errMsg = uploadData.errors?.[0]?.message || '上传 Worker 脚本失败';
-				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
-			}
-
-			// 4. 开启 workers.dev 访问路由并检查结果
-			const subRouteRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${scriptName}/subdomain`, {
-				method: 'POST',
-				headers: { ...cfHeaders, 'Content-Type': 'application/json' },
-				body: JSON.stringify({ enabled: true }),
-				signal: AbortSignal.timeout(10000)
-			});
-			const subRouteData = await subRouteRes.json();
-			if (!subRouteData.success) {
-				const errMsg = subRouteData.errors?.[0]?.message || '开启 workers.dev 路由失败';
-				return jsonResponse({ success: false, error: errMsg }, { status: 400, origin });
-			}
-
-			// 5. 组装从节点地址并保存到 KV 集群列表
-			const targetUrl = `https://${scriptName}.${subdomain}.workers.dev`;
-			const currentWorkers = (await getKVWorkers(env)) || [];
-			const nodeDisplayName = customNodeName || `${accountName} (自动部署)`;
-
-			const existingIndex = currentWorkers.findIndex(w => (w?.url || '').toLowerCase().replace(/\/+$/, '') === targetUrl.toLowerCase());
-			let nextWorkers = [...currentWorkers];
-			let savedNode;
-			if (existingIndex !== -1) {
-				savedNode = {
-					...nextWorkers[existingIndex],
-					name: nodeDisplayName,
-					url: targetUrl,
-					token: nodeToken || nextWorkers[existingIndex].token,
-					enabled: true
-				};
-				nextWorkers[existingIndex] = savedNode;
-			} else {
-				savedNode = {
-					id: 'w_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-					name: nodeDisplayName,
-					url: targetUrl,
-					token: nodeToken,
-					enabled: true
-				};
-				nextWorkers.push(savedNode);
-			}
-			await saveKVWorkers(env, nextWorkers);
-
-			// 6. 立即进行一次快速延迟探测
-			let latency = null;
-			let colo = 'CF';
-			try {
-				const pingStart = Date.now();
-				const pRes = await fetch(targetUrl + '/ip.json', {
-					headers: { 'X-Token': nodeToken },
-					signal: AbortSignal.timeout(6000)
-				});
-				if (pRes.ok) {
-					latency = Date.now() - pingStart;
-					const pJson = await pRes.json();
-					colo = pJson.colo || 'CF';
-				}
-			} catch (e) {}
-
-			return jsonResponse({
-				success: true,
-				node: savedNode,
-				url: targetUrl,
-				latency,
-				colo,
-				message: `成功部署至 ${targetUrl} 并已加入集群！`
-			}, { origin });
-
-		} catch (e) {
-			return jsonResponse({ success: false, error: '部署异常: ' + e.message }, { status: 500, origin });
-		}
-	}
-
-	return jsonResponse({ success: false, error: 'Endpoint not found' }, { status: 404, origin });
-}
-
 // ===================== Token 鉴权 =====================
-// 通过环境变量 TOKEN 或 KV 空间中的配置动态鉴权，未配置时不启用鉴权（保持向后兼容）。
+// 通过环境变量 TOKEN（或 AUTH_TOKEN、SECRET_TOKEN 等）配置访问密钥，未配置时不启用鉴权（保持向后兼容）。
+// 保护 /check、/resolve、/resolve-batch、/auth-check 等核心接口；首页页面、/ip.json、/locations 保持公开访问。
+// 支持多种传递方式，优先级从高到低：
+//   1. Authorization: Bearer <token>  请求头
+//   2. X-Token: <token>               请求头
+//   3. ?token=<token>                 URL 查询参数（同时兼容 ?key=<token>）
 function isAuthProtectedPath(pathname) {
 	const lower = pathname.toLowerCase();
-	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check' || lower === '/api/cluster/nodes' || lower === '/api/cluster/relay' || lower === '/api/sources/list';
+	return lower.startsWith('/check') || lower === '/resolve' || lower === '/resolve-batch' || lower === '/auth-check';
 }
 
 function getConfiguredToken(env) {
@@ -1456,31 +275,12 @@ function timingSafeEqual(a, b) {
 	return diff === 0;
 }
 
-async function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
+function checkAuthToken(request, url, env, pathTokenAuthenticated = false) {
 	if (pathTokenAuthenticated) return { ok: true };
 	if (!isAuthProtectedPath(url.pathname)) return { ok: true };
 
-	const kvTokens = await getKVTokens(env);
-	if (kvTokens && kvTokens.length > 0) {
-		const activeKvTokens = kvTokens.filter(t => t.enabled !== false);
-		if (activeKvTokens.length > 0) {
-			const provided = extractProvidedToken(request, url);
-			if (provided) {
-				for (const t of activeKvTokens) {
-					if (timingSafeEqual(provided, t.token)) {
-						return { ok: true };
-					}
-				}
-			}
-			const configuredToken = getConfiguredToken(env);
-			if (configuredToken && provided && timingSafeEqual(provided, configuredToken)) {
-				return { ok: true };
-			}
-			return { ok: false };
-		}
-	}
-
 	const configuredToken = getConfiguredToken(env);
+	// 未配置 TOKEN 时不启用鉴权
 	if (!configuredToken) return { ok: true };
 
 	const provided = extractProvidedToken(request, url);
@@ -1489,18 +289,9 @@ async function checkAuthToken(request, url, env, pathTokenAuthenticated = false)
 	}
 	return { ok: true };
 }
-
-async function isTokenRequired(env) {
-	const kvTokens = await getKVTokens(env);
-	if (kvTokens && kvTokens.length > 0) {
-		const activeKvTokens = kvTokens.filter(t => t.enabled !== false);
-		if (activeKvTokens.length > 0) return true;
-	}
-	return Boolean(getConfiguredToken(env));
-}
 // ===================== Token 鉴权结束 =====================
 
-async function checkProxy({ type, value }, colo, source = 'iplocate', env = null) {
+async function checkProxy({ type, value }, colo, source = 'iplocate') {
 	const startedAt = Date.now();
 	let proxy;
 
@@ -1520,13 +311,11 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 
 	let tunnel = null;
 	const selectedSource = String(source || 'iplocate').toLowerCase();
-	const kvSources = (await getKVSources(env)) || {};
 	let targetHost = 'www.iplocate.io';
 	let targetPort = 443;
 	let requestPath = '/api/lookup';
 	let acceptHeader = 'application/json';
 	let serverName = 'www.iplocate.io';
-	let currentKeyUsed = '';
 
 	if (selectedSource === 'ipsb') {
 		targetHost = 'api.ip.sb';
@@ -1538,65 +327,21 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 		serverName = 'ipwho.is';
 		requestPath = '/';
 		acceptHeader = 'application/json';
-	} else if (selectedSource === 'hackmyip' || selectedSource === 'hack_my_ip') {
-		targetHost = 'hackmyip.com';
-		serverName = 'hackmyip.com';
-		requestPath = '/api/ip';
-		acceptHeader = 'application/json';
-	} else if (selectedSource === 'ip2location' || selectedSource === 'ip2location_io') {
-		targetHost = 'api.ip2location.io';
-		serverName = 'api.ip2location.io';
-		currentKeyUsed = pickKeyForSource('ip2location', env, kvSources);
-		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}&format=json` : '/?format=json';
-		acceptHeader = 'application/json';
 	} else if (selectedSource === 'ipinfo') {
 		targetHost = 'ipinfo.io';
 		serverName = 'ipinfo.io';
-		currentKeyUsed = pickKeyForSource('ipinfo', env, kvSources);
-		requestPath = currentKeyUsed ? `/json?token=${encodeURIComponent(currentKeyUsed)}` : '/json';
+		requestPath = '/json';
 		acceptHeader = 'application/json';
 	} else if (selectedSource === 'cloudflare') {
 		targetHost = '1.1.1.1';
 		serverName = 'cloudflare.com';
 		requestPath = '/cdn-cgi/trace';
 		acceptHeader = 'text/plain';
-	} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co') {
+	} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
 		targetHost = 'ipapi.co';
 		serverName = 'ipapi.co';
 		requestPath = '/json/';
 		acceptHeader = 'application/json';
-	} else if (selectedSource === 'ipapi_is' || selectedSource === 'ipapiis' || selectedSource === 'ipapi') {
-		targetHost = 'api.ipapi.is';
-		serverName = 'api.ipapi.is';
-		currentKeyUsed = pickKeyForSource('ipapi_is', env, kvSources);
-		requestPath = currentKeyUsed ? `/?key=${encodeURIComponent(currentKeyUsed)}` : '/';
-		acceptHeader = 'application/json';
-	} else if (selectedSource === 'ipdata' || selectedSource === 'ipdata_co') {
-		targetHost = 'api.ipdata.co';
-		serverName = 'api.ipdata.co';
-		currentKeyUsed = pickKeyForSource('ipdata', env, kvSources);
-		requestPath = currentKeyUsed ? `/?api-key=${encodeURIComponent(currentKeyUsed)}` : '/';
-		acceptHeader = 'application/json';
-	} else {
-		// 检查是否为后台配置的自定义源 (custom:xxx)
-		const customDef = kvSources[selectedSource];
-		if (customDef && customDef.url) {
-			try {
-				let rawUrl = customDef.url.trim();
-				currentKeyUsed = pickKeyForSource(selectedSource, env, kvSources);
-				if (currentKeyUsed) {
-					rawUrl = rawUrl.replace(/\{\{KEY\}\}/gi, encodeURIComponent(currentKeyUsed));
-				}
-				const parsedCustomUrl = new URL(rawUrl);
-				targetHost = parsedCustomUrl.hostname;
-				serverName = parsedCustomUrl.hostname;
-				targetPort = parsedCustomUrl.port ? Number(parsedCustomUrl.port) : (parsedCustomUrl.protocol === 'http:' ? 80 : 443);
-				requestPath = parsedCustomUrl.pathname + parsedCustomUrl.search;
-				acceptHeader = 'application/json, text/plain, */*';
-			} catch (e) {
-				// URL 解析失败时回退到默认 iplocate
-			}
-		}
 	}
 
 	try {
@@ -1615,48 +360,17 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 			throw new Error(`Unsupported proxy type: ${proxy.type}`);
 		}
 
-		let timedOut = false;
-		const guardPromise = tunnelPromise.then(sock => {
-			if (timedOut) {
-				try { sock?.close?.(); } catch (e) {}
-			}
-			return sock;
-		});
-		try {
-			tunnel = await withTimeout(guardPromise, CHECK_TIMEOUT_MS, 'Proxy connection timed out');
-		} catch (err) {
-			timedOut = true;
-			throw err;
-		}
-
-		const isHttpsTarget = targetPort !== 80;
-		const clientSocket = isHttpsTarget ? new TlsClient(tunnel, {
+		tunnel = await withTimeout(tunnelPromise, CHECK_TIMEOUT_MS, 'Proxy connection timed out');
+		const tlsSocket = new TlsClient(tunnel, {
 			serverName: stripIPv6Brackets(serverName),
 			timeout: READ_TIMEOUT_MS,
 			allowChacha: true
-		}) : {
-			handshake: async () => {},
-			write: async (data) => {
-				const w = tunnel.writable.getWriter();
-				try { await w.write(data); } finally { w.releaseLock(); }
-			},
-			read: async () => {
-				const r = tunnel.readable.getReader();
-				try {
-					const res = await r.read();
-					return res.done ? null : res.value;
-				} finally {
-					r.releaseLock();
-				}
-			},
-			close: () => { try { tunnel?.close?.(); } catch (e) {} }
-		};
-
+		});
 		let exit;
 		try {
-			await withTimeout(clientSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
+			await withTimeout(tlsSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
 			const httpHostHeader = targetHost === '1.1.1.1' ? 'cloudflare.com' : targetHost;
-			await clientSocket.write(encoder.encode([
+			await tlsSocket.write(encoder.encode([
 				`GET ${requestPath} HTTP/1.1`,
 				`Host: ${httpHostHeader}`,
 				'User-Agent: Mozilla/5.0 CF-Workers-CheckProxy/2.0',
@@ -1668,7 +382,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 
 			let responseBuffer = new Uint8Array(0);
 			while (responseBuffer.byteLength < MAX_RESPONSE_BYTES) {
-				const value = await withTimeout(clientSocket.read(), READ_TIMEOUT_MS, 'Reading target response timed out');
+				const value = await withTimeout(tlsSocket.read(), READ_TIMEOUT_MS, 'Reading target response timed out');
 				if (!value) break;
 				if (!value.byteLength) continue;
 				responseBuffer = concatUint8(responseBuffer, value);
@@ -1699,41 +413,23 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 			const lengthMatch = headerText.match(/\r\ncontent-length:\s*(\d+)/i);
 			if (lengthMatch) bodyBytes = bodyBytes.slice(0, Number(lengthMatch[1]));
 
+			let bodyText = decoder.decode(bodyBytes);
 			if (/\r\ntransfer-encoding:\s*chunked/i.test(headerText)) {
 				let cursor = 0;
-				const chunks = [];
-				while (cursor < bodyBytes.byteLength) {
-					let lineEnd = -1;
-					for (let i = cursor; i < bodyBytes.byteLength - 1; i++) {
-						if (bodyBytes[i] === 0x0d && bodyBytes[i + 1] === 0x0a) {
-							lineEnd = i;
-							break;
-						}
-					}
+				let output = '';
+				while (cursor < bodyText.length) {
+					const lineEnd = bodyText.indexOf('\r\n', cursor);
 					if (lineEnd === -1) break;
-					const sizeLine = decoder.decode(bodyBytes.subarray(cursor, lineEnd)).split(';')[0].trim();
-					const size = parseInt(sizeLine, 16);
-					if (!Number.isFinite(size) || size < 0) break;
+					const sizeText = bodyText.slice(cursor, lineEnd).split(';')[0].trim();
+					const size = parseInt(sizeText, 16);
+					if (!Number.isFinite(size)) break;
 					cursor = lineEnd + 2;
 					if (size === 0) break;
-					if (cursor + size <= bodyBytes.byteLength) {
-						chunks.push(bodyBytes.subarray(cursor, cursor + size));
-					}
+					output += bodyText.slice(cursor, cursor + size);
 					cursor += size + 2;
 				}
-				if (chunks.length > 0) {
-					const totalLen = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-					const merged = new Uint8Array(totalLen);
-					let pos = 0;
-					for (const c of chunks) {
-						merged.set(c, pos);
-						pos += c.byteLength;
-					}
-					bodyBytes = merged;
-				}
+				bodyText = output || bodyText;
 			}
-
-			let bodyText = decoder.decode(bodyBytes);
 
 			if (selectedSource === 'cloudflare') {
 				const traceData = {};
@@ -1851,10 +547,6 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 				} catch (err) {
 					throw new Error('Target ipinfo.io did not return valid JSON');
 				}
-				if (raw.error || raw.status === 429) {
-					if (currentKeyUsed) markKeyCooldown('ipinfo', currentKeyUsed, 300000);
-					throw new Error(raw.error?.message || 'Target ipinfo.io rate limit reached');
-				}
 				const locParts = (raw.loc || '').split(',');
 				const lat = locParts[0] ? parseFloat(locParts[0]) : null;
 				const lon = locParts[1] ? parseFloat(locParts[1]) : null;
@@ -1889,7 +581,7 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_tor: false,
 					is_abuser: false
 				};
-			} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co') {
+			} else if (selectedSource === 'ipapico' || selectedSource === 'ipapi_co' || selectedSource === 'ipapi') {
 				let raw;
 				try {
 					raw = JSON.parse(bodyText.trim());
@@ -1926,262 +618,35 @@ async function checkProxy({ type, value }, colo, source = 'iplocate', env = null
 					is_proxy: false,
 					is_vpn: false,
 					is_tor: false,
-					is_abuser: false,
-					has_risk_data: false
-				};
-			} else if (selectedSource === 'hackmyip' || selectedSource === 'hack_my_ip') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target hackmyip.com did not return valid JSON');
-				}
-				const d = raw.data || raw;
-				const loc = d.location || {};
-				const net = d.network || {};
-				const priv = d.privacy || {};
-				const lat = loc.latitude ? parseFloat(loc.latitude) : null;
-				const lon = loc.longitude ? parseFloat(loc.longitude) : null;
-				const isDatacenter = priv.is_datacenter === true || priv.type === 'datacenter';
-				const isVpn = priv.is_vpn === true;
-				const isProxy = priv.proxy === true;
-				const isResidential = priv.is_residential === true;
-				const abuserScore = priv.score !== undefined ? priv.score : null;
-				const riskGrade = priv.grade || '';
-
-				exit = {
-					ip: d.ip,
-					country: loc.country || loc.country_name,
-					countryCode: loc.country || loc.country_name,
-					country_code: loc.country || loc.country_name,
-					countryName: loc.country_name || loc.country,
-					region: loc.region,
-					city: loc.city,
-					postal_code: loc.postal_code,
-					latitude: lat,
-					longitude: lon,
-					loc: lat && lon ? `${lat},${lon}` : '',
-					timezone: loc.timezone,
-					asn: {
-						asn: net.asn ? parseInt(net.asn, 10) : null,
-						org: net.isp,
-						name: net.isp,
-						descr: net.isp
-					},
-					asOrganization: net.isp,
-					company: {
-						name: net.isp,
-						type: isResidential ? 'isp' : (isDatacenter ? 'hosting' : 'business')
-					},
-					is_datacenter: isDatacenter,
-					is_bogon: false,
-					is_proxy: isProxy,
-					is_vpn: isVpn,
-					is_tor: false,
-					is_abuser: abuserScore && abuserScore > 50,
-					risk_score: abuserScore,
-					risk_grade: riskGrade,
-					has_risk_data: true
-				};
-			} else if (selectedSource === 'ip2location' || selectedSource === 'ip2location_io') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target api.ip2location.io did not return valid JSON');
-				}
-				if (raw.error) {
-					if (currentKeyUsed) markKeyCooldown('ip2location', currentKeyUsed, 300000);
-					throw new Error(raw.error.error_message || 'Target api.ip2location.io request failed');
-				}
-				const asnNum = raw.asn ? parseInt(String(raw.asn).replace(/^AS/i, ''), 10) : null;
-				const isProxy = raw.is_proxy === true;
-				exit = {
-					ip: raw.ip,
-					country: raw.country_code || raw.country_name,
-					countryCode: raw.country_code || raw.country_name,
-					country_code: raw.country_code || raw.country_name,
-					countryName: raw.country_name || raw.country_code,
-					region: raw.region_name,
-					city: raw.city_name,
-					postal_code: raw.zip_code,
-					latitude: raw.latitude,
-					longitude: raw.longitude,
-					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
-					timezone: raw.time_zone,
-					asn: {
-						asn: asnNum,
-						org: raw.as,
-						name: raw.as,
-						descr: raw.as
-					},
-					asOrganization: raw.as,
-					company: { name: raw.as },
-					is_datacenter: isProxy,
-					is_bogon: false,
-					is_proxy: isProxy,
-					is_vpn: false,
-					is_tor: false,
-					is_abuser: false,
-					has_risk_data: true
-				};
-			} else if (selectedSource === 'ipapi_is' || selectedSource === 'ipapiis' || selectedSource === 'ipapi') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target api.ipapi.is did not return valid JSON');
-				}
-				if (raw.error) {
-					markKeyCooldown('ipapi_is', currentKeyUsed);
-					throw new Error(raw.message || raw.reason || 'Target api.ipapi.is rate limit reached');
-				}
-				const asnData = raw.asn || {};
-				const companyData = raw.company || {};
-				const locationData = raw.location || {};
-				exit = {
-					ip: raw.ip,
-					country: locationData.country || raw.country,
-					countryCode: locationData.country_code || raw.country_code,
-					country_code: locationData.country_code || raw.country_code,
-					countryName: locationData.country || raw.country,
-					region: locationData.state || locationData.region,
-					city: locationData.city,
-					postal_code: locationData.zip || locationData.postal,
-					latitude: locationData.latitude,
-					longitude: locationData.longitude,
-					loc: locationData.latitude && locationData.longitude ? `${locationData.latitude},${locationData.longitude}` : '',
-					timezone: locationData.timezone,
-					asn: {
-						asn: asnData.asn || null,
-						org: asnData.org || asnData.descr,
-						name: asnData.org || asnData.descr,
-						descr: asnData.descr || asnData.org
-					},
-					asOrganization: asnData.org || companyData.name || '',
-					company: companyData,
-					is_datacenter: Boolean(raw.is_datacenter),
-					is_bogon: Boolean(raw.is_bogon),
-					is_proxy: Boolean(raw.is_proxy),
-					is_vpn: Boolean(raw.is_vpn),
-					is_tor: Boolean(raw.is_tor),
-					is_abuser: Boolean(raw.is_abuser)
-				};
-			} else if (selectedSource === 'ipdata' || selectedSource === 'ipdata_co') {
-				let raw;
-				try {
-					raw = JSON.parse(bodyText.trim());
-				} catch (err) {
-					throw new Error('Target api.ipdata.co did not return valid JSON');
-				}
-				if (raw.message && !raw.ip) {
-					markKeyCooldown('ipdata', currentKeyUsed);
-					throw new Error(raw.message || 'Target api.ipdata.co rate limit reached');
-				}
-				const asnData = raw.asn || {};
-				const threatData = raw.threat || {};
-				const asnNum = parseInt(String(asnData.asn || '').replace(/^AS/i, ''), 10) || null;
-				exit = {
-					ip: raw.ip,
-					country: raw.country_name || raw.country || '',
-					countryCode: raw.country_code || '',
-					country_code: raw.country_code || '',
-					countryName: raw.country_name || raw.country || '',
-					region: raw.region || '',
-					city: raw.city || '',
-					postal_code: raw.postal || '',
-					latitude: raw.latitude,
-					longitude: raw.longitude,
-					loc: raw.latitude && raw.longitude ? `${raw.latitude},${raw.longitude}` : '',
-					timezone: raw.time_zone?.name || '',
-					asn: {
-						asn: asnNum,
-						org: asnData.name || '',
-						name: asnData.name || '',
-						descr: asnData.name || ''
-					},
-					asOrganization: asnData.name || '',
-					company: { name: asnData.name || '' },
-					is_datacenter: Boolean(threatData.is_datacenter || asnData.type === 'hosting'),
-					is_bogon: Boolean(raw.is_bogon),
-					is_proxy: Boolean(threatData.is_proxy),
-					is_vpn: Boolean(threatData.is_vpn),
-					is_tor: Boolean(threatData.is_tor),
-					is_abuser: Boolean(threatData.is_known_abuser)
+					is_abuser: false
 				};
 			} else {
-				let raw;
 				try {
-					raw = JSON.parse(bodyText.trim());
+					exit = JSON.parse(bodyText.trim());
 				} catch (error) {
-					throw new Error('Target lookup did not return valid JSON');
+					throw new Error('Target /api/lookup did not return valid JSON');
 				}
 
-				// 检查是否为自定义源提取映射
-				const allKVSources = (await getKVSources(env)) || {};
-				const customDef = allKVSources[selectedSource];
-				if (customDef && customDef.mapping) {
-					const m = customDef.mapping;
-					const ipVal = getObjectByPath(raw, m.ip || 'ip') || raw.ip || '';
-					const countryVal = getObjectByPath(raw, m.country || 'country') || '';
-					const countryCodeVal = getObjectByPath(raw, m.country_code || 'country_code') || countryVal;
-					const cityVal = getObjectByPath(raw, m.city || 'city') || '';
-					const asnNum = parseInt(getObjectByPath(raw, m.asn || 'asn') || '0', 10) || null;
-					const orgVal = getObjectByPath(raw, m.org || 'org') || getObjectByPath(raw, m.isp || 'isp') || '';
-					const isProxyVal = Boolean(getObjectByPath(raw, m.is_proxy || 'is_proxy') || getObjectByPath(raw, m.proxy || 'proxy'));
-					const isVpnVal = Boolean(getObjectByPath(raw, m.is_vpn || 'is_vpn') || getObjectByPath(raw, m.vpn || 'vpn'));
-					const isDcVal = Boolean(getObjectByPath(raw, m.is_datacenter || 'is_datacenter') || getObjectByPath(raw, m.hosting || 'hosting'));
-					exit = {
-						ip: ipVal,
-						country: countryVal,
-						countryCode: countryCodeVal,
-						country_code: countryCodeVal,
-						countryName: countryVal,
-						region: getObjectByPath(raw, m.region || 'region') || '',
-						city: cityVal,
-						postal_code: getObjectByPath(raw, m.postal || 'postal') || '',
-						latitude: parseFloat(getObjectByPath(raw, m.latitude || 'latitude')) || null,
-						longitude: parseFloat(getObjectByPath(raw, m.longitude || 'longitude')) || null,
-						loc: (getObjectByPath(raw, m.latitude || 'latitude') && getObjectByPath(raw, m.longitude || 'longitude')) ? `${getObjectByPath(raw, m.latitude || 'latitude')},${getObjectByPath(raw, m.longitude || 'longitude')}` : '',
-						timezone: getObjectByPath(raw, m.timezone || 'timezone') || '',
-						asn: {
-							asn: asnNum,
-							org: orgVal,
-							name: orgVal,
-							descr: orgVal
-						},
-						asOrganization: orgVal,
-						company: { name: orgVal },
-						is_datacenter: isDcVal,
-						is_bogon: false,
-						is_proxy: isProxyVal,
-						is_vpn: isVpnVal,
-						is_tor: false,
-						is_abuser: false
-					};
-				} else {
-					// 默认按照 iplocate.io 响应结构解析
-					exit = {
-						...raw,
-						asn: raw.asn ? {
-							...raw.asn,
-							org: raw.asn.name || raw.asn.org,
-							descr: raw.asn.name || raw.asn.descr,
-						} : raw.asn,
-						rir: raw.asn?.rir || null,
-						is_datacenter: raw.privacy?.is_hosting || false,
-						is_crawler: false,
-						is_bogon: raw.privacy?.is_bogon || false,
-						is_proxy: raw.privacy?.is_proxy || false,
-						is_vpn: raw.privacy?.is_vpn || false,
-						is_tor: raw.privacy?.is_tor || false,
-						is_abuser: raw.privacy?.is_abuser || false,
-						has_risk_data: Boolean(raw.privacy),
-					};
-				}
+				// Transform iplocate.io response to maintain compatibility with existing frontend
+				exit = {
+					...exit,
+					asn: exit.asn ? {
+						...exit.asn,
+						org: exit.asn.name || exit.asn.org,
+						descr: exit.asn.name || exit.asn.descr,
+					} : exit.asn,
+					rir: exit.asn?.rir || null,
+					is_datacenter: exit.privacy?.is_hosting || false,
+					is_crawler: false,
+					is_bogon: exit.privacy?.is_bogon || false,
+					is_proxy: exit.privacy?.is_proxy || false,
+					is_vpn: exit.privacy?.is_vpn || false,
+					is_tor: exit.privacy?.is_tor || false,
+					is_abuser: exit.privacy?.is_abuser || false,
+				};
 			}
 		} finally {
-			try { clientSocket?.close?.(); } catch (e) { }
+			try { tlsSocket.close(); } catch (e) { }
 		}
 
 		return buildCheckResult({
@@ -2594,37 +1059,20 @@ async function socks5Connect(proxy, targetHost, targetPort) {
 			throw new Error(`SOCKS5 unsupported auth method: ${selectedMethod}`);
 		}
 
-		const hostBytes = encoder.encode(targetHost);
-		if (hostBytes.byteLength > 255) throw new Error('Target hostname is too long for SOCKS5');
-		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
+		const cleanHost = stripIPv6Brackets(targetHost);
+		let connectPacket;
+		if (isIPv4(cleanHost)) {
+			const parts = cleanHost.split('.').map(Number);
+			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x01, ...parts, targetPort >> 8, targetPort & 0xff]);
+		} else {
+			const hostBytes = encoder.encode(cleanHost);
+			if (hostBytes.byteLength > 255) throw new Error('Target hostname is too long for SOCKS5');
+			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
+		}
 		await writer.write(connectPacket);
-
-		// 严格按帧读取完整的 SOCKS5 CONNECT 确认报文，防止拆包导致未决字节残留在流中破坏后续 TLS 握手
-		let replyBuf = new Uint8Array(0);
-		while (replyBuf.byteLength < 4) {
-			const chunk = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
-			if (chunk.done || !chunk.value) throw new Error('SOCKS5 connection closed prematurely');
-			replyBuf = concatUint8(replyBuf, chunk.value);
-		}
-		if (replyBuf[1] !== 0x00) throw new Error(`SOCKS5 connection failed: ${replyBuf[1]}`);
-		const atyp = replyBuf[3];
-		let totalExpected = 4;
-		if (atyp === 0x01) {
-			totalExpected = 4 + 4 + 2; // IPv4: 10 bytes
-		} else if (atyp === 0x04) {
-			totalExpected = 4 + 16 + 2; // IPv6: 22 bytes
-		} else if (atyp === 0x03) {
-			if (replyBuf.byteLength < 5) {
-				const chunk = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
-				if (chunk.done || !chunk.value) throw new Error('SOCKS5 connection closed prematurely');
-				replyBuf = concatUint8(replyBuf, chunk.value);
-			}
-			totalExpected = 5 + replyBuf[4] + 2; // Domain
-		}
-		while (replyBuf.byteLength < totalExpected) {
-			const chunk = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
-			if (chunk.done || !chunk.value) throw new Error('SOCKS5 connection closed prematurely');
-			replyBuf = concatUint8(replyBuf, chunk.value);
+		response = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, 'SOCKS5 CONNECT timed out');
+		if (response.done || !response.value || response.value.byteLength < 2 || response.value[1] !== 0x00) {
+			throw new Error(`SOCKS5 connection failed: ${response.value?.[1] ?? 'closed'}`);
 		}
 
 		writer.releaseLock();
@@ -3608,38 +2056,35 @@ function normalizeTxtValue(value) {
 }
 
 async function DoH查询(name, type, endpoint = 'https://cloudflare-dns.com/dns-query') {
-	const endpoints = [
-		endpoint,
-		'https://dns.google/resolve'
-	];
-	for (const ep of endpoints) {
-		try {
-			const separator = ep.includes('?') ? '&' : '?';
-			const response = await fetch(`${ep}${separator}name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`, {
-				headers: { accept: 'application/dns-json' },
-				signal: AbortSignal.timeout(3500)
-			});
-			if (!response.ok) continue;
-			const payload = await response.json();
-			// Status 0 为 NOERROR (解析成功，无该类型记录属于合法空结果)；Status 3 为 NXDOMAIN (域名不存在)
-			// 仅当遭遇网络异常、HTTP非200或 SERVFAIL (Status 2) 时才回退至备用提供商，绝不因无 AAAA 记录误耗子请求
-			if (payload && (payload.Status === 0 || payload.Status === 3)) {
-				if (!Array.isArray(payload.Answer) || payload.Answer.length === 0) {
-					return [];
-				}
-				return payload.Answer.map(answer => ({
-					name: answer.name || name,
-					type: answer.type,
-					TTL: answer.TTL,
-					data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
-				}));
+	try {
+		const response = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`, {
+			headers: { accept: 'application/dns-json' },
+			signal: AbortSignal.timeout(3500)
+		});
+		if (!response.ok) {
+			if (endpoint.includes('cloudflare-dns.com')) {
+				return DoH查询(name, type, 'https://dns.google/resolve');
 			}
-			continue;
-		} catch (error) {
-			// 网络异常回退到备用 DoH 提供商
+			return [];
 		}
+		const payload = await response.json();
+		if (!Array.isArray(payload.Answer)) return [];
+		return payload.Answer.map(answer => ({
+			name: answer.name || name,
+			type: answer.type,
+			TTL: answer.TTL,
+			data: answer.type === 16 ? normalizeTxtValue(answer.data) : answer.data
+		}));
+	} catch (error) {
+		if (endpoint.includes('cloudflare-dns.com')) {
+			try {
+				return await DoH查询(name, type, 'https://dns.google/resolve');
+			} catch (e) {
+				return [];
+			}
+		}
+		return [];
 	}
-	return [];
 }
 
 function generateHTML(备案内容, hasToken = false) {
@@ -6606,12 +5051,6 @@ function generateHTML(备案内容, hasToken = false) {
 							<path d="m18.5 4.5 3 3"></path>
 						</svg>
 					</button>
-					<a class="token-toggle admin-toggle" href="/admin" target="_blank" rel="noopener noreferrer" aria-label="后台管理与集群配置" title="后台管理与集群配置 (/admin)">
-						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
-							<circle cx="12" cy="12" r="3"></circle>
-						</svg>
-					</a>
 					<button class="theme-toggle" type="button" id="themeToggle" aria-label="切换日间和夜间模式" title="切换日间和夜间模式">
 						<span class="theme-toggle-switch" aria-hidden="true">
 							<svg class="theme-toggle-icon theme-toggle-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -6690,15 +5129,11 @@ function generateHTML(备案内容, hasToken = false) {
 							<div class="source-select-wrapper">
 								<select id="ipSourceSelect" class="source-select" aria-label="选择出口 IP 检测源">
 									<option value="iplocate">iplocate.io (默认 · 综合地理定位与机房风控)</option>
-									<option value="hackmyip">HackMyIP (风控首选 · 原生住宅/机房/VPN与纯净度评级)</option>
-									<option value="ip2location">IP2Location.io (权威顶牌 · 自带代理识别 / 免密即用)</option>
 									<option value="ipwhois">ipwho.is (高精度 · 规范全字段 / 海外稳定)</option>
 									<option value="ipsb">api.ip.sb (极速响应 · 大批量测活首选)</option>
 									<option value="cloudflare">Cloudflare 官方 (cdn-cgi/trace · 1w+大批量推荐)</option>
 									<option value="ipinfo">ipinfo.io (知名老牌 · 国际权威数据库)</option>
 									<option value="ipapico">ipapi.co (高精度单条 · 有严格限速)</option>
-									<option value="ipapi_is">api.ipapi.is (深度风控 · 建议配置多Key轮询)</option>
-									<option value="ipdata">ipdata.co (国际权威数据库 · 支持配置Key)</option>
 								</select>
 							</div>
 						</div>
@@ -6879,16 +5314,6 @@ function generateHTML(备案内容, hasToken = false) {
 				label: 'iplocate.io',
 				desc: '当前：<b>iplocate.io</b>，提供详细的国家、城市、经纬度与 ASN 组织信息。'
 			},
-			hackmyip: {
-				badge: 'HackMyIP',
-				label: 'HackMyIP',
-				desc: '当前：<b>HackMyIP</b>，原生识别住宅/机房/VPN/Proxy及纯净度评级 (A-D / 0-100)，风控首选。'
-			},
-			ip2location: {
-				badge: 'IP2Location',
-				label: 'IP2Location.io',
-				desc: '当前：<b>IP2Location.io</b>，全球顶牌数据库，自带代理检测，免密可用且支持配置多 Key 扩容。'
-			},
 			ipwhois: {
 				badge: 'ipwho.is',
 				label: 'ipwho.is',
@@ -6913,22 +5338,13 @@ function generateHTML(备案内容, hasToken = false) {
 				badge: 'ipapi.co',
 				label: 'ipapi.co',
 				desc: '当前：<b>ipapi.co</b>，地理与网络信息详尽，但每分钟限制 30 次且对并发敏感，适合单条或少量节点测试。'
-			},
-			ipapi_is: {
-				badge: 'api.ipapi.is',
-				label: 'api.ipapi.is',
-				desc: '当前：<b>api.ipapi.is</b>，深度机房与风控指纹识别，支持在后台管理配置多 Key 自动轮询。'
-			},
-			ipdata: {
-				badge: 'ipdata.co',
-				label: 'ipdata.co',
-				desc: '当前：<b>ipdata.co</b>，国际权威威胁情报数据库，提供高精机房、VPN及代理识别，需配置 Key。'
 			}
 		};
 
 		function getStoredIpSource() {
 			try {
-				const stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
+				let stored = localStorage.getItem(IP_SOURCE_STORAGE_KEY);
+				if (stored === 'ipapi_is') stored = 'ipwhois';
 				return stored && IP_SOURCE_DEFINITIONS[stored] ? stored : 'iplocate';
 			} catch {
 				return 'iplocate';
@@ -6978,13 +5394,10 @@ function generateHTML(备案内容, hasToken = false) {
 		let inputCount = 0;
 		let appState = 'idle';
 		let activeRun = null;
-		let clusterNodes = [];
-		let clusterRoundRobinIndex = 0;
-		let clusterNodesPromise = null;
 		const CHECK_CONCURRENCY = 32;
 		const RESOLVE_BATCH_SIZE = 20;
-		const RESOLVE_BATCH_TIMEOUT_MS = 15000;
-		const RESOLVE_BATCH_MAX_ATTEMPTS = 2;
+		const RESOLVE_BATCH_TIMEOUT_MS = 20000;
+		const RESOLVE_BATCH_MAX_ATTEMPTS = 3;
 		const RISK_RESULT_FILTERS = [
 			{ key: 'verylow', label: '极度纯净' },
 			{ key: 'low', label: '纯净' },
@@ -7315,128 +5728,6 @@ function generateHTML(备案内容, hasToken = false) {
 			return backendServicePromise;
 		}
 
-		let pureClusterMode = false;
-		const nodeFailures = new Map(); // nodeUrl -> failure count
-		const nodeCooldownUntil = new Map(); // nodeUrl -> timestamp
-
-		function getHealthyClusterNode() {
-			if (!clusterNodes || !clusterNodes.length) return null;
-			const now = Date.now();
-			const activeNodes = clusterNodes.filter(url => {
-				const cd = nodeCooldownUntil.get(url);
-				return !cd || now > cd;
-			});
-			if (!activeNodes.length) return null;
-			const selected = activeNodes[clusterRoundRobinIndex++ % activeNodes.length];
-			return selected;
-		}
-
-		function reportNodeFailure(nodeUrl, isRateLimit = false) {
-			if (!nodeUrl) return;
-			const count = (nodeFailures.get(nodeUrl) || 0) + 1;
-			nodeFailures.set(nodeUrl, count);
-			// 如果是 429/1015 或连续失败 2 次，冷却休眠 5 分钟
-			if (isRateLimit || count >= 2) {
-				nodeCooldownUntil.set(nodeUrl, Date.now() + 300000);
-				console.warn('[Cluster Node Cooldown]', nodeUrl, '已熔断休眠 5 分钟');
-			}
-		}
-
-		function reportNodeSuccess(nodeUrl) {
-			if (!nodeUrl) return;
-			nodeFailures.delete(nodeUrl);
-			nodeCooldownUntil.delete(nodeUrl);
-		}
-
-		let clusterNodeTokens = {};
-		async function loadClusterNodes() {
-			if (clusterNodesPromise) return clusterNodesPromise;
-			clusterNodesPromise = (async function () {
-				try {
-					const res = await fetchJsonWithTimeout('/api/cluster/nodes', {}, 5000);
-					if (res.response && res.response.ok && Array.isArray(res.payload?.nodes)) {
-						clusterNodes = [];
-						clusterNodeTokens = {};
-						res.payload.nodes.forEach(n => {
-							const u = String(n.url || n).trim();
-							if (u) {
-								clusterNodes.push(u);
-								const cleanUrl = u.endsWith('/') ? u.slice(0, -1) : u;
-								if (n.token) clusterNodeTokens[cleanUrl] = n.token;
-							}
-						});
-						pureClusterMode = Boolean(res.payload?.pureClusterMode);
-						if (clusterNodes.length > 0) {
-							console.log('[Cluster] 已加载多 Worker 节点集群:', clusterNodes.length, '个节点', pureClusterMode ? '(纯集群执行模式)' : '');
-						}
-					}
-				} catch (e) {
-					// Standalone worker mode
-					clusterNodesPromise = null;
-				}
-				// 动态加载自定义源
-				try {
-					const sRes = await fetchJsonWithTimeout('/api/sources/list', {}, 5000);
-					if (sRes.response && sRes.response.ok && sRes.payload?.sources) {
-						updateCustomSourcesInUI(sRes.payload.sources);
-					}
-				} catch (e) {}
-				return clusterNodes;
-			})();
-			return clusterNodesPromise;
-		}
-
-		function updateCustomSourcesInUI(sourcesConfig) {
-			if (!ipSourceSelect || !sourcesConfig) return;
-			const currentSelected = getSelectedIpSource();
-
-			// 1. 动态联动内置接口的显示/隐藏（若后台设置为禁用，前台直接隐藏）
-			const builtInKeys = ['iplocate', 'hackmyip', 'ip2location', 'ipwhois', 'ipsb', 'cloudflare', 'ipinfo', 'ipapico', 'ipapi_is', 'ipdata'];
-			builtInKeys.forEach(key => {
-				const opt = ipSourceSelect.querySelector('option[value="' + key + '"]');
-				if (!opt) return;
-				const isEnabled = sourcesConfig[key]?.enabled !== false;
-				opt.hidden = !isEnabled;
-				opt.disabled = !isEnabled;
-			});
-
-			// 2. 移除旧的自定义选项并挂载启用的自定义源
-			const customOptions = ipSourceSelect.querySelectorAll('option[data-custom="true"]');
-			customOptions.forEach(opt => opt.remove());
-
-			Object.keys(sourcesConfig).forEach(key => {
-				const src = sourcesConfig[key];
-				if (!src || src.enabled === false) return;
-				if (builtInKeys.includes(key)) return;
-
-				// 注册到 IP_SOURCE_DEFINITIONS
-				IP_SOURCE_DEFINITIONS[key] = {
-					badge: src.label || key,
-					label: src.label || key,
-					desc: '自定义源：<b>' + escapeHtml(src.label || key) + '</b> (' + escapeHtml(src.url || '') + ')'
-				};
-				const opt = document.createElement('option');
-				opt.value = key;
-				opt.dataset.custom = 'true';
-				opt.textContent = (src.label || key) + ' (自定义 · 映射提取)';
-				ipSourceSelect.appendChild(opt);
-			});
-
-			// 3. 若当前选中的接口在后台被禁用了，自动平滑切换到第一个可用接口
-			let targetSource = currentSelected;
-			const currentOpt = ipSourceSelect.querySelector('option[value="' + currentSelected + '"]');
-			if (!currentOpt || currentOpt.hidden || currentOpt.disabled) {
-				const firstAvailable = Array.from(ipSourceSelect.options).find(o => !o.hidden && !o.disabled);
-				if (firstAvailable) {
-					targetSource = firstAvailable.value;
-				}
-			}
-
-			if (targetSource && IP_SOURCE_DEFINITIONS[targetSource]) {
-				applyIpSource(targetSource, true);
-			}
-		}
-
 		function clearMapLayers() {
 			mapLayers.forEach(function (layer) {
 				map.removeLayer(layer);
@@ -7497,43 +5788,22 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		function calculateExitRiskScore(exitData) {
-			if (!exitData || !exitData.ip) return null;
-			if (exitData?.has_risk_data === false) return null;
-			if (exitData?.risk_score !== undefined && exitData?.risk_score !== null) {
-				const directScore = parseAbuseScore(exitData.risk_score);
-				if (directScore !== null) {
-					return directScore / 100;
-				}
-			}
-			const hasCompanyScore = exitData?.company?.abuser_score !== undefined;
-			const hasAsnScore = exitData?.asnInfo?.abuser_score !== undefined;
 			const companyScore = parseAbuseScore(exitData?.company?.abuser_score) || 0;
 			const asnScore = parseAbuseScore(exitData?.asnInfo?.abuser_score) || 0;
 			const baseScore = ((companyScore + asnScore) / 2) * 5;
-
-			const riskFlags = [
+			const riskCount = [
 				exitData?.is_crawler,
 				exitData?.is_proxy,
 				exitData?.is_vpn,
 				exitData?.is_tor,
 				exitData?.is_abuser
-			];
-			const riskCount = riskFlags.filter(flag => flag === true).length;
-			const isDatacenter = exitData?.is_datacenter === true;
-			const isBogon = exitData?.is_bogon === true;
-
-			// 若没有提供任何风险评分、也没有任何阳性风控标记，且属于无风控源，则返回 null（恢复显示“未知”，绝不误报“极度纯净”）
-			const hasAnyPositiveRisk = riskCount > 0 || isDatacenter || isBogon || hasCompanyScore || hasAsnScore;
-			if (!hasAnyPositiveRisk && exitData?.has_risk_data !== true) {
-				return null;
-			}
-
+			].filter(function (flag) {
+				return flag === true;
+			}).length;
 			let finalScore = baseScore + riskCount * 0.15;
-			if (isDatacenter && !exitData?.is_proxy && !exitData?.is_vpn) {
-				finalScore += 0.05;
-			}
-			if (isBogon) finalScore += 1.0;
-			return Math.min(Math.max(finalScore, 0), 1.0);
+			if (exitData?.is_bogon) finalScore += 1.0;
+			if (baseScore === 0 && riskCount === 0 && !exitData?.is_bogon) return null;
+			return finalScore;
 		}
 
 		function getExitRiskMeta(score) {
@@ -7974,14 +6244,9 @@ function generateHTML(备案内容, hasToken = false) {
 		}
 
 		function getDirectProxyTarget(input) {
-			try {
-				const normalizedInput = normalizeProxyInput(input, true) || input;
-				const parsed = parseProxyUrl(normalizedInput);
-				if (parsed.scheme === 'sstp' || parsed.scheme === 'https') return parsed.normalized;
-				return isClientIpAddress(parsed.hostPlain) ? parsed.normalized : '';
-			} catch (e) {
-				return '';
-			}
+			const parsed = parseProxyUrl(input);
+			if (parsed.scheme === 'sstp' || parsed.scheme === 'https') return parsed.normalized;
+			return isClientIpAddress(parsed.hostPlain) ? parsed.normalized : '';
 		}
 
 		function parseResolvedTarget(target) {
@@ -8303,8 +6568,8 @@ function generateHTML(备案内容, hasToken = false) {
 					const currentIndex = nextIndex++;
 					try {
 						await worker(items[currentIndex], currentIndex);
-					} catch (taskErr) {
-						console.error('Worker task execution error for item', currentIndex, taskErr);
+					} catch (workerErr) {
+						console.error('Task error in concurrency runner:', workerErr);
 					}
 				}
 			}
@@ -8479,7 +6744,6 @@ function generateHTML(备案内容, hasToken = false) {
 			const record = {
 				target: target,
 				el: itemObj.el,
-				itemObj: itemObj,
 				status: 'pending',
 				proxyType: getProxyTypeFromTarget(target),
 				riskLevels: [],
@@ -8795,15 +7059,6 @@ function generateHTML(备案内容, hasToken = false) {
 			filterPanel.hidden = !isFilterPanelExpanded;
 			filterToggle.setAttribute('aria-expanded', String(isFilterPanelExpanded));
 			filterToggleText.innerText = getFilterToggleLabel(visibleCount);
-		}
-
-		let updateFiltersRaf = null;
-		function scheduleUpdateResultFilters() {
-			if (updateFiltersRaf) return;
-			updateFiltersRaf = requestAnimationFrame(function () {
-				updateFiltersRaf = null;
-				updateResultFilters();
-			});
 		}
 
 		function updateResultFilters() {
@@ -9176,18 +7431,18 @@ function generateHTML(备案内容, hasToken = false) {
 
 		function saveHistory(value) {
 			if (!value || value.includes('\\n')) return;
+			let history = getHistory();
+			history = history.filter(function (item) {
+				return item !== value;
+			});
+			history.unshift(value);
+			history = history.slice(0, 10);
 			try {
-				let history = getHistory();
-				history = history.filter(function (item) {
-					return item !== value;
-				});
-				history.unshift(value);
-				history = history.slice(0, 10);
 				localStorage.setItem('cf_proxy_history', JSON.stringify(history));
-				renderHistory();
 			} catch (e) {
-				console.warn('Failed to save history to localStorage', e);
+				console.warn('Failed to save history to localStorage:', e);
 			}
+			renderHistory();
 		}
 
 		function selectHistory(value) {
@@ -9200,6 +7455,10 @@ function generateHTML(备案内容, hasToken = false) {
 			const history = getHistory();
 			historyDropdown.innerHTML = '';
 
+			if (history.length && !inputList.value && !batchMode.checked) {
+				inputList.value = history[0];
+			}
+
 			if (!history.length) {
 				const emptyItem = document.createElement('button');
 				emptyItem.type = 'button';
@@ -9207,10 +7466,6 @@ function generateHTML(备案内容, hasToken = false) {
 				emptyItem.innerText = '暂无历史记录';
 				historyDropdown.appendChild(emptyItem);
 				return;
-			}
-
-			if (inputList && !inputList.value.trim() && history.length > 0) {
-				inputList.value = history[0];
 			}
 
 			history.forEach(function (item) {
@@ -9268,64 +7523,6 @@ function generateHTML(备案内容, hasToken = false) {
 			}
 			const text = String(value);
 			return text.includes('ms') ? text : text + ' ms';
-		}
-
-		function classifyCheckError(errorMsg) {
-			if (errorMsg && typeof errorMsg === 'object') {
-				errorMsg = errorMsg.message || errorMsg.error || JSON.stringify(errorMsg);
-			}
-			const msg = String(errorMsg || '').toLowerCase();
-			if (!msg) {
-				return { badge: '不可用', category: '检测未通过', description: '代理连接无响应或验证失败。' };
-			}
-			// 1. 集群中继与网关异常
-			if (msg.includes('relay failed') || (msg.includes('relay') && (msg.includes('fail') || msg.includes('err')))) {
-				return { badge: '中继失败', category: '集群中继异常', description: '主 Worker 转发请求至从节点失败，可能从节点网络阻断或脱机 (502 Relay Failed)。' };
-			}
-			if (msg.includes('502') || msg.includes('bad gateway')) {
-				return { badge: '网关错误', category: '中继网关异常', description: '从节点或上游中继网关响应 502 错误，目标集群服务暂时不可达。' };
-			}
-			if (msg.includes('504') || msg.includes('gateway timeout')) {
-				return { badge: '网关超时', category: '网关响应超时', description: '中继网关等待上游节点响应超时 (HTTP 504 Gateway Timeout)。' };
-			}
-			if (msg.includes('521') || msg.includes('522') || msg.includes('520') || msg.includes('523') || msg.includes('524')) {
-				return { badge: '节点脱机', category: 'Cloudflare异常', description: 'Cloudflare 无法连接到指定的从节点 Worker，源站服务不可用。' };
-			}
-			// 2. 超时与中断
-			if (msg.includes('abort') || msg.includes('timeout') || msg.includes('timed out') || msg.includes('超时')) {
-				return { badge: '握手超时', category: '连接或握手超时', description: '代理连接或握手超时，目标节点无响应或丢包严重。' };
-			}
-			// 3. 连接重置与拒绝
-			if (msg.includes('refused') || msg.includes('reset') || msg.includes('拒绝') || msg.includes('重置') || msg.includes('closed') || msg.includes('econn')) {
-				return { badge: '被重置/拒绝', category: '连接异常中断', description: '代理端口拒绝连接或握手被对端强制关闭/重置（目标服务未启动或被阻断）。' };
-			}
-			// 4. 权限与鉴权体系细分
-			if (msg.includes('403') || msg.includes('forbidden')) {
-				return { badge: '禁止访问', category: '访问被拒绝/拦截', description: '请求被拒绝 (HTTP 403)，可能是安全防火墙/WAF拦截，或节点令牌权限不足。' };
-			}
-			if (msg.includes('unauthorized') || (msg.includes('token') && msg.includes('invalid')) || msg.includes('401')) {
-				return { badge: '令牌无效', category: '接口鉴权失败', description: '访问令牌缺失或校验不通过 (HTTP 401 Unauthorized)，请检查 Token 设置。' };
-			}
-			if (msg.includes('407') || msg.includes('auth') || msg.includes('credential') || msg.includes('认证') || msg.includes('密码')) {
-				return { badge: '认证失败', category: '账号鉴权失败', description: '代理服务器需要鉴权或提供的用户名/密码无效 (407 Proxy Auth Required)。' };
-			}
-			// 5. DNS 解析
-			if (msg.includes('dns') || msg.includes('resolve') || msg.includes('not found') || msg.includes('解析') || msg.includes('enotfound')) {
-				return { badge: '解析失败', category: '域名无法解析', description: '代理的主机名无法通过 DNS/DoH 解析，请检查域名或 DNS。' };
-			}
-			// 6. TLS 握手
-			if (msg.includes('tls') || msg.includes('ssl') || msg.includes('cert') || msg.includes('handshake failed') || msg.includes('证书')) {
-				return { badge: 'TLS错误', category: 'TLS/证书握手失败', description: '安全加密握手失败，目标证书无效、端口不支持 SSL 或协议版本不兼容。' };
-			}
-			// 7. 速率限制
-			if (msg.includes('429') || msg.includes('1015') || msg.includes('1027') || msg.includes('rate limit') || msg.includes('限流') || msg.includes('quota')) {
-				return { badge: '被限流', category: '触发频率限制', description: '数据源或检测节点触发频率限制，建议切换节点或稍后再试。' };
-			}
-			// 8. 协议不支持
-			if (msg.includes('unsupported') || msg.includes('protocol') || msg.includes('协议')) {
-				return { badge: '协议不支持', category: '协议格式异常', description: '目标返回了非预期的握手报文，目标端口可能不是指定的代理协议。' };
-			}
-			return { badge: '不可用', category: '检测未通过', description: '无法通过该代理访问目标出口，请检查代理可用性或更换目标。' };
 		}
 
 		function getLatencyTooltipText(data) {
@@ -9574,11 +7771,10 @@ function generateHTML(备案内容, hasToken = false) {
 				ipv4: { ok: false },
 				ipv6: { ok: false }
 			};
-			const respTime = source.responseTime ?? source.latency ?? source.connect_ms ?? source.elapsed_ms;
 			if (exit && exit.ip) {
 				probeResults[stack] = {
 					ok: true,
-					connect_ms: respTime,
+					connect_ms: source.responseTime,
 					exit: exit
 				};
 			}
@@ -9586,8 +7782,6 @@ function generateHTML(备案内容, hasToken = false) {
 			return Object.assign({}, source, {
 				type: normalizeProxyType(source.type) || (parsed ? parsed.scheme : ''),
 				exit: exit,
-				responseTime: respTime,
-				latency: respTime,
 				proxyIP: parsed ? parsed.hostPlain : (source.hostname || source.candidate || target),
 				portRemote: parsed ? parsed.port : (source.port || ''),
 				supports_ipv4: Boolean(probeResults.ipv4.ok),
@@ -9608,124 +7802,24 @@ function generateHTML(备案内容, hasToken = false) {
 			itemObj = itemObj || addResultItem(target);
 			const resultRecord = itemObj.record;
 			const currentSource = getSelectedIpSource();
-			let isCounted = false;
 
 			try {
-				if (clusterNodesPromise) {
-					try { await clusterNodesPromise; } catch (e) {}
-				}
-
-				let result = null;
-				let attempts = 0;
-				const maxAttempts = (clusterNodes && clusterNodes.length > 1) ? Math.min(clusterNodes.length + 1, 3) : 2;
-
-				while (attempts < maxAttempts && !isRunStopped(run)) {
-					attempts++;
-					let baseUrl = '';
-					let chosenNode = null;
-					if (clusterNodes && clusterNodes.length > 0) {
-						chosenNode = getHealthyClusterNode();
-						if (chosenNode && (chosenNode.startsWith('http://') || chosenNode.startsWith('https://'))) {
-							baseUrl = chosenNode.endsWith('/') ? chosenNode.slice(0, -1) : chosenNode;
-						}
-					}
-
-					// 如果开启了纯集群模式但无可用节点，报错提示；否则如无节点或非纯集群则回退本地
-					if (pureClusterMode && !baseUrl && clusterNodes.length > 0) {
-						// 节点全部在冷却，稍候或使用第一个
-						chosenNode = clusterNodes[0];
-						baseUrl = chosenNode.endsWith('/') ? chosenNode.slice(0, -1) : chosenNode;
-					}
-
-					const nodeToken = chosenNode ? clusterNodeTokens[baseUrl] : '';
-					let isNodeFailure = false;
-
-					// 若 Token 为脱敏的 '***'，直接走 Relay，杜绝带 '***' 直连被 403 封锁
-					if (nodeToken === '***') {
-						isNodeFailure = true;
-					} else {
-						const checkUrl = baseUrl + '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken ? '&token=' + encodeURIComponent(nodeToken) : '');
-						try {
-							result = await fetchJsonWithTimeout(checkUrl, {}, 12000, run?.controller.signal);
-							const status = result?.response?.status;
-							if (chosenNode && (status === 429 || status === 1015 || status === 1027)) {
-								reportNodeFailure(chosenNode, true);
-								continue;
-							}
-							if (chosenNode && (!result?.response?.ok && (status >= 500 || status === 401 || status === 403))) {
-								reportNodeFailure(chosenNode, false);
-								isNodeFailure = true;
-							} else {
-								if (chosenNode && result?.response?.ok) {
-									reportNodeSuccess(chosenNode);
-								}
-								break;
-							}
-						} catch (networkErr) {
-							if (isRunStopped(run)) throw networkErr;
-							if (chosenNode) {
-								reportNodeFailure(chosenNode, false);
-							}
-							isNodeFailure = true;
-						}
-					}
-
-					// 若直连从节点失败，且属于跨域节点，尝试通过主 Worker 的 Relay 隧道转发
-					if (isNodeFailure && chosenNode && baseUrl) {
-						let isCrossDomain = false;
-						try {
-							isCrossDomain = new URL(baseUrl).origin !== window.location.origin;
-						} catch (e) {
-							isCrossDomain = !baseUrl.includes(window.location.host);
-						}
-
-						if (isCrossDomain) {
-							try {
-								const relayUrl = '/api/cluster/relay?node=' + encodeURIComponent(baseUrl) + '&proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '') + (nodeToken && nodeToken !== '***' ? '&token=' + encodeURIComponent(nodeToken) : '');
-								const relayResult = await fetchJsonWithTimeout(relayUrl, {}, 12000, run?.controller.signal);
-								if (relayResult?.response?.ok && relayResult?.payload && !String(relayResult.payload?.error || '').startsWith('Relay failed')) {
-									result = relayResult;
-									reportNodeSuccess(chosenNode);
-									break;
-								}
-							} catch (relayErr) {
-								if (isRunStopped(run)) throw relayErr;
-							}
-						}
-					}
-
-					if (attempts >= maxAttempts) {
-						if (!pureClusterMode && baseUrl) {
-							try {
-								const fallbackUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
-								result = await fetchJsonWithTimeout(fallbackUrl, {}, 12000, run?.controller.signal);
-								break;
-							} catch (fallbackErr) {
-								if (isRunStopped(run)) throw fallbackErr;
-								throw fallbackErr;
-							}
-						} else {
-							break;
-						}
-					}
-				}
-
-				const data = normalizeCheckDataForUi(result?.payload || {
+				const checkUrl = '/check?proxy=' + encodeURIComponent(target) + (currentSource ? '&source=' + encodeURIComponent(currentSource) : '');
+				const result = await fetchJsonWithTimeout(checkUrl, {}, 12000, run?.controller.signal);
+				const data = normalizeCheckDataForUi(result.payload || {
 					success: false,
 					error: '检测接口没有返回有效 JSON'
 				}, target);
-				if (!result?.response?.ok) {
+				if (!result.response.ok) {
 					data.success = false;
-					const httpError = 'HTTP ' + (result?.response?.status || 'Error');
-					if (!data.error || data.error === '检测接口没有返回有效 JSON') {
-						data.error = httpError;
-					}
+					data.error = data.error || ('HTTP ' + result.response.status);
 				}
+				completedCount++;
 
 				if (data.success) {
 					successCount++;
 					itemObj.el.className = 'result-item success';
-					const latency = formatLatency(data.responseTime ?? data.latency ?? data.connect_ms);
+					const latency = formatLatency(data.responseTime);
 					itemObj.badge.className = 'status-badge status-success';
 					itemObj.badge.innerText = latency;
 					setLatencyTooltip(itemObj.badge, data, latency);
@@ -9769,17 +7863,15 @@ function generateHTML(备案内容, hasToken = false) {
 					itemObj.el.className = 'result-item error';
 					updateResultFlag(itemObj, '');
 					itemObj.badge.className = 'status-badge status-error';
-					const errText = data.error || data.message || ('HTTP ' + (result?.response?.status || 'Error'));
-					const errDiag = classifyCheckError(errText);
-					itemObj.badge.innerText = errDiag.badge || '不可用';
+					itemObj.badge.innerText = '不可用';
 					const sourceDef = IP_SOURCE_DEFINITIONS[currentSource] || IP_SOURCE_DEFINITIONS.iplocate;
 					itemObj.info.innerHTML =
 						'<span class="result-label">候选目标</span>' +
 						buildCopyableTarget(target) +
-						'<span class="result-detail">' + escapeHtml(errDiag.description || ('无法通过该代理访问 ' + sourceDef.label + '，请更换目标后重试。')) + '</span>';
+						'<span class="result-detail">无法通过该代理访问 ' + escapeHtml(sourceDef.label) + '，请更换目标后重试。</span>';
 					itemObj.meta.innerHTML =
-						buildMetaChip(errDiag.category || '检测未通过', 'error', 'meta-chip-danger') +
-						buildMetaChip(errText, 'info');
+						buildMetaChip('检测未通过', 'error', 'meta-chip-danger') +
+						buildMetaChip(data.error || data.message || '远端返回失败结果', 'info');
 					itemObj.exitList.innerHTML = '';
 				}
 			} catch (error) {
@@ -9794,36 +7886,31 @@ function generateHTML(备案内容, hasToken = false) {
 					itemObj.meta.innerHTML = buildMetaChip('已停止', 'info');
 					itemObj.exitList.innerHTML = '';
 					updateProgress();
-					scheduleUpdateResultFilters();
+					updateResultFilters();
 					return;
 				}
-				const errText = error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常');
-				const errDiag = classifyCheckError(errText);
+				completedCount++;
 				const errInfo = {
 					success: false,
-					error: errText
+					error: error && error.name === 'AbortError' ? '检测请求超时' : (error?.message || '请求异常')
 				};
 				updateResultRecordAsError(resultRecord, errInfo);
 				itemObj.el.className = 'result-item error';
 				updateResultFlag(itemObj, '');
 				itemObj.badge.className = 'status-badge status-error';
-				itemObj.badge.innerText = errDiag.badge || '失败';
+				itemObj.badge.innerText = '失败';
 				itemObj.info.innerHTML =
 					'<span class="result-label">候选目标</span>' +
 					buildCopyableTarget(target) +
-					'<span class="result-detail">' + escapeHtml(errDiag.description || '检测请求执行失败，可能是接口异常或网络中断。') + '</span>';
+					'<span class="result-detail">检测请求执行失败，可能是接口异常或网络中断。</span>';
 				itemObj.meta.innerHTML =
-					buildMetaChip(errDiag.category || '请求异常', 'error', 'meta-chip-danger') +
-					buildMetaChip(errText, 'retry');
+					buildMetaChip('请求异常', 'error', 'meta-chip-danger') +
+					buildMetaChip(error && error.name === 'AbortError' ? '检测请求超时' : '请稍后重试', 'retry');
 				itemObj.exitList.innerHTML = '';
-			} finally {
-				if (!isRunStopped(run) && !isCounted) {
-					isCounted = true;
-					completedCount++;
-					updateProgress();
-					scheduleUpdateResultFilters();
-				}
 			}
+
+			updateProgress();
+			updateResultFilters();
 		}
 
 		function showDetails(button, exitData) {
@@ -9978,11 +8065,9 @@ function generateHTML(备案内容, hasToken = false) {
 
 			const value = batchMode.checked ? normalizeBatchInputValue(inputList.value) : stripTargetLabel(inputList.value);
 			if (!value) {
-				if (inputList) {
-					inputList.focus();
-					inputList.classList.add('is-invalid');
-					setTimeout(function () { inputList.classList.remove('is-invalid'); }, 600);
-				}
+				inputList.focus();
+				inputList.classList.add('is-invalid');
+				setTimeout(function () { inputList.classList.remove('is-invalid'); }, 600);
 				return;
 			}
 
@@ -10075,43 +8160,8 @@ function generateHTML(备案内容, hasToken = false) {
 				}
 			} catch (error) {
 				if (isRunStopped(run) || error?.name === 'AbortError') {
-					resultRecords.forEach(function (rec) {
-						if (rec && rec.status === 'pending') {
-							rec.status = 'stopped';
-							const item = rec.itemObj;
-							if (item && item.badge) {
-								item.badge.className = 'status-badge status-error';
-								item.badge.innerText = '已停止';
-								const detail = item.el ? item.el.querySelector('.result-detail') : null;
-								if (detail) {
-									detail.textContent = '检测已手动停止，未继续请求该代理。';
-								}
-								if (item.meta) {
-									item.meta.innerHTML = buildMetaChip('已停止', 'info');
-								}
-								if (item.exitList) {
-									item.exitList.innerHTML = '';
-								}
-							} else if (rec.el) {
-								const badge = rec.el.querySelector('.status-badge');
-								if (badge) {
-									badge.className = 'status-badge status-error';
-									badge.innerText = '已停止';
-								}
-								const detail = rec.el.querySelector('.result-detail');
-								if (detail) {
-									detail.textContent = '检测已手动停止，未继续请求该代理。';
-								}
-								const meta = rec.el.querySelector('.result-meta');
-								if (meta) {
-									meta.innerHTML = buildMetaChip('已停止', 'info');
-								}
-							}
-						}
-					});
 					progressText.innerText = '已停止 · 已完成 ' + completedCount + ' / ' + totalTargets + ' · 有效 ' + successCount;
 					setAppState('stopped');
-					scheduleUpdateResultFilters();
 				} else {
 					console.error(error);
 					progressText.innerText = '系统错误';
@@ -10127,10 +8177,6 @@ function generateHTML(备案内容, hasToken = false) {
 		let hasPromptedTokenAuth = false;
 		function onTokenUnauthorized() {
 			if (hasPromptedTokenAuth) return;
-			const lockOverlay = document.getElementById('authLockOverlay');
-			if (lockOverlay && lockOverlay.classList.contains('is-active')) return;
-			if (window.__TOKEN_REQUIRED__ && !getSavedToken()) return;
-
 			hasPromptedTokenAuth = true;
 			openTokenModal('服务端已开启 Token 鉴权（401 Unauthorized）。请输入正确的访问令牌后继续。');
 		}
@@ -10173,8 +8219,6 @@ function generateHTML(备案内容, hasToken = false) {
 			} catch (e) {}
 			updateTokenButtonState();
 			closeTokenModal();
-			clusterNodesPromise = null;
-			loadClusterNodes();
 		}
 
 		function clearToken() {
@@ -10217,7 +8261,7 @@ function generateHTML(备案内容, hasToken = false) {
 				});
 				return { valid: res.ok, status: res.status };
 			} catch (e) {
-				return { valid: true, status: 0, networkError: true };
+				return { valid: false, status: 0, networkError: true };
 			}
 		}
 
@@ -10266,25 +8310,22 @@ function generateHTML(备案内容, hasToken = false) {
 				lockBtn.disabled = true;
 			}
 
-			const result = await checkTokenValidity(token);
+			const isValid = await checkTokenValidity(token);
 
 			if (lockBtn) {
 				lockBtn.textContent = '验证并解锁';
 				lockBtn.disabled = false;
 			}
 
-			if (result.valid) {
+			if (isValid) {
 				try {
 					localStorage.setItem('cf_proxy_token', token);
 				} catch (e) {}
 				updateTokenButtonState();
 				hideAuthLockOverlay();
-				closeTokenModal();
-				clusterNodesPromise = null;
-				loadClusterNodes();
 			} else {
 				if (errorMsg) {
-					errorMsg.textContent = result.networkError ? '网络连接超时，请重试' : 'Token 错误，请检查后重新输入';
+					errorMsg.textContent = 'Token 错误，请检查后重新输入';
 					errorMsg.classList.add('is-visible');
 				}
 				const input = document.getElementById('authLockInput');
@@ -10314,8 +8355,8 @@ function generateHTML(备案内容, hasToken = false) {
 				if (!saved) {
 					showAuthLockOverlay();
 				} else {
-					checkTokenValidity(saved).then(function (result) {
-						if (!result.valid && result.status === 401) {
+					checkTokenValidity(saved).then(function (authRes) {
+						if (!authRes.valid && authRes.status === 401) {
 							try { localStorage.removeItem('cf_proxy_token'); } catch (e) {}
 							updateTokenButtonState();
 							showAuthLockOverlay('本地保存的 Token 已失效，请重新输入');
@@ -10391,22 +8432,17 @@ function generateHTML(备案内容, hasToken = false) {
 
 			initTokenManager();
 			renderHistory();
-			if (batchMode && batchMode.checked) {
-				swapInputMode(true);
-			} else {
-				setModeVisuals(false);
-				bindInputShortcut();
-			}
+			setModeVisuals(false);
+			bindInputShortcut();
 			renderDashboard();
 			updateResultFilters();
 			loadCfLocations();
 			loadBackendServiceInfo();
-			loadClusterNodes();
 
 			const path = window.location.pathname.slice(1);
 			if (path && path.length > 3) {
 				const decodedPath = decodeURIComponent(path);
-				const isLikelyProxy = /^(socks5|http|https|turn|sstp):\\/\\//i.test(decodedPath) || /^[a-z0-9.-]+:\\d+/i.test(decodedPath);
+				const isLikelyProxy = /^(socks5|http|https|turn|sstp):\\/\\//i.test(decodedPath) || /^[\\w.-]+:\\d{1,5}$/.test(decodedPath);
 				if (isLikelyProxy && decodedPath !== 'resolve' && decodedPath !== 'favicon.ico') {
 					inputList.value = decodedPath;
 					window.history.replaceState({}, '', '/');
@@ -11158,1470 +9194,3 @@ class TlsClient {
 	}
 	close() { this.socket.close() }
 }
-
-function generateAdminHTML(env, hasKV = false) {
-	return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>CheckSocks5 - 集群中枢与管理控制台</title>
-	<script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
-	<style>
-		:root {
-			--bg: #060e18;
-			--card-bg: rgba(9, 23, 38, 0.88);
-			--border: rgba(97, 219, 255, 0.16);
-			--border-hover: rgba(97, 219, 255, 0.4);
-			--cyan: #61dbff;
-			--emerald: #34d399;
-			--rose: #fb7185;
-			--amber: #fbbf24;
-		}
-		body {
-			background-color: #050d17;
-			background-image: 
-				radial-gradient(ellipse 80% 50% at 50% -20%, rgba(97, 219, 255, 0.15), transparent),
-				radial-gradient(circle at 100% 100%, rgba(16, 185, 129, 0.08), transparent 40%);
-			color: #f0f8ff;
-			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-		}
-		.glass-card {
-			background: var(--card-bg);
-			border: 1px solid var(--border);
-			backdrop-filter: blur(16px);
-			border-radius: 1rem;
-		}
-		.tab-btn.active {
-			background: rgba(97, 219, 255, 0.15);
-			color: #61dbff;
-			border-color: rgba(97, 219, 255, 0.4);
-		}
-		.toast {
-			position: fixed;
-			bottom: 24px;
-			right: 24px;
-			z-index: 999;
-			transform: translateY(100px);
-			opacity: 0;
-			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-		}
-		.toast.show {
-			transform: translateY(0);
-			opacity: 1;
-		}
-	</style>
-</head>
-<body class="min-h-screen p-4 md:p-8">
-	<div class="max-w-6xl mx-auto space-y-6">
-
-		<!-- 顶栏导航 -->
-		<header class="flex flex-col md:flex-row md:items-center justify-between pb-6 border-b border-cyan-900/40 gap-4">
-			<div class="flex items-center gap-3">
-				<div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-500 to-emerald-400 flex items-center justify-center shadow-lg shadow-cyan-500/20 font-black text-slate-950 text-xl">
-					S5
-				</div>
-				<div>
-					<h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-						CheckSocks5 控制台
-						<span class="text-[11px] px-2 py-0.5 rounded-full font-mono bg-cyan-950/80 border border-cyan-500/30 text-cyan-300">
-							Admin v1.4.0
-						</span>
-					</h1>
-					<p class="text-xs text-slate-400 mt-0.5">Cloudflare KV 驱动的接口多 Key 轮询、Worker 集群调度与动态凭据中枢</p>
-				</div>
-			</div>
-
-			<div class="flex items-center gap-3">
-				<span id="kvStatusBadge" class="px-2.5 py-1 rounded-full text-xs font-mono border ${hasKV ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-300' : 'bg-amber-950/80 border-amber-500/30 text-amber-300'}">
-					${hasKV ? '● KV 存储空间已绑定' : '⚠️ 未绑定 KV (需在 CF 绑定 KV)'}
-				</span>
-				<a href="/" class="px-3 py-1.5 rounded-xl border border-slate-700 bg-slate-800/60 hover:bg-slate-700/60 text-xs font-medium text-cyan-300 flex items-center gap-1.5 transition">
-					← 返回测活主页
-				</a>
-				<button onclick="logoutAdmin()" class="px-3 py-1.5 rounded-xl border border-rose-900/60 bg-rose-950/40 hover:bg-rose-900/60 text-xs font-medium text-rose-300 transition">
-					退出
-				</button>
-			</div>
-		</header>
-
-		<!-- 选项卡切换 -->
-		<div class="flex flex-wrap gap-2 border-b border-white/5 pb-3">
-			<button onclick="switchTab('tokens')" id="tabBtn-tokens" class="tab-btn active px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
-				🔑 访问凭据 (Tokens)
-			</button>
-			<button onclick="switchTab('sources')" id="tabBtn-sources" class="tab-btn px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
-				🌐 接口与多 Key 池
-			</button>
-			<button onclick="switchTab('workers')" id="tabBtn-workers" class="tab-btn px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
-				🚀 多账号节点集群
-			</button>
-			<button onclick="switchTab('settings')" id="tabBtn-settings" class="tab-btn px-4 py-2 rounded-xl text-xs font-semibold border border-transparent transition flex items-center gap-1.5">
-				⚙️ 系统安全与备份
-			</button>
-		</div>
-
-		<!-- 选项卡 1：Token 动态管理 -->
-		<section id="tabContent-tokens" class="space-y-4">
-			<div class="glass-card p-6 space-y-5">
-				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
-					<div>
-						<h2 class="text-lg font-bold text-white flex items-center gap-2">
-							动态访问凭据管理
-						</h2>
-						<p class="text-xs text-slate-400 mt-0.5">在 KV 中动态签发和撤销访问 Token，免去每次在环境变量中重新部署的繁琐。</p>
-					</div>
-					<button onclick="openTokenModal('add')" class="px-3.5 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition flex items-center gap-1 shadow-lg shadow-cyan-500/20">
-						+ 新建 Token
-					</button>
-				</div>
-
-				<div class="overflow-x-auto">
-					<table class="w-full text-left text-xs">
-						<thead>
-							<tr class="border-b border-white/10 text-slate-400">
-								<th class="py-2.5 px-3">备注说明</th>
-								<th class="py-2.5 px-3">Token 凭据</th>
-								<th class="py-2.5 px-3">状态</th>
-								<th class="py-2.5 px-3">创建时间</th>
-								<th class="py-2.5 px-3 text-right">操作</th>
-							</tr>
-						</thead>
-						<tbody id="tokenTableBody">
-							<tr><td colspan="5" class="py-8 text-center text-slate-500">正在加载数据...</td></tr>
-						</tbody>
-					</table>
-				</div>
-			</div>
-		</section>
-
-		<!-- 选项卡 2：接口多 Key 池与自定义接口管理 -->
-		<section id="tabContent-sources" class="space-y-4 hidden">
-			<div class="glass-card p-6 space-y-5">
-				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-white/5">
-					<div>
-						<h2 class="text-lg font-bold text-white flex items-center gap-2">
-							出口接口、多 Key 轮询池与自定义源
-						</h2>
-						<p class="text-xs text-slate-400 mt-0.5">支持为官方接口录入多个免费 Key 自动轮询分流翻倍额度；同时支持添加自定义 IP 数据库，通过 JSON 字段映射提取出口数据。</p>
-					</div>
-					<div class="flex items-center gap-2">
-						<button onclick="openCustomSourceModal('add')" class="px-3.5 py-1.5 rounded-xl font-bold text-xs border border-cyan-500/40 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition flex items-center gap-1">
-							➕ 添加自定义接口
-						</button>
-						<button onclick="saveAllSourcesConfig()" class="px-4 py-1.5 rounded-xl font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition shadow-lg shadow-cyan-500/20">
-							保存内置接口配置
-						</button>
-					</div>
-				</div>
-
-				<div id="sourcesContainer" class="grid grid-cols-1 md:grid-cols-2 gap-4">
-					<!-- 动态渲染各源卡片 -->
-				</div>
-			</div>
-		</section>
-
-		<!-- 选项卡 3：Worker 节点集群管理 -->
-		<section id="tabContent-workers" class="space-y-4 hidden">
-			<!-- 纯集群调度模式开关横幅 -->
-			<div class="glass-card p-5 border-cyan-500/30 bg-gradient-to-r from-cyan-950/40 via-slate-900/60 to-emerald-950/30">
-				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-					<div class="space-y-1">
-						<div class="flex items-center gap-2">
-							<span class="text-base font-bold text-white">⚡ 纯集群调度模式 (主账号 0 消耗)</span>
-							<span class="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-emerald-950 text-emerald-300 border border-emerald-500/30">
-								保护主额度
-							</span>
-						</div>
-						<p class="text-xs text-slate-300 leading-relaxed max-w-3xl">
-							开启后，主 Worker <b>仅作为控制中枢与 UI 托管</b>，所有代理测活任务 <b>100% 分发给下方子节点</b> 轮询执行，主账号 Workers 每日 10 万次配额保持 0 消耗！建议在已配置好子节点后开启。
-						</p>
-					</div>
-					<div class="flex items-center gap-3">
-						<label class="relative inline-flex items-center cursor-pointer">
-							<input type="checkbox" id="pureClusterModeToggle" onchange="handlePureClusterToggle(this.checked)" class="sr-only peer">
-							<div class="w-12 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-500"></div>
-							<span id="pureClusterModeLabel" class="ml-2 text-xs font-semibold text-slate-400">已关闭</span>
-						</label>
-					</div>
-				</div>
-			</div>
-
-			<div class="glass-card p-6 space-y-5">
-				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-white/10">
-					<div class="space-y-1">
-						<div class="flex items-center gap-2.5">
-							<div class="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500/20 to-teal-500/10 border border-emerald-500/30 flex items-center justify-center text-sm shadow-inner shrink-0">
-								🌐
-							</div>
-							<div>
-								<h2 class="text-base font-bold text-white flex items-center gap-2 flex-wrap">
-									多账号 Worker 节点集群
-									<span id="clusterNodeCountBadge" class="text-[10px] px-2 py-0.5 rounded-full font-mono bg-emerald-500/10 border border-emerald-500/20 text-emerald-300">0 个节点</span>
-								</h2>
-								<p class="text-xs text-slate-400 mt-0.5">跨 Cloudflare 免费账号分布式轮询调度与智能容灾，单节点 429 自动熔断切流，平稳支撑 10w+ 测活</p>
-							</div>
-						</div>
-					</div>
-					<div class="flex items-center gap-2 shrink-0 self-end sm:self-center ml-auto sm:ml-0">
-						<button onclick="pingAllWorkers()" class="h-9 px-3.5 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center gap-1.5 shadow-sm cursor-pointer">
-							<span class="text-amber-400">⚡</span> 一键测速
-						</button>
-						<button onclick="openWorkerModal('add')" class="h-9 px-3.5 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/50 hover:border-cyan-400/50 transition flex items-center gap-1.5 shadow-sm cursor-pointer">
-							<span>➕</span> 手动接入
-						</button>
-					</div>
-				</div>
-
-				<div id="workerGrid" class="grid grid-cols-1 md:grid-cols-2 gap-4">
-					<!-- 动态渲染 Worker 节点卡片 -->
-				</div>
-			</div>
-		</section>
-
-		<!-- 选项卡 4：系统设置与数据备份 -->
-		<section id="tabContent-settings" class="space-y-4 hidden">
-			<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-				<!-- 修改管理员密码 -->
-				<div class="glass-card p-6 space-y-4">
-					<h3 class="text-sm font-bold text-white flex items-center gap-1.5">
-						🔐 修改后台管理员密码
-					</h3>
-					<form onsubmit="handlePasswordChange(event)" class="space-y-3">
-						<div>
-							<label class="text-xs text-slate-400 block mb-1">当前旧密码</label>
-							<input type="password" id="inputOldPassword" required class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="text-xs text-slate-400 block mb-1">新密码 (不少于 4 位)</label>
-							<input type="password" id="inputNewPassword" required minlength="4" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="text-xs text-slate-400 block mb-1">确认新密码</label>
-							<input type="password" id="inputConfirmPassword" required minlength="4" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-xs text-white focus:outline-none focus:border-cyan-400">
-						</div>
-						<button type="submit" class="px-4 py-2 rounded-xl text-xs font-bold bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition">
-							更新密码
-						</button>
-					</form>
-				</div>
-
-				<!-- 配置备份与还原 -->
-				<div class="glass-card p-6 space-y-4">
-					<h3 class="text-sm font-bold text-white flex items-center gap-1.5">
-						💾 配置导出与一键还原
-					</h3>
-					<p class="text-xs text-slate-400">将当前的动态 Token、接口多 Key 配置、自定义接口与节点集群导出为 JSON 文件备份，或从备份文件一键恢复。</p>
-					
-					<div class="pt-2 flex flex-col sm:flex-row gap-3">
-						<button onclick="exportFullConfig()" class="px-4 py-2 rounded-xl text-xs font-semibold border border-cyan-500/30 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40 transition">
-							📥 导出配置 JSON 备份
-						</button>
-						<label class="px-4 py-2 rounded-xl text-xs font-semibold border border-emerald-500/30 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/40 cursor-pointer text-center transition">
-							📤 导入恢复配置文件
-							<input type="file" accept=".json" onchange="importConfig(event)" class="hidden">
-						</label>
-					</div>
-
-					<div class="p-3 rounded-lg border border-white/5 bg-white/[0.02] text-[11px] text-slate-400 leading-relaxed mt-4">
-						<b>💡 如何在 Cloudflare 绑定 KV 与管理员密码？</b><br>
-						1. <b>KV 命名空间绑定</b>：进入 Cloudflare 控制台 -> Workers & Pages -> 本项目 ->「设置」->「绑定 / 变量」-> 在「KV 命名空间绑定」中添加变量名称为 <code>KV</code> 即可。<br>
-						2. <b>环境变量预设密码</b>：可在「环境变量」中添加 <code>ADMIN</code> 直接作为管理员密码。
-					</div>
-				</div>
-			</div>
-		</section>
-
-	</div>
-
-	<!-- 登录 / 初始化弹窗 -->
-	<div id="authModal" class="fixed inset-0 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4 z-50">
-		<div class="glass-card max-w-md w-full p-6 space-y-4 border-cyan-500/30 shadow-2xl">
-			<div class="text-center space-y-1">
-				<div class="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 flex items-center justify-center mx-auto text-xl font-bold mb-2">
-					🔐
-				</div>
-				<h3 id="authModalTitle" class="text-lg font-bold text-white">管理员认证</h3>
-				<p id="authModalSubtitle" class="text-xs text-slate-400">请输入管理后台密码以访问控制台</p>
-			</div>
-
-			<form onsubmit="handleLoginSubmit(event)" class="space-y-3 pt-2">
-				<div>
-					<input type="password" id="authPasswordInput" required placeholder="请输入管理员密码..." class="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-cyan-500/30 text-sm text-white focus:outline-none focus:border-cyan-400 transition">
-				</div>
-				<button type="submit" class="w-full py-2.5 rounded-xl font-bold text-sm bg-gradient-to-r from-cyan-500 to-emerald-400 text-slate-950 hover:brightness-110 transition shadow-lg shadow-cyan-500/20">
-					确认进入
-				</button>
-			</form>
-		</div>
-	</div>
-
-	<!-- Token 添加/编辑弹窗 -->
-	<div id="tokenModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
-		<div class="glass-card max-w-md w-full p-6 space-y-4">
-			<h3 id="tokenModalTitle" class="text-base font-bold text-white">新建访问 Token</h3>
-			<div class="space-y-3 text-xs">
-				<div>
-					<label class="block text-slate-400 mb-1">Token 凭据密钥</label>
-					<div class="flex gap-2">
-						<input type="text" id="modalTokenValue" class="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400 font-mono">
-						<button type="button" onclick="generateRandomToken()" class="px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-800 text-slate-300 hover:text-white">随机生成</button>
-					</div>
-				</div>
-				<div>
-					<label class="block text-slate-400 mb-1">备注说明 (可选)</label>
-					<input type="text" id="modalTokenNote" placeholder="例如：自用、朋友测试、爬虫调用" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400">
-				</div>
-			</div>
-			<div class="flex justify-end gap-2 pt-2">
-				<button onclick="closeTokenModal()" class="px-3.5 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
-				<button onclick="submitTokenModal()" class="px-4 py-1.5 rounded-lg font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950">保存</button>
-			</div>
-		</div>
-	</div>
-
-	<!-- Worker 节点添加/编辑弹窗 -->
-	<div id="workerModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
-		<div class="glass-card max-w-md w-full p-6 space-y-4">
-			<h3 id="workerModalTitle" class="text-base font-bold text-white">添加 Worker 集群从节点</h3>
-			<div class="space-y-3 text-xs">
-				<div>
-					<label class="block text-slate-400 mb-1">节点名称</label>
-					<input type="text" id="modalWorkerName" placeholder="例如：CF账号B - 备用节点" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400">
-				</div>
-				<div>
-					<label class="block text-slate-400 mb-1">Worker 完整地址 (URL)</label>
-					<input type="text" id="modalWorkerUrl" placeholder="https://xxx.workers.dev" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400 font-mono">
-				</div>
-				<div>
-					<label class="block text-slate-400 mb-1">该节点的访问 Token (若无鉴权可留空)</label>
-					<input type="text" id="modalWorkerToken" placeholder="若该从节点开启了 TOKEN 鉴权则填入" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400 font-mono">
-				</div>
-			</div>
-			<div class="flex justify-end gap-2 pt-2">
-				<button onclick="closeWorkerModal()" class="px-3.5 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
-				<button onclick="submitWorkerModal()" class="px-4 py-1.5 rounded-lg font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950">保存</button>
-			</div>
-		</div>
-	</div>
-
-	<!-- 自定义接口添加/编辑弹窗 -->
-	<div id="customSourceModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
-		<div class="glass-card max-w-xl w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto">
-			<div class="flex items-center justify-between pb-3 border-b border-white/10">
-				<h3 id="customSourceModalTitle" class="text-base font-bold text-white flex items-center gap-2">
-					➕ 添加自定义 IP 接口
-				</h3>
-				<button onclick="closeCustomSourceModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
-			</div>
-
-			<div class="space-y-4 text-xs">
-				<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-					<div>
-						<label class="block text-slate-300 font-semibold mb-1">接口英文标识 (Key, 纯英文字母数字)</label>
-						<input type="text" id="modalCustomKey" placeholder="例如：my_ip_api" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-					</div>
-					<div>
-						<label class="block text-slate-300 font-semibold mb-1">前台显示名称 (Label)</label>
-						<input type="text" id="modalCustomLabel" placeholder="例如：我的自建 IP 库" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-white focus:outline-none focus:border-cyan-400">
-					</div>
-				</div>
-
-				<div>
-					<label class="block text-slate-300 font-semibold mb-1">目标请求 URL (支持在 URL 中使用 <code>{{KEY}}</code> 自动替换 Key 池)</label>
-					<input type="text" id="modalCustomUrl" placeholder="https://api.example.com/json 或 https://api.myip.com/?key={{KEY}}" class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-white/10 text-cyan-300 font-mono focus:outline-none focus:border-cyan-400">
-				</div>
-
-				<div>
-					<label class="block text-slate-300 font-semibold mb-1">API Key 轮询池 (可选，每行一个，用于替换 <code>{{KEY}}</code> 轮询分流)</label>
-					<textarea id="modalCustomKeys" rows="2" placeholder="如需 Key 验证请每行填入一个，系统会自动轮询均衡负载..." class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400"></textarea>
-				</div>
-
-				<div class="p-3.5 rounded-xl border border-cyan-500/20 bg-cyan-950/20 space-y-3">
-					<div class="text-[11px] font-bold text-cyan-300 flex items-center justify-between">
-						<span>🧩 JSON 响应字段路径映射 (点操作符支持多层，如 <code>data.ip</code>)</span>
-						<span class="text-slate-400 font-normal">留空则使用默认字段名</span>
-					</div>
-
-					<div class="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">IP 地址字段</label>
-							<input type="text" id="modalMapIp" placeholder="ip" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">国家/地区字段</label>
-							<input type="text" id="modalMapCountry" placeholder="country" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">国家代码(如 US)</label>
-							<input type="text" id="modalMapCountryCode" placeholder="country_code" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">城市字段</label>
-							<input type="text" id="modalMapCity" placeholder="city" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">ASN 号字段</label>
-							<input type="text" id="modalMapAsn" placeholder="asn" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">运营商/ISP 字段</label>
-							<input type="text" id="modalMapOrg" placeholder="org 或 isp" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">代理/Proxy 字段</label>
-							<input type="text" id="modalMapProxy" placeholder="is_proxy" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">机房/Hosting 字段</label>
-							<input type="text" id="modalMapDatacenter" placeholder="is_datacenter" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-						<div>
-							<label class="block text-[11px] text-slate-400 mb-0.5">时区字段</label>
-							<input type="text" id="modalMapTimezone" placeholder="timezone" class="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-						</div>
-					</div>
-				</div>
-			</div>
-
-			<div class="flex justify-end gap-2 pt-3 border-t border-white/10">
-				<button onclick="closeCustomSourceModal()" class="px-4 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
-				<button onclick="submitCustomSourceModal()" class="px-5 py-1.5 rounded-lg font-bold text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg shadow-cyan-500/20">保存接口</button>
-			</div>
-		</div>
-	</div>
-
-	<!-- 极简子节点专属脚本展示与复制弹窗 -->
-	<div id="subWorkerScriptModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
-		<div class="glass-card max-w-2xl w-full p-6 space-y-4 max-h-[90vh] flex flex-col">
-			<div class="flex items-center justify-between pb-3 border-b border-white/10">
-				<div>
-					<h3 class="text-base font-bold text-white flex items-center gap-2">
-						📋 极简子 Worker 专属脚本 (免 KV / 免配置)
-					</h3>
-					<p class="text-xs text-slate-400 mt-0.5">直接复制代码部署到其他免费 Cloudflare 账号中，开箱即用，秒级上线从节点！</p>
-				</div>
-				<button onclick="closeSubWorkerScriptModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
-			</div>
-
-			<div class="flex-1 overflow-hidden flex flex-col space-y-2">
-				<div class="text-[11px] text-slate-400">
-					💡 <b>部署指引</b>：在其他 Cloudflare 账号进入 <b>Workers & Pages</b> -> <b>创建 Worker</b> -> 点击 <b>快速编辑 / 编辑代码</b> -> 全选并粘贴以下代码 -> 点击 <b>部署</b>。将生成的 <code>.workers.dev</code> 域名添加到上方集群池即可！
-				</div>
-				<textarea id="subWorkerScriptArea" readonly class="flex-1 w-full p-3 rounded-xl bg-slate-950 border border-white/10 text-xs text-cyan-200 font-mono leading-relaxed select-all focus:outline-none focus:border-cyan-400 resize-none h-80"></textarea>
-			</div>
-
-			<div class="flex justify-between items-center pt-3 border-t border-white/10">
-				<span class="text-[11px] text-slate-400">原生支持 SOCKS5 / HTTP 探测与跨域 CORS</span>
-				<div class="space-x-2">
-					<button onclick="closeSubWorkerScriptModal()" class="px-4 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">关闭</button>
-					<button onclick="copySubWorkerScript()" class="px-5 py-1.5 rounded-lg font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/20">一键复制代码</button>
-				</div>
-			</div>
-		</div>
-	</div>
-
-	<!-- 批量全自动部署从节点弹窗 -->
-	<div id="batchDeployModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
-		<div class="glass-card max-w-2xl w-full p-6 space-y-4 max-h-[92vh] flex flex-col border border-emerald-500/30 shadow-2xl">
-			<div class="flex items-center justify-between pb-3 border-b border-white/10">
-				<div>
-					<h3 class="text-base font-bold text-white flex items-center gap-2">
-						🤖 批量全自动部署从节点 (Cloudflare 官方 API 直连)
-					</h3>
-					<p class="text-xs text-slate-400 mt-0.5">填入备用 Cloudflare 账号凭据，系统全自动创建 Worker、上传极简内核、激活 workers.dev 并一键入库集群！</p>
-				</div>
-				<button onclick="closeBatchDeployModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
-			</div>
-
-			<div class="space-y-3 text-xs overflow-y-auto flex-1 pr-1">
-				<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-					<div>
-						<label class="block text-slate-300 font-semibold mb-1">统一 Worker 脚本名称</label>
-						<input type="text" id="batchDeployScriptName" value="check-socks5-node" placeholder="例如：check-socks5-node" class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-white font-mono focus:outline-none focus:border-cyan-400">
-					</div>
-					<div>
-						<label class="block text-slate-300 font-semibold mb-1">部署模式</label>
-						<div class="text-[11px] text-emerald-400 py-1.5">
-							✓ 自动初始化/覆盖 + 自动开启 workers.dev + 自动测速入库
-						</div>
-					</div>
-				</div>
-
-				<div>
-					<div class="flex justify-between items-center mb-1">
-						<label class="text-slate-300 font-semibold">账号列表 (每行一个账号，支持逗号或空格分隔)</label>
-						<span id="batchDeployCount" class="text-cyan-300 font-mono text-[11px]">0 个账号待部署</span>
-					</div>
-					<textarea id="batchDeployAccounts" rows="6" oninput="updateBatchAccountsCount()" placeholder="格式1（推荐）：邮箱, Global API Key&#10;user1@gmail.com, 1a2b3c4d5e6f7g8h9i0j...&#10;user2@gmail.com, 9z8y7x6w5v4u3t2s1r0q...&#10;&#10;格式2：独立 API Token（每行一个）&#10;cf_token_abcdef123456..." class="w-full p-3 rounded-xl bg-slate-950 border border-white/10 text-xs text-cyan-200 font-mono leading-relaxed focus:outline-none focus:border-cyan-400"></textarea>
-				</div>
-
-				<div class="p-3 rounded-lg border border-cyan-500/20 bg-cyan-950/20 text-[11px] text-slate-300 space-y-1">
-					<b>💡 如何获取 Global API Key（永久免密，零验证码）：</b><br>
-					1. 登录该 Cloudflare 免费小号；<br>
-					2. 点击网页右上角头像 -> <b>「我的个人资料」</b> -> <b>「API 令牌」</b>；<br>
-					3. 找到 <b>「Global API Key」</b> 一行，点击 <b>「查看」</b>，复制那串 37 位的十六进制 Key 即可。<br>
-					<div class="pt-1 text-emerald-400 font-medium">🛡️ 安全保障：凭据仅在部署时直连 Cloudflare 官方 API，系统不留存任何密钥；各从节点部署时已自动注入专属鉴权令牌防外界盗用。</div>
-				</div>
-
-				<!-- 部署日志控制台 -->
-				<div id="batchDeployConsoleWrapper" class="space-y-1 hidden">
-					<div class="flex justify-between items-center text-[11px] text-slate-400">
-						<span>实时部署执行日志：</span>
-						<span id="batchDeployStatusText" class="text-cyan-300 font-medium">就绪</span>
-					</div>
-					<div id="batchDeployConsole" class="p-3 rounded-xl bg-slate-950 border border-white/10 font-mono text-[11px] text-cyan-300 max-h-40 overflow-y-auto space-y-1 select-text"></div>
-				</div>
-			</div>
-
-			<div class="flex justify-between items-center pt-3 border-t border-white/10">
-				<button onclick="closeBatchDeployModal()" class="px-4 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300 hover:text-white">取消</button>
-				<button id="startBatchDeployBtn" onclick="runBatchAutoDeploy()" class="px-5 py-1.5 rounded-lg font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 hover:brightness-110 text-slate-950 shadow-lg shadow-emerald-500/20">
-					🚀 开始一键全自动部署
-				</button>
-			</div>
-		</div>
-	</div>
-
-	<!-- Toast 提示 -->
-	<div id="adminToast" class="toast flex items-center gap-2 px-4 py-3 rounded-xl border border-cyan-400/40 bg-slate-900/95 text-white shadow-2xl text-xs font-medium">
-		<span id="toastContent">已保存！</span>
-	</div>
-
-	<script>
-		let adminSessionToken = sessionStorage.getItem('cf_admin_token') || '';
-		let globalConfig = { tokens: [], workers: [], sources: {}, clusterSettings: {}, hasKV: ${hasKV}, needSetup: false };
-		let editingTokenId = null;
-		let editingWorkerId = null;
-		let editingCustomSourceKey = null;
-
-		const DEFAULT_SOURCES_SPEC = [
-			{ key: 'hackmyip', label: 'HackMyIP (风控首选 · 原生住宅/机房/VPN与纯净度评级)', needKey: false, desc: '免密免注册，原生检测家庭住宅/机房、VPN及 A-D 纯净度等级。' },
-			{ key: 'ip2location', label: 'IP2Location.io (权威顶牌 · 自带代理识别 / 免密即用)', needKey: true, desc: '全球顶级权威库。免密每天1000次，可填多个免费Key扩容至月5万次。' },
-			{ key: 'ipapi_is', label: 'api.ipapi.is (深度风控 · 建议配置多个免费Key轮询)', needKey: true, desc: '免费注册得Key。建议录入多个免费账号的Key轮询分流，额度翻倍。' },
-			{ key: 'ipdata', label: 'ipdata.co (国际权威数据库 · 支持配置Key)', needKey: true, desc: '需配置 Key，提供每日1500次高精机房与威胁情报。' },
-			{ key: 'iplocate', label: 'iplocate.io (默认 · 综合地理定位与机房风控)', needKey: false, desc: '默认综合定位与ASN组织信息。' },
-			{ key: 'ipwhois', label: 'ipwho.is (高精度 · 规范全字段 / 海外稳定)', needKey: false, desc: '全字段规整，海外测活稳定。' },
-			{ key: 'ipsb', label: 'api.ip.sb (极速响应 · 大批量测活首选)', needKey: false, desc: '极速解析，轻量无阻塞。' },
-			{ key: 'cloudflare', label: 'Cloudflare 官方 (cdn-cgi/trace · 1w+大批量推荐)', needKey: false, desc: 'Workers内核直连，零拦截无上限。' },
-			{ key: 'ipinfo', label: 'ipinfo.io (知名老牌 · 国际权威数据库)', needKey: true, desc: '权威老牌库，支持填入 Token 扩容。' },
-			{ key: 'ipapico', label: 'ipapi.co (高精度单条 · 有严格限速)', needKey: false, desc: '单条精细排查，注意限速30次/分。' }
-		];
-
-		const SUB_WORKER_SCRIPT_TEMPLATE = ${JSON.stringify(SUB_WORKER_SCRIPT_TEMPLATE)};
-
-		async function adminFetch(endpoint, options = {}) {
-			options.headers = options.headers || {};
-			if (adminSessionToken) {
-				options.headers['Authorization'] = 'Bearer ' + adminSessionToken;
-			}
-			const res = await fetch(endpoint, options);
-			if (res.status === 401) {
-				sessionStorage.removeItem('cf_admin_token');
-				adminSessionToken = '';
-				showAuthModal(false);
-				throw new Error('认证已失效，请重新登录');
-			}
-			return res.json();
-		}
-
-		async function initDashboard() {
-			try {
-				const res = await fetch('/api/admin/config', {
-					headers: adminSessionToken ? { 'Authorization': 'Bearer ' + adminSessionToken } : {}
-				});
-				const data = await res.json();
-				if (res.status === 401 || !data.success) {
-					showAuthModal(data.needSetup);
-					return;
-				}
-				hideAuthModal();
-				globalConfig = data;
-				// 同步纯集群模式开关
-				const isPure = Boolean(globalConfig.clusterSettings?.pureClusterMode);
-				const pureToggle = document.getElementById('pureClusterModeToggle');
-				const pureLabel = document.getElementById('pureClusterModeLabel');
-				if (pureToggle) pureToggle.checked = isPure;
-				if (pureLabel) {
-					pureLabel.textContent = isPure ? '已启用 (主账号0消耗)' : '已关闭';
-					pureLabel.className = 'ml-2 text-xs font-semibold ' + (isPure ? 'text-emerald-400' : 'text-slate-400');
-				}
-				renderAll();
-			} catch (e) {
-				showAuthModal(false);
-			}
-		}
-
-		function showAuthModal(isSetup) {
-			const modal = document.getElementById('authModal');
-			modal.classList.remove('hidden');
-			if (isSetup) {
-				document.getElementById('authModalTitle').textContent = '🎉 首次配置管理员密码';
-				document.getElementById('authModalSubtitle').textContent = '未检测到密码，请为管理后台设置一个专属管理员主密码：';
-			} else {
-				document.getElementById('authModalTitle').textContent = '🔐 管理员认证';
-				document.getElementById('authModalSubtitle').textContent = '请输入管理后台密码以访问控制台';
-			}
-		}
-
-		function hideAuthModal() {
-			document.getElementById('authModal').classList.add('hidden');
-		}
-
-		async function handleLoginSubmit(e) {
-			e.preventDefault();
-			const pass = document.getElementById('authPasswordInput').value.trim();
-			if (!pass) return;
-			try {
-				const res = await fetch('/api/admin/login', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ password: pass })
-				});
-				const data = await res.json();
-				if (!data.success) {
-					alert(data.error || '登录失败');
-					return;
-				}
-				adminSessionToken = data.token;
-				sessionStorage.setItem('cf_admin_token', adminSessionToken);
-				showToast(data.message || '登录成功');
-				hideAuthModal();
-				initDashboard();
-			} catch (err) {
-				alert(err.message || '网络连接异常');
-			}
-		}
-
-		function logoutAdmin() {
-			sessionStorage.removeItem('cf_admin_token');
-			adminSessionToken = '';
-			window.location.reload();
-		}
-
-		function switchTab(name) {
-			['tokens', 'sources', 'workers', 'settings'].forEach(t => {
-				document.getElementById('tabContent-' + t).classList.toggle('hidden', t !== name);
-				document.getElementById('tabBtn-' + t).classList.toggle('active', t === name);
-			});
-		}
-
-		function renderAll() {
-			renderTokens();
-			renderSources();
-			renderWorkers();
-		}
-
-		// Token 管理
-		function renderTokens() {
-			const tbody = document.getElementById('tokenTableBody');
-			const tokens = globalConfig.tokens || [];
-			if (!tokens.length) {
-				tbody.innerHTML = '<tr><td colspan="5" class="py-8 text-center text-slate-500">暂无动态 Token（未配置时系统遵循环境变量 TOKEN）</td></tr>';
-				return;
-			}
-			tbody.innerHTML = tokens.map(t => {
-				const dateStr = t.createdAt ? new Date(t.createdAt).toLocaleString('zh-CN', { hour12: false }) : '-';
-				return \`
-					<tr class="border-b border-white/5 hover:bg-white/[0.02]">
-						<td class="py-3 px-3 font-semibold text-white">\${escapeHtml(t.note || '未命名')}</td>
-						<td class="py-3 px-3 font-mono text-cyan-300">
-							<span id="tok-\${t.id}">••••••••••••</span>
-							<button onclick="toggleTokenMask('\${t.id}')" class="ml-1 text-slate-400 hover:text-white">👁️</button>
-							<button onclick="copyTokenById('\${t.id}')" class="ml-1 text-slate-400 hover:text-white">📋</button>
-						</td>
-						<td class="py-3 px-3">
-							<button onclick="toggleTokenStatus('\${t.id}')" class="px-2 py-0.5 rounded text-[11px] font-medium border \${t.enabled !== false ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300' : 'bg-slate-800 border-slate-600 text-slate-400'}">
-								\${t.enabled !== false ? '已启用' : '已停用'}
-							</button>
-						</td>
-						<td class="py-3 px-3 text-slate-400">\${dateStr}</td>
-						<td class="py-3 px-3 text-right space-x-2">
-							<button onclick="editToken('\${t.id}')" class="text-cyan-400 hover:underline">编辑</button>
-							<button onclick="deleteToken('\${t.id}')" class="text-rose-400 hover:underline">删除</button>
-						</td>
-					</tr>
-				\`;
-			}).join('');
-		}
-
-		function toggleTokenMask(id) {
-			const tok = (globalConfig.tokens || []).find(t => t.id === id);
-			if (!tok) return;
-			const span = document.getElementById('tok-' + id);
-			if (!span) return;
-			if (span.textContent === '••••••••••••') {
-				span.textContent = tok.token;
-			} else {
-				span.textContent = '••••••••••••';
-			}
-		}
-
-		function copyTokenById(id) {
-			const tok = (globalConfig.tokens || []).find(t => t.id === id);
-			if (tok) copyToClipboard(tok.token);
-		}
-
-		function openTokenModal(mode, id = null) {
-			editingTokenId = id;
-			const modal = document.getElementById('tokenModal');
-			if (mode === 'add') {
-				document.getElementById('tokenModalTitle').textContent = '新建访问 Token';
-				document.getElementById('modalTokenValue').value = '';
-				document.getElementById('modalTokenNote').value = '';
-			} else {
-				const tok = globalConfig.tokens.find(t => t.id === id);
-				if (!tok) return;
-				document.getElementById('tokenModalTitle').textContent = '编辑 Token';
-				document.getElementById('modalTokenValue').value = tok.token;
-				document.getElementById('modalTokenNote').value = tok.note || '';
-			}
-			modal.classList.remove('hidden');
-		}
-
-		function closeTokenModal() {
-			document.getElementById('tokenModal').classList.add('hidden');
-			editingTokenId = null;
-		}
-
-		function generateRandomToken() {
-			const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-			let s = 'cf_';
-			for (let i = 0; i < 24; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
-			document.getElementById('modalTokenValue').value = s;
-		}
-
-		async function submitTokenModal() {
-			const tokenVal = document.getElementById('modalTokenValue').value.trim();
-			const noteVal = document.getElementById('modalTokenNote').value.trim();
-			if (!tokenVal) { alert('Token 不能为空'); return; }
-
-			try {
-				const action = editingTokenId ? 'update' : 'add';
-				const res = await adminFetch('/api/admin/tokens', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						action,
-						token: { id: editingTokenId, token: tokenVal, note: noteVal }
-					})
-				});
-				if (res.success) {
-					globalConfig.tokens = res.tokens;
-					renderTokens();
-					closeTokenModal();
-					showToast('Token 保存成功！');
-				} else {
-					alert(res.error || '保存失败');
-				}
-			} catch (e) {
-				alert(e.message);
-			}
-		}
-
-		async function toggleTokenStatus(id) {
-			try {
-				const res = await adminFetch('/api/admin/tokens', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ action: 'toggle', id })
-				});
-				if (res.success) {
-					globalConfig.tokens = res.tokens;
-					renderTokens();
-					showToast('状态已更新');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		async function deleteToken(id) {
-			if (!confirm('确定要删除该 Token 吗？')) return;
-			try {
-				const res = await adminFetch('/api/admin/tokens', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ action: 'delete', id })
-				});
-				if (res.success) {
-					globalConfig.tokens = res.tokens;
-					renderTokens();
-					showToast('Token 已删除');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		function editToken(id) {
-			openTokenModal('edit', id);
-		}
-
-		// 接口与多 Key 池管理
-		function renderSources() {
-			const container = document.getElementById('sourcesContainer');
-			const confSources = globalConfig.sources || {};
-
-			// 渲染官方内置接口
-			const builtInHtml = DEFAULT_SOURCES_SPEC.map(spec => {
-				const current = confSources[spec.key] || { enabled: true, keys: [] };
-				const isEnabled = current.enabled !== false;
-				const keysText = (current.keys || []).join('\\n');
-				const keysCount = (current.keys || []).filter(Boolean).length;
-				return \`
-					<div class="p-4 rounded-xl border border-white/10 bg-slate-900/60 space-y-3">
-						<div class="flex items-center justify-between">
-							<strong class="text-sm font-semibold text-white">\${escapeHtml(spec.label)}</strong>
-							<label class="flex items-center gap-1.5 cursor-pointer">
-								<span class="text-[11px] text-slate-400">\${isEnabled ? '启用' : '禁用'}</span>
-								<input type="checkbox" id="sourceEnable-\${spec.key}" \${isEnabled ? 'checked' : ''} class="w-4 h-4 rounded text-cyan-500 bg-slate-800">
-							</label>
-						</div>
-						<p class="text-xs text-slate-400 leading-relaxed">\${escapeHtml(spec.desc)}</p>
-						\${spec.needKey ? \`
-							<div>
-								<div class="flex justify-between text-[11px] text-slate-400 mb-1">
-									<span>API Key 池 (每行一个，自动轮询均衡负载)</span>
-									<span class="text-cyan-300 font-mono">\${keysCount} 个可用 Key</span>
-								</div>
-								<textarea id="sourceKeys-\${spec.key}" rows="2" placeholder="在此粘贴 API Key，支持填入多个免费账号的 Key 轮询..." class="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-white/10 text-xs text-cyan-100 font-mono focus:outline-none focus:border-cyan-400">\${escapeHtml(keysText)}</textarea>
-							</div>
-						\` : ''}
-					</div>
-				\`;
-			}).join('');
-
-			// 渲染自定义接口
-			const customKeys = Object.keys(confSources).filter(k => {
-				return confSources[k]?.isCustom || !DEFAULT_SOURCES_SPEC.some(s => s.key === k);
-			});
-
-			const customHtml = customKeys.map(k => {
-				const src = confSources[k];
-				const isEnabled = src.enabled !== false;
-				const keysCount = (src.keys || []).filter(Boolean).length;
-				return \`
-					<div class="p-4 rounded-xl border border-cyan-500/30 bg-slate-900/80 space-y-3 relative overflow-hidden">
-						<div class="absolute top-0 right-0 bg-cyan-500 text-slate-950 text-[10px] font-bold px-2 py-0.5 rounded-bl-lg">自定义接口</div>
-						<div class="flex items-center justify-between pr-16">
-							<strong class="text-sm font-semibold text-white">\${escapeHtml(src.label || k)}</strong>
-							<label class="flex items-center gap-1.5 cursor-pointer">
-								<span class="text-[11px] text-slate-400">\${isEnabled ? '启用' : '禁用'}</span>
-								<input type="checkbox" onchange="toggleCustomSourceEnable('\${k}', this.checked)" \${isEnabled ? 'checked' : ''} class="w-4 h-4 rounded text-cyan-500 bg-slate-800">
-							</label>
-						</div>
-						<div class="text-xs font-mono text-cyan-300 break-all bg-slate-950/60 p-2 rounded-lg border border-white/5">
-							\${escapeHtml(src.url || '')}
-						</div>
-						<div class="text-[11px] text-slate-400 space-y-1">
-							<div>Key 池状态: <span class="text-cyan-300 font-mono">\${keysCount} 个 Key 轮询中</span></div>
-							<div class="truncate">字段映射: <code class="text-slate-300 font-mono">IP: \${escapeHtml(src.mapping?.ip || 'ip')} | 地区: \${escapeHtml(src.mapping?.country || 'country')} | ASN: \${escapeHtml(src.mapping?.asn || 'asn')}</code></div>
-						</div>
-						<div class="flex items-center justify-end gap-3 text-xs pt-1 border-t border-white/5">
-							<button onclick="openCustomSourceModal('edit', '\${k}')" class="text-cyan-400 hover:underline">编辑</button>
-							<button onclick="deleteCustomSource('\${k}')" class="text-rose-400 hover:underline">删除</button>
-						</div>
-					</div>
-				\`;
-			}).join('');
-
-			container.innerHTML = builtInHtml + customHtml;
-		}
-
-		async function saveAllSourcesConfig() {
-			const nextSources = { ...(globalConfig.sources || {}) };
-			DEFAULT_SOURCES_SPEC.forEach(spec => {
-				const isEnabled = document.getElementById('sourceEnable-' + spec.key)?.checked ?? true;
-				let keys = [];
-				if (spec.needKey) {
-					const val = document.getElementById('sourceKeys-' + spec.key)?.value || '';
-					keys = val.split(/[\\r\\n,;]+/).map(k => k.trim()).filter(Boolean);
-				}
-				nextSources[spec.key] = { ...(nextSources[spec.key] || {}), enabled: isEnabled, keys };
-			});
-
-			try {
-				const res = await adminFetch('/api/admin/sources', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ sources: nextSources })
-				});
-				if (res.success) {
-					globalConfig.sources = res.sources;
-					renderSources();
-					showToast('所有接口配置已保存！');
-				} else {
-					alert(res.error || '保存失败');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		function openCustomSourceModal(mode, key = null) {
-			editingCustomSourceKey = key;
-			const modal = document.getElementById('customSourceModal');
-			if (mode === 'add') {
-				document.getElementById('customSourceModalTitle').innerHTML = '➕ 添加自定义 IP 接口';
-				document.getElementById('modalCustomKey').value = '';
-				document.getElementById('modalCustomKey').disabled = false;
-				document.getElementById('modalCustomLabel').value = '';
-				document.getElementById('modalCustomUrl').value = '';
-				document.getElementById('modalCustomKeys').value = '';
-				document.getElementById('modalMapIp').value = 'ip';
-				document.getElementById('modalMapCountry').value = 'country';
-				document.getElementById('modalMapCountryCode').value = 'country_code';
-				document.getElementById('modalMapCity').value = 'city';
-				document.getElementById('modalMapAsn').value = 'asn';
-				document.getElementById('modalMapOrg').value = 'org';
-				document.getElementById('modalMapProxy').value = 'is_proxy';
-				document.getElementById('modalMapDatacenter').value = 'is_datacenter';
-				document.getElementById('modalMapTimezone').value = 'timezone';
-			} else {
-				const src = globalConfig.sources?.[key];
-				if (!src) return;
-				document.getElementById('customSourceModalTitle').innerHTML = '✏️ 编辑自定义 IP 接口 (' + escapeHtml(key) + ')';
-				document.getElementById('modalCustomKey').value = key;
-				document.getElementById('modalCustomKey').disabled = true;
-				document.getElementById('modalCustomLabel').value = src.label || '';
-				document.getElementById('modalCustomUrl').value = src.url || '';
-				document.getElementById('modalCustomKeys').value = (src.keys || []).join('\\n');
-				const m = src.mapping || {};
-				document.getElementById('modalMapIp').value = m.ip || 'ip';
-				document.getElementById('modalMapCountry').value = m.country || 'country';
-				document.getElementById('modalMapCountryCode').value = m.country_code || 'country_code';
-				document.getElementById('modalMapCity').value = m.city || 'city';
-				document.getElementById('modalMapAsn').value = m.asn || 'asn';
-				document.getElementById('modalMapOrg').value = m.org || m.isp || 'org';
-				document.getElementById('modalMapProxy').value = m.is_proxy || 'is_proxy';
-				document.getElementById('modalMapDatacenter').value = m.is_datacenter || 'is_datacenter';
-				document.getElementById('modalMapTimezone').value = m.timezone || 'timezone';
-			}
-			modal.classList.remove('hidden');
-		}
-
-		function closeCustomSourceModal() {
-			document.getElementById('customSourceModal').classList.add('hidden');
-			editingCustomSourceKey = null;
-		}
-
-		async function submitCustomSourceModal() {
-			const key = document.getElementById('modalCustomKey').value.trim().toLowerCase();
-			const label = document.getElementById('modalCustomLabel').value.trim();
-			const url = document.getElementById('modalCustomUrl').value.trim();
-			const keysRaw = document.getElementById('modalCustomKeys').value.trim();
-			const keys = keysRaw ? keysRaw.split(/[\\r\\n,;]+/).map(k => k.trim()).filter(Boolean) : [];
-
-			if (!key || !/^[a-z0-9_-]+$/.test(key)) {
-				alert('接口标识只能包含英文小写字母、数字、下划线或连字符');
-				return;
-			}
-			if (!url || !/^https?:\\/\\//i.test(url)) {
-				alert('请输入有效的 HTTP / HTTPS 请求 URL');
-				return;
-			}
-
-			const mapping = {
-				ip: document.getElementById('modalMapIp').value.trim() || 'ip',
-				country: document.getElementById('modalMapCountry').value.trim() || 'country',
-				country_code: document.getElementById('modalMapCountryCode').value.trim() || 'country_code',
-				city: document.getElementById('modalMapCity').value.trim() || 'city',
-				asn: document.getElementById('modalMapAsn').value.trim() || 'asn',
-				org: document.getElementById('modalMapOrg').value.trim() || 'org',
-				is_proxy: document.getElementById('modalMapProxy').value.trim() || 'is_proxy',
-				is_datacenter: document.getElementById('modalMapDatacenter').value.trim() || 'is_datacenter',
-				timezone: document.getElementById('modalMapTimezone').value.trim() || 'timezone'
-			};
-
-			const nextSources = { ...(globalConfig.sources || {}) };
-			nextSources[key] = {
-				label: label || key,
-				url,
-				keys,
-				mapping,
-				isCustom: true,
-				enabled: nextSources[key]?.enabled !== false
-			};
-
-			try {
-				const res = await adminFetch('/api/admin/sources', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ sources: nextSources })
-				});
-				if (res.success) {
-					globalConfig.sources = res.sources;
-					renderSources();
-					closeCustomSourceModal();
-					showToast('自定义接口已保存并立即生效！');
-				} else {
-					alert(res.error || '保存失败');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		async function toggleCustomSourceEnable(key, enabled) {
-			const nextSources = { ...(globalConfig.sources || {}) };
-			if (!nextSources[key]) return;
-			nextSources[key].enabled = enabled;
-			try {
-				const res = await adminFetch('/api/admin/sources', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ sources: nextSources })
-				});
-				if (res.success) {
-					globalConfig.sources = res.sources;
-					showToast('接口状态已更新');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		async function deleteCustomSource(key) {
-			if (!confirm('确定要删除自定义接口 [' + key + '] 吗？')) return;
-			const nextSources = { ...(globalConfig.sources || {}) };
-			delete nextSources[key];
-			try {
-				const res = await adminFetch('/api/admin/sources', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ sources: nextSources })
-				});
-				if (res.success) {
-					globalConfig.sources = res.sources;
-					renderSources();
-					showToast('自定义接口已删除');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		// 极简子节点专属脚本弹窗
-		function openSubWorkerScriptModal() {
-			document.getElementById('subWorkerScriptArea').value = SUB_WORKER_SCRIPT_TEMPLATE;
-			document.getElementById('subWorkerScriptModal').classList.remove('hidden');
-		}
-
-		function closeSubWorkerScriptModal() {
-			document.getElementById('subWorkerScriptModal').classList.add('hidden');
-		}
-
-		function copySubWorkerScript() {
-			const code = document.getElementById('subWorkerScriptArea').value;
-			navigator.clipboard.writeText(code).then(() => {
-				showToast('已复制完整脚本代码！去备用 CF 账号粘贴部署即可');
-			}).catch(() => {
-				alert('复制失败，请手动在文本框中全选复制');
-			});
-		}
-
-		// 批量全自动部署从节点
-		function openBatchDeployModal() {
-			document.getElementById('batchDeployModal').classList.remove('hidden');
-			document.getElementById('batchDeployConsoleWrapper').classList.add('hidden');
-			document.getElementById('batchDeployConsole').innerHTML = '';
-			updateBatchAccountsCount();
-		}
-
-		function closeBatchDeployModal() {
-			document.getElementById('batchDeployModal').classList.add('hidden');
-		}
-
-		function updateBatchAccountsCount() {
-			const text = document.getElementById('batchDeployAccounts')?.value || '';
-			const lines = text.split(/[\\r\\n]+/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-			const countSpan = document.getElementById('batchDeployCount');
-			if (countSpan) countSpan.textContent = lines.length + ' 个账号待部署';
-		}
-
-		async function runBatchAutoDeploy() {
-			const text = document.getElementById('batchDeployAccounts').value;
-			const scriptName = (document.getElementById('batchDeployScriptName').value || 'check-socks5-node').trim();
-			const lines = text.split(/[\\r\\n]+/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-
-			if (!lines.length) {
-				alert('请先输入至少一个 Cloudflare 账号凭据');
-				return;
-			}
-
-			const startBtn = document.getElementById('startBatchDeployBtn');
-			startBtn.disabled = true;
-			startBtn.classList.add('opacity-50', 'cursor-not-allowed');
-
-			const consoleWrapper = document.getElementById('batchDeployConsoleWrapper');
-			const consoleBox = document.getElementById('batchDeployConsole');
-			const statusText = document.getElementById('batchDeployStatusText');
-			consoleWrapper.classList.remove('hidden');
-			consoleBox.innerHTML = '';
-
-			function logLine(msg, type = 'info') {
-				const time = new Date().toTimeString().slice(0, 8);
-				const color = type === 'success' ? 'text-emerald-300' : (type === 'error' ? 'text-rose-400' : 'text-cyan-300');
-				const p = document.createElement('div');
-				p.className = color + ' leading-relaxed';
-				p.textContent = '[' + time + '] ' + msg;
-				consoleBox.appendChild(p);
-				consoleBox.scrollTop = consoleBox.scrollHeight;
-			}
-
-			logLine('🚀 开始批量自动部署任务，共计 ' + lines.length + ' 个账号...', 'info');
-
-			let successCount = 0;
-			let failCount = 0;
-
-			for (let i = 0; i < lines.length; i++) {
-				const line = lines[i];
-				let email = '', apiKey = '';
-				if (line.includes(',')) {
-					const parts = line.split(',');
-					email = parts[0].trim();
-					apiKey = parts.slice(1).join(',').trim();
-				} else if (/[ \\t]/.test(line)) {
-					const parts = line.split(/[ \\t]+/);
-					email = parts[0].trim();
-					apiKey = parts.slice(1).join(' ').trim();
-				} else {
-					apiKey = line.trim();
-				}
-
-				const targetLabel = email || (apiKey.slice(0, 8) + '...');
-				statusText.textContent = '正在处理 (' + (i + 1) + '/' + lines.length + '): ' + targetLabel;
-				logLine('正在连接 Cloudflare API 部署 [' + targetLabel + '] ...', 'info');
-
-				try {
-					const res = await adminFetch('/api/admin/auto-deploy-node', {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ email, apiKey, scriptName })
-					});
-
-					if (res.success) {
-						successCount++;
-						const latText = res.latency ? ' (延迟: ' + res.latency + 'ms ' + (res.colo || '') + ')' : '';
-						logLine('✅ [' + targetLabel + '] 部署成功！' + res.url + latText + '，已自动加入集群！', 'success');
-					} else {
-						failCount++;
-						logLine('❌ [' + targetLabel + '] 部署失败: ' + (res.error || '未知错误'), 'error');
-					}
-				} catch (err) {
-					failCount++;
-					logLine('❌ [' + targetLabel + '] 网络请求异常: ' + err.message, 'error');
-				}
-			}
-
-			statusText.textContent = '全部完成！成功 ' + successCount + ' / 失败 ' + failCount;
-			logLine('🎉 批量自动化部署结束！成功: ' + successCount + ' 个，失败: ' + failCount + ' 个', successCount > 0 ? 'success' : 'error');
-
-			startBtn.disabled = false;
-			startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-
-			if (successCount > 0) {
-				showToast('已自动部署并同步加入 ' + successCount + ' 个从节点！');
-				initDashboard();
-			}
-		}
-
-		// 纯集群调度模式开关
-		async function handlePureClusterToggle(enabled) {
-			const label = document.getElementById('pureClusterModeLabel');
-			if (label) {
-				label.textContent = enabled ? '已启用 (主账号0消耗)' : '已关闭';
-				label.className = 'ml-2 text-xs font-semibold ' + (enabled ? 'text-emerald-400' : 'text-slate-400');
-			}
-			try {
-				const res = await adminFetch('/api/admin/cluster-settings', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ pureClusterMode: enabled })
-				});
-				if (res.success) {
-					globalConfig.clusterSettings = res.clusterSettings;
-					showToast(enabled ? '纯集群模式已启用！主账号零消耗' : '纯集群模式已关闭，主节点参与测活');
-				} else {
-					alert(res.error || '保存集群设置失败');
-				}
-			} catch (e) {
-				alert(e.message);
-			}
-		}
-
-		// Worker 集群管理
-		function renderWorkers() {
-			const grid = document.getElementById('workerGrid');
-			const workers = globalConfig.workers || [];
-			const countBadge = document.getElementById('clusterNodeCountBadge');
-			if (countBadge) countBadge.textContent = workers.length + ' 个节点';
-
-			if (!workers.length) {
-				grid.innerHTML = '<div class="col-span-full py-12 px-6 rounded-2xl border border-dashed border-white/10 bg-slate-950/40 text-center space-y-4">'
-					+ '<div class="w-12 h-12 mx-auto rounded-2xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-xl text-cyan-400">🤖</div>'
-					+ '<div class="space-y-1 max-w-md mx-auto">'
-					+ '<h4 class="text-sm font-bold text-white">当前集群暂无从节点</h4>'
-					+ '<p class="text-xs text-slate-400 leading-relaxed">接入多个备用 Cloudflare 免费账号的子节点，可组成弹性负载均衡集群，大批量并发任务自动分流并突破单号限额。</p>'
-					+ '</div>'
-					+ '<div class="flex items-center justify-center gap-3 pt-2">'
-					+ '<button onclick="openBatchDeployModal()" class="px-4 py-2 rounded-xl text-xs font-bold bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 hover:brightness-110 shadow-lg shadow-emerald-500/20">🚀 批量全自动部署</button>'
-					+ '<button onclick="openSubWorkerScriptModal()" class="px-3.5 py-2 rounded-xl text-xs font-semibold border border-white/10 bg-slate-900 text-slate-300 hover:text-white">📋 查看极简代码</button>'
-					+ '</div>'
-					+ '</div>';
-				return;
-			}
-			grid.innerHTML = workers.map(w => {
-				return \`
-					<div class="p-4 rounded-xl border border-white/10 bg-slate-900/60 space-y-3">
-						<div class="flex items-center justify-between">
-							<strong class="text-sm font-semibold text-white flex items-center gap-1.5">
-								\${escapeHtml(w.name)}
-								<span id="pingBadge-\${w.id}" class="text-[10px] px-1.5 py-0.5 rounded font-mono bg-slate-800 text-slate-400">待检测</span>
-							</strong>
-							<button onclick="toggleWorkerStatus('\${w.id}')" class="px-2 py-0.5 rounded text-[11px] font-medium border \${w.enabled !== false ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300' : 'bg-slate-800 border-slate-600 text-slate-400'}">
-								\${w.enabled !== false ? '运行中' : '已挂起'}
-							</button>
-						</div>
-						<div class="text-xs font-mono text-cyan-300 break-all bg-slate-950/60 p-2 rounded-lg border border-white/5">
-							\${escapeHtml(w.url)}
-						</div>
-						<div class="flex items-center justify-between text-xs pt-1">
-							<button onclick="pingWorkerById('\${w.id}')" class="text-cyan-400 hover:underline">
-								⚡ 测速
-							</button>
-							<div class="space-x-2">
-								<button onclick="editWorker('\${w.id}')" class="text-slate-400 hover:text-white">编辑</button>
-								<button onclick="deleteWorker('\${w.id}')" class="text-rose-400 hover:underline">删除</button>
-							</div>
-						</div>
-					</div>
-				\`;
-			}).join('');
-		}
-
-		function openWorkerModal(mode, id = null) {
-			editingWorkerId = id;
-			const modal = document.getElementById('workerModal');
-			if (mode === 'add') {
-				document.getElementById('workerModalTitle').textContent = '添加 Worker 集群从节点';
-				document.getElementById('modalWorkerName').value = '';
-				document.getElementById('modalWorkerUrl').value = '';
-				document.getElementById('modalWorkerToken').value = '';
-			} else {
-				const w = globalConfig.workers.find(item => item.id === id);
-				if (!w) return;
-				document.getElementById('workerModalTitle').textContent = '编辑 Worker 节点';
-				document.getElementById('modalWorkerName').value = w.name;
-				document.getElementById('modalWorkerUrl').value = w.url;
-				document.getElementById('modalWorkerToken').value = w.token || '';
-			}
-			modal.classList.remove('hidden');
-		}
-
-		function closeWorkerModal() {
-			document.getElementById('workerModal').classList.add('hidden');
-			editingWorkerId = null;
-		}
-
-		async function submitWorkerModal() {
-			const name = document.getElementById('modalWorkerName').value.trim();
-			const url = document.getElementById('modalWorkerUrl').value.trim();
-			const token = document.getElementById('modalWorkerToken').value.trim();
-			if (!url) { alert('URL 不能为空'); return; }
-
-			try {
-				const action = editingWorkerId ? 'update' : 'add';
-				const res = await adminFetch('/api/admin/workers', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						action,
-						worker: { id: editingWorkerId, name, url, token }
-					})
-				});
-				if (res.success) {
-					globalConfig.workers = res.workers;
-					renderWorkers();
-					closeWorkerModal();
-					showToast('节点已保存');
-				} else {
-					alert(res.error || '保存失败');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		async function toggleWorkerStatus(id) {
-			try {
-				const res = await adminFetch('/api/admin/workers', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ action: 'toggle', id })
-				});
-				if (res.success) {
-					globalConfig.workers = res.workers;
-					renderWorkers();
-					showToast('节点状态已更新');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		async function deleteWorker(id) {
-			if (!confirm('确定要删除该 Worker 节点吗？')) return;
-			try {
-				const res = await adminFetch('/api/admin/workers', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ action: 'delete', id })
-				});
-				if (res.success) {
-					globalConfig.workers = res.workers;
-					renderWorkers();
-					showToast('节点已删除');
-				}
-			} catch (e) { alert(e.message); }
-		}
-
-		function editWorker(id) {
-			openWorkerModal('edit', id);
-		}
-
-		function pingWorkerById(id) {
-			const w = (globalConfig.workers || []).find(item => item.id === id);
-			if (w) pingSingleWorker(w.id, w.url, w.token || '');
-		}
-
-		async function pingSingleWorker(id, url, token) {
-			const badge = document.getElementById('pingBadge-' + id);
-			if (badge) { badge.textContent = '测试中...'; badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-cyan-950 text-cyan-300'; }
-			try {
-				const res = await adminFetch('/api/admin/ping', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ url, token })
-				});
-				if (res.success) {
-					if (badge) {
-						badge.textContent = res.latency + 'ms' + (res.colo ? ' (' + res.colo + ')' : '');
-						badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-emerald-950 text-emerald-300 border border-emerald-500/30';
-					}
-				} else {
-					if (badge) {
-						badge.textContent = '异常 (' + (res.status || '超时') + ')';
-						badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-rose-950 text-rose-300 border border-rose-500/30';
-					}
-				}
-			} catch (e) {
-				if (badge) {
-					badge.textContent = '不可达';
-					badge.className = 'text-[10px] px-1.5 py-0.5 rounded font-mono bg-rose-950 text-rose-300 border border-rose-500/30';
-				}
-			}
-		}
-
-		function pingAllWorkers() {
-			(globalConfig.workers || []).forEach(w => {
-				pingSingleWorker(w.id, w.url, w.token || '');
-			});
-		}
-
-		// 系统设置
-		async function handlePasswordChange(e) {
-			e.preventDefault();
-			const oldPass = document.getElementById('inputOldPassword').value.trim();
-			const newPass = document.getElementById('inputNewPassword').value.trim();
-			const confirmPass = document.getElementById('inputConfirmPassword').value.trim();
-			if (newPass !== confirmPass) { alert('两次输入的新密码不一致'); return; }
-
-			try {
-				const res = await adminFetch('/api/admin/password', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ oldPassword: oldPass, newPassword: newPass })
-				});
-				if (res.success) {
-					adminSessionToken = res.token;
-					sessionStorage.setItem('cf_admin_token', adminSessionToken);
-					showToast('密码修改成功！已自动更新当前会话');
-					document.getElementById('inputOldPassword').value = '';
-					document.getElementById('inputNewPassword').value = '';
-					document.getElementById('inputConfirmPassword').value = '';
-				} else {
-					alert(res.error || '修改失败');
-				}
-			} catch (err) { alert(err.message); }
-		}
-
-		function exportFullConfig() {
-			const backup = {
-				version: '1.4.0',
-				timestamp: Date.now(),
-				tokens: globalConfig.tokens || [],
-				workers: globalConfig.workers || [],
-				sources: globalConfig.sources || {},
-				clusterSettings: globalConfig.clusterSettings || {}
-			};
-			const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
-			const a = document.createElement('a');
-			a.href = URL.createObjectURL(blob);
-			a.download = 'cf-socks5-config-backup-' + new Date().toISOString().slice(0, 10) + '.json';
-			a.click();
-			showToast('备份文件已下载！');
-		}
-
-		async function importConfig(e) {
-			const file = e.target.files?.[0];
-			if (!file) return;
-			const reader = new FileReader();
-			reader.onload = async function (evt) {
-				try {
-					const data = JSON.parse(evt.target.result);
-					if (data.tokens && Array.isArray(data.tokens)) {
-						await adminFetch('/api/admin/tokens', {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ action: 'save_all', tokens: data.tokens })
-						});
-					}
-					if (data.workers && Array.isArray(data.workers)) {
-						await adminFetch('/api/admin/workers', {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ action: 'save_all', workers: data.workers })
-						});
-					}
-					if (data.sources && typeof data.sources === 'object') {
-						await adminFetch('/api/admin/sources', {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ sources: data.sources })
-						});
-					}
-					if (data.clusterSettings && typeof data.clusterSettings === 'object') {
-						await adminFetch('/api/admin/cluster-settings', {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify(data.clusterSettings)
-						});
-					}
-					showToast('配置还原成功！正在刷新...');
-					setTimeout(() => window.location.reload(), 1000);
-				} catch (err) {
-					alert('解析配置文件失败: ' + err.message);
-				}
-			};
-			reader.readAsText(file);
-		}
-
-		function showToast(msg) {
-			const t = document.getElementById('adminToast');
-			document.getElementById('toastContent').textContent = msg;
-			t.classList.add('show');
-			setTimeout(() => t.classList.remove('show'), 2800);
-		}
-
-		function copyToClipboard(text) {
-			navigator.clipboard.writeText(text).then(() => showToast('已复制到剪贴板！')).catch(() => alert('复制失败'));
-		}
-
-		function escapeHtml(str) {
-			return String(str || '').replace(/[&<>"']/g, function (m) {
-				return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m];
-			});
-		}
-
-		window.addEventListener('DOMContentLoaded', initDashboard);
-	</script>
-</body>
-</html>`;
-}
-

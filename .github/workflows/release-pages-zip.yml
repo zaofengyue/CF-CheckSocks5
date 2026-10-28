@@ -66,7 +66,8 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.title }}
           files: CF-CheckSocks5-Pages.zip
-          generate_release_notes: true
+          body: "Cloudflare Pages 部署包 (CF-CheckSocks5-Pages.zip)"
+          generate_release_notes: false
           draft: false
           prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
         env:

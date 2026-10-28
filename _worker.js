@@ -6774,7 +6774,7 @@ function generateHTML(备案内容, hasToken = false) {
 		function buildTextExport(records) {
 			return records.map(function (record) {
 				return buildTextExportLine(record);
-			}).filter(Boolean).join('\n');
+			}).filter(Boolean).join('\\n');
 		}
 
 		function escapeCsvValue(value) {
@@ -6812,7 +6812,7 @@ function generateHTML(备案内容, hasToken = false) {
 					return escapeCsvValue(getNestedExportValue(fallbackData, column.path));
 				}).join(',');
 			});
-			return [headerLine].concat(rows).join('\n');
+			return [headerLine].concat(rows).join('\\n');
 		}
 
 		function padExportDatePart(value) {

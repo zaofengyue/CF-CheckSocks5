@@ -6,17 +6,16 @@
 
 ## 功能特性
 
-
 - 支持 `socks5://`、`http://`、`https://`、`turn://`、`sstp://` 五类代理协议。
 - 支持无认证代理、`username:password` 认证代理，以及 IPv4、域名、方括号 IPv6 地址。
 - TURN 检测使用 TCP Allocation / CONNECT / ConnectionBind 流程，支持无认证 TURN 服务器和长期凭据认证。
 - SSTP 检测使用 HTTPS SSTP 握手、PPP / IPCP 建链，并通过 PPP 内 TCP 连接读取出口信息。
 - 支持单条检测和批量检测；批量模式会自动去重、解析域名并并发验证。
 - 支持域名解析为 A / AAAA 记录，优先使用 Cloudflare DoH，失败后回退到 Google DoH。
-- 支持出口 IP 查询多源自由切换，涵盖 `iplocate.io`、`HackMyIP`（风控首选 · 原生住宅/机房/VPN与纯净度评级）、`IP2Location.io`（全球权威顶牌 · 自带代理识别 / 免密即用）、`ipwho.is`（高精度全字段规范）、`api.ip.sb`（极速大批量）、`Cloudflare 官方 Trace`（1w+ 超大批量首选，零风控无上限）、`ipinfo.io`、`ipapi.co` 以及 `api.ipapi.is`（深度风控识别 · 支持多 Key 轮询）。
-- 支持代理出口信息展示，包括出口 IP、地区、ASN、运营商、风险标签、响应耗时等。
-- 支持 Leaflet / OpenStreetMap 地图展示出口位置。
-- 支持结果筛选，支持将有效及失败结果复制到剪贴板或导出为 TXT / CSV（包含详细报错原因）。
+- 使用 `www.iplocate.io` 高精度探测出口信息，展示出口 IP、地理位置、ASN、运营商、风险标签、响应耗时等。
+- 落地 IP 交互升级：支持**落地 IP 点击一键复制**，以及**独立小箭头展开/折叠出口详情与网络地图**。
+- 支持 Leaflet / OpenStreetMap 地图可视化出口位置。
+- 支持结果筛选（全部 / 有效 / 失败），支持将有效及失败结果复制到剪贴板或导出为 TXT / CSV（包含详细报错原因）。
 - 彻底移除第三方追踪脚本，保障节点数据与访客隐私绝对安全。
 - 支持深浅色主题、历史记录快速回填和自定义页脚备案内容。
 
@@ -31,12 +30,9 @@ Demo: <https://check.socks5.cmliussss.net>
 1. 在 Cloudflare 控制台 -> **Workers 和 Pages** -> 点击 **创建 Worker**。
 2. 点击部署生成默认 Worker，进入详情页后点击右上角 **编辑代码**。
 3. 将本项目中的 [_worker.js](./_worker.js) 全部内容复制，粘贴替换编辑器中的所有代码，点击 **部署**。
-4. **（可选，强烈推荐）开启后台管理与分布式集群功能**：
-   - 在 Cloudflare 控制台 -> **KV** 中创建一个新的 KV 命名空间（例如：`CHECK_SOCKS5_KV`）。
-   - 进入该 Worker 的 **设置** -> **绑定 (Bindings)** -> 添加 **KV 命名空间绑定**：
-     - **变量名称**：`KV`（兼容 `CONFIG_KV`）
-     - **KV 命名空间**：选择刚才创建的命名空间。
-   - 访问你的域名 `/admin`，首次打开会提示初始化管理员密码（亦可在环境变量设置 `ADMIN`），进入后台即可图形化管理 Token、接口 Key 池和集群调度。
+4. **（可选）设置私有访问密码**：
+   - 进入该 Worker 的 **设置** -> **变量与机密 (Variables and Secrets)**。
+   - 添加环境变量 `TOKEN`，设置你的私有密码，点击保存并部署。
 
 ### 方式二：Cloudflare Pages 上传压缩包 / 文件夹部署
 
@@ -47,34 +43,14 @@ Demo: <https://check.socks5.cmliussss.net>
    - **方式 A（上传文件夹）**：解压下载的项目包，直接将包含 `_worker.js` 的文件夹拖入上传区域。
    - **方式 B（上传压缩包）**：将 `_worker.js`、`_routes.json`、`index.html` 等文件全选压缩为 zip 上传（请确保 `_worker.js` 位于压缩包最外层根目录，不要嵌套子文件夹）。
 3. 点击 **部署站点**。
-4. 同样可以在 Pages 项目的 **设置** -> **函数 (Functions)** -> **KV 命名空间绑定** 中添加变量名 `KV` 激活后台管理系统。
+4. 同样可以在 Pages 项目的 **设置** -> **环境变量** 中添加变量名 `TOKEN` 保护私有访问。
 
-## 环境变量与 KV 绑定
+## 环境变量
 
-当前源码支持读取以下配置（最简仅需 `KV` 与 `ADMIN`）：
-
-| 变量 / 绑定名 | 类型 | 说明 | 示例 | 必需 |
+| 变量名 | 类型 | 说明 | 示例 | 必需 |
 | --- | --- | --- | --- | --- |
-| `KV` | KV 命名空间 | 绑定 Cloudflare KV 命名空间，激活 `/admin` 图形后台管理系统、多 Key 自动轮询、分布式集群调度与动态 Token 增删。亦兼容旧名 `CONFIG_KV`。 | 绑定至 KV 命名空间 | 否 |
-| `ADMIN` | 环境变量 | 管理员后台密码。亦可在初次访问 `/admin` 时直接网页输入初始化。兼容 `ADMIN_PASSWORD`、`ADMIN_TOKEN`。 | `admin123456` | 否 |
-| `TOKEN` | 环境变量 | 全局兜底访问鉴权令牌（兼容 `AUTH_TOKEN`）。若绑定了 KV，亦可在 `/admin` 后台动态新增和管理多个 Token。 | `my-secret-token` | 否 |
+| `TOKEN` | 环境变量 | 全局私有访问鉴权密码（亦兼容 `AUTH_TOKEN`）。设置后保护 `/check`、`/resolve` 核心接口及网页访问。 | `my-secret-token` | 否 |
 | `BEIAN` | 环境变量 | 自定义页面页脚 HTML。未设置时使用默认页脚，包含项目链接和维护者链接。 | `© 2026 Example.com · ICP 备案号` | 否 |
-
-## 后台管理系统 (`/admin`)
-
-当 Worker / Pages 绑定了 `KV`（亦兼容 `CONFIG_KV`）命名空间时，访问 `https://your-domain/admin` 将开启管理控制台：
-
-- **访问 Token 管理 (Tokens)**：可视化创建、禁用、启用与删除用户 Token，支持为每个 Token 备注用途（如“自用客户端”、“群友测试”等）。
-- **接口与多 Key 池管理 (Sources & Key Pool)**：
-  - 支持为商业 IP 查询接口（如 `api.ipapi.is`、`api.ip2location.io`、`ipdata.co` 等）配置多组 API Key，自动 Round-Robin 轮询调度与 429 智能熔断。
-  - **自定义接口 (Custom IP Sources)**：支持任意添加第三方自建或商业 IP 数据库，支持在 URL 中设置 `{{KEY}}` 搭配 Key 池轮询，并通过 JSON 点操作符路径（如 `data.ip`、`location.country`）自由映射提取出口属性。
-- **Worker 分布式集群调度与纯集群模式 (Worker Cluster)**：
-  - **⚡ 纯集群调度模式 (主账号 0 消耗)**：一键开启纯集群模式，主 Worker 仅作为控制面板与管理中枢，所有测活流量 100% 分发给子 Worker 节点，彻底保持主账号每日 10 万次配额零消耗！
-  - **🤖 批量全自动部署从节点**：支持在后台一键输入多个 Cloudflare 小号的 `邮箱, Global API Key`（或 API Token），系统自动调用 Cloudflare 官方 API 创建 Worker、上传极简内核、激活 `workers.dev` 并自动将新节点测速入库，全程免去任何手动操作！
-  - **📋 极简子节点专属脚本**：亦支持一键复制免 KV 空间、免环境变量的纯执行独立脚本手动部署。
-  - **10w+ 智能容灾与熔断重试**：大批量测活时，当某个子节点因高频请求遇到 429/1015/1027 或网络离线时，前端调度器自动将其标记 5 分钟冷却，并自动切换至下一健康子节点重试，大批量检测持续不中断。
-  - **一键全节点测速巡检**：实时探测所有子 Worker 的 HTTP 往返延迟与 Cloudflare 边缘机房代码（如 HKG、SJC 等）。
-- **配置导入导出与备份 (Settings & Backup)**：支持一键导出全站配置 JSON 备份文件，迁移站点时一键上传还原。
 
 ## 支持的代理格式
 
@@ -275,7 +251,10 @@ curl "https://your-worker.example.workers.dev/resolve?proxyip=socks5://proxy.exa
 3. 在输入框中填写代理链接、`IP:端口`、`域名:端口` 或带认证的代理地址。
 4. 如需批量检测，打开「批量检测」并粘贴多行目标。
 5. 点击「开始检测」。
-6. 检测完成后，可按全部/有效/失败/风控评级、协议和国家地区筛选，并导出有效结果。
+6. 检测完成后：
+   - 可按全部 / 有效 / 失败进行分类筛选；
+   - 点击落地 IP 即可一键复制，点击右侧小圆圈箭头可展开查看地理位置与网络详情；
+   - 支持将有效及失败结果一键复制到剪贴板，或导出为 TXT / CSV 文件。
 
 也可以直接通过路径触发单条检测：
 
